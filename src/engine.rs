@@ -256,10 +256,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_stub_run_is_empty() {
+    async fn real_run_completes_with_blank_runner() {
+        // With a MockCommandRunner that has no registered responses, every real
+        // scanner's subprocess call errors — scanners must degrade gracefully
+        // (emit an Info fallback or nothing) rather than hang or panic. This
+        // asserts the engine drives a real scanner end-to-end and terminates,
+        // and that anything emitted is a non-actionable Info fallback.
         let m = mgr(Mode::Real);
         let map = m.run_to_completion(&[ScannerId::Ports]).await;
-        assert_eq!(map.len(), 0, "stub scanners emit nothing");
+        assert!(m.current_generation() >= 1);
+        assert!(
+            map.values().all(|f| f.severity == crate::model::Severity::Info),
+            "a blank-runner real scan should only yield Info fallbacks"
+        );
     }
 
     #[tokio::test]
