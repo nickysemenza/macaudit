@@ -23,6 +23,10 @@ pub enum Action {
     Enter,
     Esc,
     Backspace,
+    /// Scroll the detail pane down/up (PageDown/PageUp, or ctrl-d/ctrl-u —
+    /// the readline-ish aliases many terminal users reach for).
+    PageDown,
+    PageUp,
     /// Any printable character, including space — interpretation is
     /// mode-dependent (e.g. `' '` marks a row in Normal mode but types a
     /// space in Filter mode).
@@ -38,10 +42,14 @@ pub fn map(key: KeyEvent) -> Option<Action> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     Some(match key.code {
         KeyCode::Char('c') if ctrl => CtrlC,
+        KeyCode::Char('d') if ctrl => PageDown,
+        KeyCode::Char('u') if ctrl => PageUp,
         KeyCode::Up => Up,
         KeyCode::Down => Down,
         KeyCode::Left => Left,
         KeyCode::Right => Right,
+        KeyCode::PageDown => PageDown,
+        KeyCode::PageUp => PageUp,
         KeyCode::Tab => Tab,
         KeyCode::BackTab => BackTab,
         KeyCode::Enter => Enter,
@@ -122,6 +130,35 @@ mod tests {
         assert_eq!(
             map(key(KeyCode::Backspace, KeyModifiers::NONE)),
             Some(Action::Backspace)
+        );
+    }
+
+    #[test]
+    fn page_up_down_map_directly_and_via_ctrl_aliases() {
+        assert_eq!(
+            map(key(KeyCode::PageDown, KeyModifiers::NONE)),
+            Some(Action::PageDown)
+        );
+        assert_eq!(
+            map(key(KeyCode::PageUp, KeyModifiers::NONE)),
+            Some(Action::PageUp)
+        );
+        assert_eq!(
+            map(key(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            Some(Action::PageDown)
+        );
+        assert_eq!(
+            map(key(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            Some(Action::PageUp)
+        );
+        // Plain (unmodified) d/u remain ordinary chars, e.g. for filter text.
+        assert_eq!(
+            map(key(KeyCode::Char('d'), KeyModifiers::NONE)),
+            Some(Action::Char('d'))
+        );
+        assert_eq!(
+            map(key(KeyCode::Char('u'), KeyModifiers::NONE)),
+            Some(Action::Char('u'))
         );
     }
 }

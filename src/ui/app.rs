@@ -6,10 +6,12 @@
 //! the key-action reducer, and orchestrates `draw()` by handing each pane
 //! its slice of state.
 //!
-//! Keys route through three modal states (`Mode`): `Normal` is the default
+//! Keys route through four modal states (`Mode`): `Normal` is the default
 //! navigation/action surface, `Filter` turns every printable key into text
-//! input for the `/` search box, and `Confirm` is the batch-execute dialog
-//! opened by `x` — only `y`/`enter`/`n`/`esc` do anything there.
+//! input for the `/` search box, `Confirm` is the batch-execute dialog
+//! opened by `x` — only `y`/`enter`/`n`/`esc` do anything there — and `Help`
+//! is the `?` keybindings overlay, where only `?`/`esc`/`q`/`enter` (plus
+//! ctrl-c, which always quits) do anything.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
@@ -23,7 +25,7 @@ use crate::registry::{self, ViewKind};
 use crate::remedy::{PlannedAction, RemedyEngine};
 use crate::ui::keys::Action;
 use crate::ui::tree::TreeRow;
-use crate::ui::{activity, confirm, detail, sidebar, statusbar, table, tree};
+use crate::ui::{activity, confirm, detail, help, sidebar, statusbar, table, tree};
 
 /// Per-section scan status shown in the sidebar.
 #[derive(Clone, Debug, PartialEq)]
@@ -74,6 +76,8 @@ pub enum Mode {
     Normal,
     Filter,
     Confirm,
+    /// The `?` keybindings overlay.
+    Help,
 }
 
 pub struct AppState {
@@ -88,6 +92,10 @@ pub struct AppState {
     sort: Sort,
     show_system: bool,
     pub show_detail: bool,
+    /// Vertical scroll offset (lines) of the detail pane. Reset to 0 whenever
+    /// the selection or section changes, or the pane is toggled — a stale
+    /// scroll position on a freshly-selected finding would just look broken.
+    pub(crate) detail_scroll: u16,
 
     pub(crate) mode: Mode,
     /// Substring filter (case-insensitive, matched against title/path).
@@ -144,6 +152,7 @@ impl Default for AppState {
             sort: Sort::SizeDesc,
             show_system: false,
             show_detail: false,
+            detail_scroll: 0,
             mode: Mode::Normal,
             filter: String::new(),
             collapsed_groups: HashSet::new(),
@@ -463,6 +472,7 @@ impl AppState {
             Mode::Normal => self.handle_normal(action),
             Mode::Filter => self.handle_filter(action),
             Mode::Confirm => self.handle_confirm(action),
+            Mode::Help => self.handle_help(action),
         }
     }
 
@@ -486,6 +496,27 @@ impl AppState {
             Action::Char('/') => self.mode = Mode::Filter,
             Action::Char('s') => self.sort = self.sort.next(),
             Action::Char('h') => self.show_system = !self.show_system,
+            Action::Char('?') => self.mode = Mode::Help,
+            Action::PageDown if self.show_detail => {
+                self.detail_scroll = self.detail_scroll.saturating_add(5);
+            }
+            Action::PageUp if self.show_detail => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(5);
+            }
+            _ => {}
+        }
+    }
+
+    /// `Mode::Help`: only closing keys (and ctrl-c, handled above every
+    /// mode) do anything — everything else, including the letters that are
+    /// shortcuts in Normal mode, is swallowed so the overlay can't silently
+    /// mutate state while it's up.
+    fn handle_help(&mut self, action: Action) {
+        match action {
+            Action::CtrlC => self.should_quit = true,
+            Action::Char('?') | Action::Esc | Action::Char('q') | Action::Enter => {
+                self.mode = Mode::Normal;
+            }
             _ => {}
         }
     }
@@ -532,21 +563,25 @@ impl AppState {
         if n > 0 {
             self.selected_row = (self.selected_row + 1).min(n - 1);
         }
+        self.detail_scroll = 0;
     }
 
     fn move_up(&mut self) {
         self.selected_row = self.selected_row.saturating_sub(1);
+        self.detail_scroll = 0;
     }
 
     fn next_section(&mut self) {
         self.selected_section = (self.selected_section + 1) % ScannerId::ALL.len();
         self.selected_row = 0;
+        self.detail_scroll = 0;
     }
 
     fn prev_section(&mut self) {
         self.selected_section =
             (self.selected_section + ScannerId::ALL.len() - 1) % ScannerId::ALL.len();
         self.selected_row = 0;
+        self.detail_scroll = 0;
     }
 
     /// Left: in tree view, collapse the group under the cursor; otherwise
@@ -589,6 +624,7 @@ impl AppState {
             }
         }
         self.show_detail = !self.show_detail;
+        self.detail_scroll = 0;
     }
 
     fn toggle_mark_selected(&mut self) {
@@ -649,7 +685,13 @@ impl AppState {
                 .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
                 .split(main[0]);
             self.draw_main_panel(frame, split[0]);
-            detail::draw(frame, split[1], self.selected_finding(), self.delete_mode);
+            detail::draw(
+                frame,
+                split[1],
+                self.selected_finding(),
+                self.delete_mode,
+                self.detail_scroll,
+            );
         } else {
             self.draw_main_panel(frame, main[0]);
         }
@@ -664,6 +706,9 @@ impl AppState {
 
         if self.mode == Mode::Confirm {
             confirm::draw(frame, frame.area(), &self.confirm_actions, self.delete_mode);
+        }
+        if self.mode == Mode::Help {
+            help::draw(frame, frame.area());
         }
     }
 
@@ -1106,5 +1151,123 @@ mod tests {
         app.handle(Action::Char('x'));
         assert_eq!(app.mode, Mode::Confirm, "confirm dialog should have opened");
         terminal.draw(|f| app.draw(f)).unwrap(); // confirm modal
+
+        app.handle(Action::Char('n')); // cancel back to Normal
+        app.handle(Action::Char('?'));
+        assert_eq!(app.mode, Mode::Help, "help overlay should have opened");
+        terminal.draw(|f| app.draw(f)).unwrap(); // help modal
+    }
+
+    #[test]
+    fn question_mark_opens_help_and_esc_closes_it() {
+        let mut app = AppState::default();
+        assert_eq!(app.mode, Mode::Normal);
+
+        app.handle(Action::Char('?'));
+        assert_eq!(app.mode, Mode::Help);
+
+        app.handle(Action::Esc);
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn help_mode_also_closes_on_q_enter_or_question_mark() {
+        for closer in [Action::Char('q'), Action::Enter, Action::Char('?')] {
+            let mut app = AppState::default();
+            app.handle(Action::Char('?'));
+            assert_eq!(app.mode, Mode::Help);
+            app.handle(closer);
+            assert_eq!(app.mode, Mode::Normal, "{closer:?} should close Help");
+        }
+    }
+
+    #[test]
+    fn help_mode_swallows_shortcut_keys_without_mutating_state() {
+        let mut app = app_with_gen(1);
+        app.apply(finding_event(1, "/a", Some(10)));
+        app.apply(finding_event(1, "/b", Some(20)));
+        let row_before = app.selected_row;
+        let filter_before = app.filter.clone();
+        let marked_before = app.marked_total();
+
+        app.handle(Action::Char('?'));
+        assert_eq!(app.mode, Mode::Help);
+
+        // Keys that are shortcuts elsewhere must be no-ops while Help is up.
+        for action in [
+            Action::Char('j'),
+            Action::Down,
+            Action::Char(' '),
+            Action::Char('x'),
+            Action::Char('/'),
+            Action::Char('s'),
+            Action::Char('h'),
+            Action::Char('r'),
+        ] {
+            app.handle(action);
+        }
+
+        assert_eq!(
+            app.mode,
+            Mode::Help,
+            "still in Help — nothing should escape it"
+        );
+        assert_eq!(app.selected_row, row_before, "selection must not move");
+        assert_eq!(app.filter, filter_before, "filter must not change");
+        assert_eq!(app.marked_total(), marked_before, "marks must not change");
+        assert!(app.pending_rescan.is_none(), "no rescan should be queued");
+    }
+
+    #[test]
+    fn ctrl_c_quits_even_while_help_is_open() {
+        let mut app = AppState::default();
+        app.handle(Action::Char('?'));
+        assert_eq!(app.mode, Mode::Help);
+        app.handle(Action::CtrlC);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn page_down_up_scroll_detail_only_when_open() {
+        let mut app = AppState::default();
+        assert!(!app.show_detail);
+
+        // Detail pane closed: PageDown/PageUp are no-ops.
+        app.handle(Action::PageDown);
+        assert_eq!(app.detail_scroll, 0);
+
+        app.show_detail = true;
+        app.handle(Action::PageDown);
+        assert_eq!(app.detail_scroll, 5);
+        app.handle(Action::PageDown);
+        assert_eq!(app.detail_scroll, 10);
+        app.handle(Action::PageUp);
+        assert_eq!(app.detail_scroll, 5);
+
+        // Saturates at 0 rather than underflowing.
+        app.handle(Action::PageUp);
+        app.handle(Action::PageUp);
+        assert_eq!(app.detail_scroll, 0);
+    }
+
+    #[test]
+    fn detail_scroll_resets_on_selection_and_section_change() {
+        let mut app = app_with_gen(1);
+        app.apply(finding_event(1, "/a", Some(10)));
+        app.apply(finding_event(1, "/b", Some(20)));
+        app.show_detail = true;
+        app.detail_scroll = 15;
+
+        app.handle(Action::Down); // moves selection within the section
+        assert_eq!(app.detail_scroll, 0, "moving selection resets scroll");
+
+        app.detail_scroll = 15;
+        app.handle(Action::Tab); // switches section
+        assert_eq!(app.detail_scroll, 0, "switching section resets scroll");
+
+        app.detail_scroll = 15;
+        app.handle(Action::Enter); // toggles the detail pane closed
+        assert!(!app.show_detail);
+        assert_eq!(app.detail_scroll, 0, "toggling detail resets scroll");
     }
 }

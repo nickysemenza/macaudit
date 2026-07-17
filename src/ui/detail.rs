@@ -15,13 +15,23 @@ use crate::model::Finding;
 use crate::remedy::RemedyEngine;
 use crate::ui::theme;
 
-pub fn draw(frame: &mut Frame, area: Rect, selected: Option<&Finding>, delete_mode: DeleteMode) {
+/// `scroll` is the pane's vertical scroll offset (lines), owned by
+/// `AppState::detail_scroll` and driven by PageUp/PageDown — this pane is
+/// the only thing on screen that can outgrow its box (a finding's meta +
+/// remedies can run to dozens of lines), so it's the one pane that scrolls.
+pub fn draw(
+    frame: &mut Frame,
+    area: Rect,
+    selected: Option<&Finding>,
+    delete_mode: DeleteMode,
+    scroll: u16,
+) {
     let block = Block::default().borders(Borders::ALL).title(" Detail ");
     let text: Vec<Line> = match selected {
         None => vec![Line::from("No selection")],
         Some(f) => render_finding(f, delete_mode),
     };
-    frame.render_widget(Paragraph::new(text).block(block), area);
+    frame.render_widget(Paragraph::new(text).block(block).scroll((scroll, 0)), area);
 }
 
 fn render_finding(f: &Finding, delete_mode: DeleteMode) -> Vec<Line<'static>> {

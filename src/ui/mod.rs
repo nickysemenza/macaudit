@@ -11,6 +11,7 @@ pub mod theme;
 mod activity;
 mod confirm;
 mod detail;
+mod help;
 mod sidebar;
 mod statusbar;
 mod table;
