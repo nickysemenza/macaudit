@@ -1,21 +1,29 @@
 //! `AppState` and its reducer. The reducer is deliberately pure (no I/O) and
-//! independent of the event loop so it can be unit-tested directly. Lane U
-//! extends the rendering (tree view, detail pane, confirm dialog, activity log);
-//! the skeleton renders a sidebar + a sortable table + a bottom bar.
+//! independent of the event loop so it can be unit-tested directly.
+//!
+//! Rendering is split across sibling modules (`sidebar`, `table`, `tree`,
+//! `detail`, `confirm`, `activity`, `statusbar`); this file owns state,
+//! the key-action reducer, and orchestrates `draw()` by handing each pane
+//! its slice of state.
+//!
+//! Keys route through three modal states (`Mode`): `Normal` is the default
+//! navigation/action surface, `Filter` turns every printable key into text
+//! input for the `/` search box, and `Confirm` is the batch-execute dialog
+//! opened by `x` — only `y`/`enter`/`n`/`esc` do anything there.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, List, ListItem, Row, Table, TableState};
 use ratatui::Frame;
 
-use crate::model::{Finding, FindingId, ScanEvent, ScannerId, Severity};
-use crate::registry;
+use crate::config::DeleteMode;
+use crate::model::{Finding, FindingId, Remedy, ScanEvent, ScannerId, Severity};
+use crate::registry::{self, ViewKind};
+use crate::remedy::{PlannedAction, RemedyEngine};
 use crate::ui::keys::Action;
-use crate::ui::theme;
+use crate::ui::tree::TreeRow;
+use crate::ui::{activity, confirm, detail, sidebar, statusbar, table, tree};
 
 /// Per-section scan status shown in the sidebar.
 #[derive(Clone, Debug, PartialEq)]
@@ -59,6 +67,15 @@ impl Sort {
     }
 }
 
+/// Which key-input surface is active. Keys mean different things in each —
+/// see the module doc comment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Normal,
+    Filter,
+    Confirm,
+}
+
 pub struct AppState {
     /// Findings per section, upserted by stable id (last write wins — this is the
     /// invariant that makes deferred size updates correct).
@@ -72,12 +89,32 @@ pub struct AppState {
     show_system: bool,
     pub show_detail: bool,
 
+    pub(crate) mode: Mode,
+    /// Substring filter (case-insensitive, matched against title/path).
+    pub(crate) filter: String,
+    /// Tree groups the user has explicitly collapsed, keyed by
+    /// (section, group key) so collapsing in one section doesn't affect
+    /// another.
+    collapsed_groups: HashSet<(ScannerId, String)>,
+    /// The planned actions currently shown in the confirm dialog.
+    confirm_actions: Vec<PlannedAction>,
+    /// Delete mode used when planning remedies. Defaults to `Trash`, matching
+    /// `Config::default()` — see the module-level contract-friction note in
+    /// the lane report: `AppState` has no path to the real `Config` because
+    /// `ScannerManager` doesn't expose one and `ui::run`'s signature is
+    /// frozen, so this can't be wired to `--rm` today.
+    delete_mode: DeleteMode,
+    pub(crate) activity: Vec<String>,
+
     /// The generation whose events we accept; stale events are dropped.
     pub current_gen: u64,
     pub tick: usize,
     pub should_quit: bool,
     /// Set when the user requests a rescan; the loop consumes and clears it.
     pub pending_rescan: Option<RescanRequest>,
+    /// Set when the confirm dialog is accepted; the loop consumes and clears
+    /// it, executing (or, pre-Phase-2, just logging) each action.
+    pub pending_execute: Option<Vec<PlannedAction>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,10 +138,17 @@ impl Default for AppState {
             sort: Sort::SizeDesc,
             show_system: false,
             show_detail: false,
+            mode: Mode::Normal,
+            filter: String::new(),
+            collapsed_groups: HashSet::new(),
+            confirm_actions: Vec::new(),
+            delete_mode: DeleteMode::Trash,
+            activity: Vec::new(),
             current_gen: 0,
             tick: 0,
             should_quit: false,
             pending_rescan: None,
+            pending_execute: None,
         }
     }
 }
@@ -112,6 +156,19 @@ impl Default for AppState {
 impl AppState {
     pub fn selected_section_id(&self) -> ScannerId {
         ScannerId::ALL[self.selected_section]
+    }
+
+    pub(crate) fn selected_section_index(&self) -> usize {
+        self.selected_section
+    }
+
+    /// Append a line to the activity log (capped so it can't grow unbounded
+    /// across a long session).
+    pub fn push_activity(&mut self, line: String) {
+        self.activity.push(line);
+        if self.activity.len() > 200 {
+            self.activity.remove(0);
+        }
     }
 
     /// Apply a scan event. Drops events from stale generations. This is the sole
@@ -178,75 +235,17 @@ impl AppState {
         }
     }
 
-    /// Findings for the selected section, ordered by the current sort, with
-    /// System apps optionally hidden.
-    fn visible_rows(&self) -> Vec<&Finding> {
-        let id = self.selected_section_id();
-        let Some(map) = self.findings.get(&id) else {
-            return Vec::new();
-        };
-        let mut rows: Vec<&Finding> = map
-            .values()
-            .filter(|f| self.show_system || !is_system_app(f))
-            .collect();
-        match self.sort {
-            Sort::SizeDesc => {
-                rows.sort_by(|a, b| b.size_bytes.unwrap_or(0).cmp(&a.size_bytes.unwrap_or(0)))
-            }
-            Sort::Title => rows.sort_by(|a, b| a.title.cmp(&b.title)),
-            Sort::Severity => rows.sort_by(|a, b| b.severity.cmp(&a.severity)),
-        }
-        rows
+    // ---- read-only helpers used by the reducer and by sibling render modules ----
+
+    pub(crate) fn status_of(&self, id: ScannerId) -> SectionStatus {
+        self.status.get(&id).cloned().unwrap_or(SectionStatus::Idle)
     }
 
-    /// Handle a semantic action. Returns nothing; the loop reads `should_quit`
-    /// and `pending_rescan` afterward.
-    pub fn handle(&mut self, action: Action) {
-        match action {
-            Action::Quit => self.should_quit = true,
-            Action::Down => {
-                let n = self.visible_rows().len();
-                if n > 0 {
-                    self.selected_row = (self.selected_row + 1).min(n - 1);
-                }
-            }
-            Action::Up => {
-                self.selected_row = self.selected_row.saturating_sub(1);
-            }
-            Action::NextSection => {
-                self.selected_section = (self.selected_section + 1) % ScannerId::ALL.len();
-                self.selected_row = 0;
-            }
-            Action::PrevSection => {
-                self.selected_section =
-                    (self.selected_section + ScannerId::ALL.len() - 1) % ScannerId::ALL.len();
-                self.selected_row = 0;
-            }
-            Action::Mark => {
-                if let Some(f) = self.visible_rows().get(self.selected_row) {
-                    let id = f.id;
-                    if !self.marked.insert(id) {
-                        self.marked.remove(&id);
-                    }
-                }
-            }
-            Action::Detail => self.show_detail = !self.show_detail,
-            Action::ToggleSystem => self.show_system = !self.show_system,
-            Action::CycleSort => self.sort = self.sort.next(),
-            Action::RescanSection => {
-                self.pending_rescan = Some(RescanRequest::Section(self.selected_section_id()));
-            }
-            Action::RescanAll => self.pending_rescan = Some(RescanRequest::All),
-            // Filter and Execute are wired by lane U / Phase 2.
-            Action::Filter | Action::Execute => {}
-        }
-    }
-
-    fn section_count(&self, id: ScannerId) -> usize {
+    pub(crate) fn section_count(&self, id: ScannerId) -> usize {
         self.findings.get(&id).map(|m| m.len()).unwrap_or(0)
     }
 
-    fn section_reclaimable(&self, id: ScannerId) -> u64 {
+    pub(crate) fn section_reclaimable(&self, id: ScannerId) -> u64 {
         self.findings
             .get(&id)
             .map(|m| {
@@ -258,7 +257,7 @@ impl AppState {
             .unwrap_or(0)
     }
 
-    fn marked_total(&self) -> (usize, u64) {
+    pub(crate) fn marked_total(&self) -> (usize, u64) {
         let mut count = 0;
         let mut bytes = 0;
         for map in self.findings.values() {
@@ -272,6 +271,240 @@ impl AppState {
         (count, bytes)
     }
 
+    pub(crate) fn sort_label(&self) -> &'static str {
+        self.sort.label()
+    }
+
+    fn is_tree_view(&self) -> bool {
+        matches!(
+            registry::section(self.selected_section_id()).view,
+            ViewKind::Tree
+        )
+    }
+
+    /// Findings for the selected section, ordered by the current sort, with
+    /// System apps and the `/` filter applied.
+    fn visible_findings(&self) -> Vec<&Finding> {
+        let id = self.selected_section_id();
+        let Some(map) = self.findings.get(&id) else {
+            return Vec::new();
+        };
+        let needle = self.filter.to_lowercase();
+        let mut rows: Vec<&Finding> = map
+            .values()
+            .filter(|f| self.show_system || !is_system_app(f))
+            .filter(|f| needle.is_empty() || matches_filter(f, &needle))
+            .collect();
+        match self.sort {
+            Sort::SizeDesc => {
+                rows.sort_by(|a, b| b.size_bytes.unwrap_or(0).cmp(&a.size_bytes.unwrap_or(0)))
+            }
+            Sort::Title => rows.sort_by(|a, b| a.title.cmp(&b.title)),
+            Sort::Severity => rows.sort_by(|a, b| b.severity.cmp(&a.severity)),
+        }
+        rows
+    }
+
+    /// The flattened tree rows for the selected section (Tree-view sections
+    /// only; callers should check `is_tree_view()` first if it matters).
+    fn tree_rows(&self) -> Vec<TreeRow<'_>> {
+        let id = self.selected_section_id();
+        let findings = self.visible_findings();
+        tree::build_rows(findings.into_iter(), |key| {
+            self.collapsed_groups.contains(&(id, key.to_string()))
+        })
+    }
+
+    fn row_count(&self) -> usize {
+        if self.is_tree_view() {
+            self.tree_rows().len()
+        } else {
+            self.visible_findings().len()
+        }
+    }
+
+    /// The Finding under the cursor, whether we're in table or tree view (in
+    /// tree view, `None` when the cursor is on a group header).
+    fn selected_finding(&self) -> Option<&Finding> {
+        if self.is_tree_view() {
+            match self.tree_rows().into_iter().nth(self.selected_row) {
+                Some(TreeRow::Item(f)) => Some(f),
+                _ => None,
+            }
+        } else {
+            self.visible_findings().into_iter().nth(self.selected_row)
+        }
+    }
+
+    // ---- reducer ----
+
+    /// Handle a semantic action. Returns nothing; the loop reads `should_quit`,
+    /// `pending_rescan`, and `pending_execute` afterward.
+    pub fn handle(&mut self, action: Action) {
+        match self.mode {
+            Mode::Normal => self.handle_normal(action),
+            Mode::Filter => self.handle_filter(action),
+            Mode::Confirm => self.handle_confirm(action),
+        }
+    }
+
+    fn handle_normal(&mut self, action: Action) {
+        match action {
+            Action::CtrlC => self.should_quit = true,
+            Action::Char('q') | Action::Esc => self.should_quit = true,
+            Action::Up | Action::Char('k') => self.move_up(),
+            Action::Down | Action::Char('j') => self.move_down(),
+            Action::Tab => self.next_section(),
+            Action::BackTab => self.prev_section(),
+            Action::Left => self.on_left(),
+            Action::Right => self.on_right(),
+            Action::Char(' ') => self.toggle_mark_selected(),
+            Action::Enter => self.on_enter(),
+            Action::Char('x') => self.open_confirm(),
+            Action::Char('r') => {
+                self.pending_rescan = Some(RescanRequest::Section(self.selected_section_id()));
+            }
+            Action::Char('R') => self.pending_rescan = Some(RescanRequest::All),
+            Action::Char('/') => self.mode = Mode::Filter,
+            Action::Char('s') => self.sort = self.sort.next(),
+            Action::Char('h') => self.show_system = !self.show_system,
+            _ => {}
+        }
+    }
+
+    fn handle_filter(&mut self, action: Action) {
+        match action {
+            Action::CtrlC => self.should_quit = true,
+            Action::Char(c) => {
+                self.filter.push(c);
+                self.selected_row = 0;
+            }
+            Action::Backspace => {
+                self.filter.pop();
+                self.selected_row = 0;
+            }
+            Action::Enter => self.mode = Mode::Normal,
+            Action::Esc => {
+                self.filter.clear();
+                self.mode = Mode::Normal;
+                self.selected_row = 0;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_confirm(&mut self, action: Action) {
+        match action {
+            Action::CtrlC => self.should_quit = true,
+            Action::Char('y') | Action::Enter => {
+                self.pending_execute = Some(std::mem::take(&mut self.confirm_actions));
+                self.marked.clear();
+                self.mode = Mode::Normal;
+            }
+            Action::Char('n') | Action::Esc => {
+                self.confirm_actions.clear();
+                self.mode = Mode::Normal;
+            }
+            _ => {}
+        }
+    }
+
+    fn move_down(&mut self) {
+        let n = self.row_count();
+        if n > 0 {
+            self.selected_row = (self.selected_row + 1).min(n - 1);
+        }
+    }
+
+    fn move_up(&mut self) {
+        self.selected_row = self.selected_row.saturating_sub(1);
+    }
+
+    fn next_section(&mut self) {
+        self.selected_section = (self.selected_section + 1) % ScannerId::ALL.len();
+        self.selected_row = 0;
+    }
+
+    fn prev_section(&mut self) {
+        self.selected_section =
+            (self.selected_section + ScannerId::ALL.len() - 1) % ScannerId::ALL.len();
+        self.selected_row = 0;
+    }
+
+    /// Left: in tree view, collapse the group under the cursor; otherwise
+    /// (table view, or the cursor is on a leaf item) switch to the previous
+    /// section.
+    fn on_left(&mut self) {
+        if self.is_tree_view() {
+            if let Some(TreeRow::Group { key, .. }) = self.tree_rows().get(self.selected_row) {
+                self.collapsed_groups
+                    .insert((self.selected_section_id(), key.clone()));
+                return;
+            }
+        }
+        self.prev_section();
+    }
+
+    /// Right: in tree view, expand the group under the cursor; otherwise
+    /// switch to the next section. Mirror of `on_left`.
+    fn on_right(&mut self) {
+        if self.is_tree_view() {
+            if let Some(TreeRow::Group { key, .. }) = self.tree_rows().get(self.selected_row) {
+                self.collapsed_groups
+                    .remove(&(self.selected_section_id(), key.clone()));
+                return;
+            }
+        }
+        self.next_section();
+    }
+
+    /// Enter: on a tree group header, toggle expand/collapse; otherwise
+    /// toggle the detail pane (spec §4).
+    fn on_enter(&mut self) {
+        if self.is_tree_view() {
+            if let Some(TreeRow::Group { key, .. }) = self.tree_rows().get(self.selected_row) {
+                let entry = (self.selected_section_id(), key.clone());
+                if !self.collapsed_groups.remove(&entry) {
+                    self.collapsed_groups.insert(entry);
+                }
+                return;
+            }
+        }
+        self.show_detail = !self.show_detail;
+    }
+
+    fn toggle_mark_selected(&mut self) {
+        if let Some(id) = self.selected_finding().map(|f| f.id) {
+            if !self.marked.insert(id) {
+                self.marked.remove(&id);
+            }
+        }
+    }
+
+    /// Gather marked findings' primary remedies, plan them via `RemedyEngine`,
+    /// and open the confirm dialog. No-op if nothing marked has an
+    /// executable remedy.
+    fn open_confirm(&mut self) {
+        if self.marked.is_empty() {
+            return;
+        }
+        let items: Vec<(FindingId, Remedy)> = self
+            .findings
+            .values()
+            .flat_map(|m| m.values())
+            .filter(|f| self.marked.contains(&f.id))
+            .filter_map(|f| primary_remedy(f).map(|r| (f.id, r.clone())))
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        let engine = RemedyEngine::new(self.delete_mode);
+        self.confirm_actions = engine.plan(&items);
+        self.mode = Mode::Confirm;
+    }
+
+    // ---- rendering ----
+
     /// Render the whole UI.
     pub fn draw(&self, frame: &mut Frame) {
         let cols = Layout::default()
@@ -279,11 +512,17 @@ impl AppState {
             .constraints([Constraint::Length(24), Constraint::Min(20)])
             .split(frame.area());
 
-        self.draw_sidebar(frame, cols[0]);
+        sidebar::draw(self, frame, cols[0]);
 
+        let activity_h = activity::height_for(&self.activity);
+        let mut vconstraints = vec![Constraint::Min(3)];
+        if activity_h > 0 {
+            vconstraints.push(Constraint::Length(activity_h));
+        }
+        vconstraints.push(Constraint::Length(1));
         let main = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(1)])
+            .constraints(vconstraints)
             .split(cols[1]);
 
         if self.show_detail {
@@ -291,195 +530,71 @@ impl AppState {
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
                 .split(main[0]);
-            self.draw_table(frame, split[0]);
-            self.draw_detail(frame, split[1]);
+            self.draw_main_panel(frame, split[0]);
+            detail::draw(frame, split[1], self.selected_finding());
         } else {
-            self.draw_table(frame, main[0]);
+            self.draw_main_panel(frame, main[0]);
         }
-        self.draw_statusbar(frame, main[1]);
-    }
 
-    fn draw_sidebar(&self, frame: &mut Frame, area: Rect) {
-        let items: Vec<ListItem> = registry::REGISTRY
-            .iter()
-            .enumerate()
-            .map(|(i, meta)| {
-                let status = self
-                    .status
-                    .get(&meta.id)
-                    .cloned()
-                    .unwrap_or(SectionStatus::Idle);
-                let glyph = match &status {
-                    SectionStatus::Idle => " ".to_string(),
-                    SectionStatus::Scanning { .. } => theme::spinner(self.tick).to_string(),
-                    SectionStatus::Done { .. } => "✓".to_string(),
-                    SectionStatus::Failed { .. } => "⚠".to_string(),
-                };
-                let count = self.section_count(meta.id);
-                let reclaim = self.section_reclaimable(meta.id);
-                let suffix = if matches!(status, SectionStatus::Done { .. }) && count > 0 {
-                    if reclaim > 0 {
-                        format!(
-                            "{count} · {}",
-                            humansize::format_size(reclaim, humansize::BINARY)
-                        )
-                    } else {
-                        format!("{count}")
-                    }
-                } else {
-                    String::new()
-                };
-                let selected = i == self.selected_section;
-                let style = if selected {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::White)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-                ListItem::new(Line::from(vec![
-                    Span::raw(format!("{glyph} ")),
-                    Span::raw(format!("{:<10}", meta.title)),
-                    Span::styled(suffix, Style::default().fg(Color::DarkGray)),
-                ]))
-                .style(style)
-            })
-            .collect();
-        let list =
-            List::new(items).block(Block::default().borders(Borders::ALL).title(" macaudit "));
-        frame.render_widget(list, area);
-    }
-
-    fn draw_table(&self, frame: &mut Frame, area: Rect) {
-        let id = self.selected_section_id();
-        let title = format!(" {} ", registry::section(id).title);
-        let rows = self.visible_rows();
-        let table_rows: Vec<Row> = rows
-            .iter()
-            .map(|f| {
-                let mark = if self.marked.contains(&f.id) {
-                    "●"
-                } else {
-                    " "
-                };
-                let size = f
-                    .size_bytes
-                    .map(|b| humansize::format_size(b, humansize::BINARY))
-                    .unwrap_or_else(|| "…".to_string());
-                Row::new(vec![
-                    Cell::from(mark),
-                    Cell::from(f.title.clone()),
-                    Cell::from(size),
-                    Cell::from(Span::styled(
-                        severity_label(f.severity),
-                        Style::default().fg(theme::severity_color(f.severity)),
-                    )),
-                ])
-            })
-            .collect();
-
-        let widths = [
-            Constraint::Length(2),
-            Constraint::Min(20),
-            Constraint::Length(12),
-            Constraint::Length(12),
-        ];
-        let table = Table::new(table_rows, widths)
-            .header(
-                Row::new(vec!["", "Name", "Size", "Severity"])
-                    .style(Style::default().add_modifier(Modifier::BOLD)),
-            )
-            .block(Block::default().borders(Borders::ALL).title(title))
-            .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-
-        let mut ts = TableState::default();
-        if !rows.is_empty() {
-            ts.select(Some(self.selected_row.min(rows.len() - 1)));
-        }
-        frame.render_stateful_widget(table, area, &mut ts);
-    }
-
-    fn draw_detail(&self, frame: &mut Frame, area: Rect) {
-        let rows = self.visible_rows();
-        let block = Block::default().borders(Borders::ALL).title(" Detail ");
-        let text: Vec<Line> = match rows.get(self.selected_row) {
-            None => vec![Line::from("No selection")],
-            Some(f) => {
-                let mut lines = vec![
-                    Line::from(Span::styled(
-                        f.title.clone(),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    )),
-                    Line::from(f.detail.clone()),
-                ];
-                if let Some(p) = &f.path {
-                    lines.push(Line::from(format!("path: {}", p.display())));
-                }
-                if let Some(b) = f.size_bytes {
-                    lines.push(Line::from(format!(
-                        "size: {}",
-                        humansize::format_size(b, humansize::BINARY)
-                    )));
-                }
-                if !f.remedies.is_empty() {
-                    lines.push(Line::from(""));
-                    lines.push(Line::from(Span::styled(
-                        "Remedies:",
-                        Style::default().add_modifier(Modifier::BOLD),
-                    )));
-                    for r in &f.remedies {
-                        let color = if r.destructive {
-                            Color::Red
-                        } else {
-                            Color::Green
-                        };
-                        lines.push(Line::from(vec![
-                            Span::raw(format!("  {} — ", r.label)),
-                            Span::styled(r.command.rendered(), Style::default().fg(color)),
-                        ]));
-                    }
-                }
-                lines
-            }
+        let statusbar_area = if activity_h > 0 {
+            activity::draw(frame, main[1], &self.activity);
+            main[2]
+        } else {
+            main[1]
         };
-        frame.render_widget(ratatui::widgets::Paragraph::new(text).block(block), area);
+        statusbar::draw(self, frame, statusbar_area);
+
+        if self.mode == Mode::Confirm {
+            confirm::draw(frame, frame.area(), &self.confirm_actions, self.delete_mode);
+        }
     }
 
-    fn draw_statusbar(&self, frame: &mut Frame, area: Rect) {
-        let (n, bytes) = self.marked_total();
-        let left = format!(
-            " jk:nav  tab:section  space:mark  enter:detail  x:exec  r/R:rescan  s:sort({})  h:sys  q:quit",
-            self.sort.label()
-        );
-        let right = format!(
-            "Selected: {n} items · {} ",
-            humansize::format_size(bytes, humansize::BINARY)
-        );
-        let bar = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(10), Constraint::Length(right.len() as u16)])
-            .split(area);
-        frame.render_widget(
-            ratatui::widgets::Paragraph::new(left)
-                .style(Style::default().bg(Color::DarkGray).fg(Color::White)),
-            bar[0],
-        );
-        frame.render_widget(
-            ratatui::widgets::Paragraph::new(right)
-                .style(Style::default().bg(Color::DarkGray).fg(Color::White)),
-            bar[1],
-        );
+    fn draw_main_panel(&self, frame: &mut Frame, area: Rect) {
+        let id = self.selected_section_id();
+        let title = registry::section(id).title;
+        match registry::section(id).view {
+            ViewKind::Table => {
+                let rows = self.visible_findings();
+                table::draw(
+                    frame,
+                    area,
+                    title,
+                    &rows,
+                    |fid| self.marked.contains(&fid),
+                    self.selected_row,
+                );
+            }
+            ViewKind::Tree => {
+                let rows = self.tree_rows();
+                tree::draw(
+                    frame,
+                    area,
+                    title,
+                    &rows,
+                    |fid| self.marked.contains(&fid),
+                    self.selected_row,
+                );
+            }
+        }
     }
 }
 
-fn severity_label(sev: Severity) -> &'static str {
-    match sev {
-        Severity::Info => "info",
-        Severity::Attention => "attention",
-        Severity::Reclaimable => "reclaim",
-        Severity::Warning => "warning",
-    }
+/// The remedy to plan when a finding is marked for batch execution: the
+/// destructive one (typically the delete/trash action) if there is one, else
+/// whatever remedy comes first (e.g. a Reveal-in-Finder-only finding).
+fn primary_remedy(f: &Finding) -> Option<&Remedy> {
+    f.remedies
+        .iter()
+        .find(|r| r.destructive)
+        .or_else(|| f.remedies.first())
+}
+
+fn matches_filter(f: &Finding, needle: &str) -> bool {
+    f.title.to_lowercase().contains(needle)
+        || f.path
+            .as_ref()
+            .map(|p| p.display().to_string().to_lowercase().contains(needle))
+            .unwrap_or(false)
 }
 
 /// Whether a finding is a System app (hidden unless `h` toggled). Heuristic on
@@ -494,7 +609,7 @@ fn is_system_app(f: &Finding) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::FindingKind;
+    use crate::model::{FindingKind, RemedyCommand};
 
     fn finding_event(gen: u64, id_key: &str, size: Option<u64>) -> ScanEvent {
         let mut f = Finding::new(FindingKind::App, id_key, id_key);
@@ -506,10 +621,34 @@ mod tests {
         }
     }
 
+    fn finding_with_remedy(gen: u64, key: &str) -> ScanEvent {
+        let f = Finding::new(FindingKind::App, key, key)
+            .size(100)
+            .remedy(Remedy {
+                label: "Delete".into(),
+                command: RemedyCommand::Trash { path: key.into() },
+                reclaims_bytes: Some(100),
+                destructive: true,
+            });
+        ScanEvent::Finding {
+            scanner: ScannerId::Apps,
+            gen,
+            finding: Box::new(f),
+        }
+    }
+
+    /// `AppState::default()` with `current_gen` set, so tests that need to
+    /// accept events don't trip clippy's `field_reassign_with_default`.
+    fn app_with_gen(gen: u64) -> AppState {
+        AppState {
+            current_gen: gen,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn upsert_dedups_by_id() {
-        let mut app = AppState::default();
-        app.current_gen = 1;
+        let mut app = app_with_gen(1);
         app.apply(finding_event(1, "/a", None));
         app.apply(finding_event(1, "/a", Some(999))); // same id, now sized
         let map = app.findings.get(&ScannerId::Apps).unwrap();
@@ -519,27 +658,202 @@ mod tests {
 
     #[test]
     fn stale_generation_dropped() {
-        let mut app = AppState::default();
-        app.current_gen = 2;
+        let mut app = app_with_gen(2);
         app.apply(finding_event(1, "/old", Some(1))); // stale gen
         assert_eq!(app.section_count(ScannerId::Apps), 0);
     }
 
     #[test]
     fn marking_toggles() {
-        let mut app = AppState::default();
-        app.current_gen = 1;
+        let mut app = app_with_gen(1);
         app.apply(finding_event(1, "/a", Some(10)));
-        app.handle(Action::Mark);
+        // Apps is a Tree-view section: row 0 is the group header, row 1 is
+        // the finding itself.
+        app.handle(Action::Down);
+        app.handle(Action::Char(' '));
         assert_eq!(app.marked_total().0, 1);
-        app.handle(Action::Mark);
+        app.handle(Action::Char(' '));
         assert_eq!(app.marked_total().0, 0);
     }
 
     #[test]
     fn rescan_section_requested() {
         let mut app = AppState::default();
-        app.handle(Action::RescanAll);
+        app.handle(Action::Char('R'));
         assert_eq!(app.pending_rescan, Some(RescanRequest::All));
+    }
+
+    #[test]
+    fn tab_and_backtab_cycle_sections() {
+        let mut app = AppState::default();
+        let start = app.selected_section_index();
+        app.handle(Action::Tab);
+        assert_eq!(
+            app.selected_section_index(),
+            (start + 1) % ScannerId::ALL.len()
+        );
+        app.handle(Action::BackTab);
+        assert_eq!(app.selected_section_index(), start);
+    }
+
+    #[test]
+    fn q_quits_in_normal_mode_but_is_text_in_filter_mode() {
+        let mut app = AppState::default();
+        app.handle(Action::Char('/'));
+        app.handle(Action::Char('q'));
+        assert!(!app.should_quit);
+        assert_eq!(app.filter, "q");
+        app.handle(Action::Esc);
+        app.handle(Action::Char('q'));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn filter_narrows_visible_rows_by_title_substring() {
+        let mut app = app_with_gen(1);
+        app.apply(finding_event(1, "/alpha", Some(1)));
+        app.apply(finding_event(1, "/beta", Some(1)));
+        assert_eq!(app.visible_findings().len(), 2);
+        app.filter = "alph".to_string();
+        assert_eq!(app.visible_findings().len(), 1);
+        assert_eq!(app.visible_findings()[0].title, "/alpha");
+    }
+
+    #[test]
+    fn filter_mode_captures_shortcut_letters_as_text() {
+        let mut app = AppState::default();
+        app.handle(Action::Char('/'));
+        assert_eq!(app.mode, Mode::Filter);
+        for c in ['j', 'k', 'q', ' ', 'x'] {
+            app.handle(Action::Char(c));
+        }
+        assert_eq!(app.filter, "jkq x");
+        app.handle(Action::Enter);
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.filter, "jkq x"); // Enter applies without clearing
+    }
+
+    #[test]
+    fn filter_esc_clears_and_exits() {
+        let mut app = AppState::default();
+        app.handle(Action::Char('/'));
+        app.handle(Action::Char('a'));
+        app.handle(Action::Esc);
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.filter.is_empty());
+    }
+
+    #[test]
+    fn confirm_flow_produces_pending_execute() {
+        let mut app = app_with_gen(1);
+        app.apply(finding_with_remedy(1, "/Applications/Old.app"));
+        app.handle(Action::Down); // Apps is Tree view: row 0 is the group header
+        app.handle(Action::Char(' ')); // mark the only row
+        assert_eq!(app.marked_total().0, 1);
+
+        app.handle(Action::Char('x')); // open confirm
+        assert_eq!(app.mode, Mode::Confirm);
+        assert_eq!(app.confirm_actions.len(), 1);
+        assert!(app.confirm_actions[0].rendered.contains("trash"));
+
+        app.handle(Action::Char('y')); // confirm
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.marked_total().0, 0); // cleared after queuing
+        let actions = app.pending_execute.take().expect("pending_execute set");
+        assert_eq!(actions.len(), 1);
+    }
+
+    #[test]
+    fn confirm_cancel_leaves_marks_and_sets_no_pending_execute() {
+        let mut app = app_with_gen(1);
+        app.apply(finding_with_remedy(1, "/Applications/Old.app"));
+        app.handle(Action::Down); // Apps is Tree view: row 0 is the group header
+        app.handle(Action::Char(' '));
+        app.handle(Action::Char('x'));
+        app.handle(Action::Char('n'));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.pending_execute.is_none());
+        assert_eq!(app.marked_total().0, 1); // still marked, nothing executed
+    }
+
+    #[test]
+    fn tree_expand_collapse_via_left_right() {
+        let mut app = app_with_gen(1);
+        // Apps (index 0) is a Tree-view section; both findings fall back to
+        // the same "app" group since neither sets meta.group.
+        app.apply(finding_event(1, "/App1", Some(10)));
+        app.apply(finding_event(1, "/App2", Some(20)));
+        assert_eq!(app.tree_rows().len(), 3); // 1 group header + 2 items
+
+        app.handle(Action::Left); // cursor is on the group header -> collapse
+        assert_eq!(app.tree_rows().len(), 1);
+
+        app.handle(Action::Right); // expand again
+        assert_eq!(app.tree_rows().len(), 3);
+
+        app.handle(Action::Enter); // enter also toggles a group header
+        assert_eq!(app.tree_rows().len(), 1);
+    }
+
+    #[test]
+    fn sidebar_status_transitions_scanning_done_failed() {
+        let mut app = app_with_gen(1);
+        assert_eq!(app.status_of(ScannerId::Apps), SectionStatus::Idle);
+
+        app.apply(ScanEvent::Started {
+            scanner: ScannerId::Apps,
+            gen: 1,
+        });
+        assert!(matches!(
+            app.status_of(ScannerId::Apps),
+            SectionStatus::Scanning { .. }
+        ));
+
+        app.apply(ScanEvent::Finished {
+            scanner: ScannerId::Apps,
+            gen: 1,
+            duration: Duration::from_secs(1),
+        });
+        assert!(matches!(
+            app.status_of(ScannerId::Apps),
+            SectionStatus::Done { .. }
+        ));
+
+        app.apply(ScanEvent::Started {
+            scanner: ScannerId::Brew,
+            gen: 1,
+        });
+        app.apply(ScanEvent::Failed {
+            scanner: ScannerId::Brew,
+            gen: 1,
+            error: "boom".into(),
+        });
+        assert!(matches!(
+            app.status_of(ScannerId::Brew),
+            SectionStatus::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn draw_smoke_test_across_modes() {
+        let mut app = app_with_gen(1);
+        app.apply(finding_with_remedy(1, "/Applications/Old.app"));
+        app.show_detail = true;
+        app.push_activity("did a thing".into());
+
+        let backend = ratatui::backend::TestBackend::new(100, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| app.draw(f)).unwrap(); // normal, detail pane + activity log
+
+        app.handle(Action::Char('/'));
+        terminal.draw(|f| app.draw(f)).unwrap(); // filter input in the statusbar
+
+        app.handle(Action::Esc);
+        app.handle(Action::Down); // Apps is Tree view: row 0 is the group header
+        app.handle(Action::Char(' '));
+        app.handle(Action::Char('x'));
+        assert_eq!(app.mode, Mode::Confirm, "confirm dialog should have opened");
+        terminal.draw(|f| app.draw(f)).unwrap(); // confirm modal
     }
 }
