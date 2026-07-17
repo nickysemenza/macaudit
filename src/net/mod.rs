@@ -6,7 +6,9 @@
 //! bodies and never touch the network. Non-2xx statuses are returned as values
 //! (the caller decides what 304/403 mean); `Err` is transport-only.
 
+pub mod catalog;
 pub mod enrich;
+pub mod github;
 
 use std::collections::HashMap;
 use std::sync::Mutex;

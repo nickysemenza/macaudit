@@ -128,12 +128,20 @@ fn is_unmanaged_candidate(classification: Classification, obtained_from: Option<
     )
 }
 
-/// Bundle id best-effort extraction: `system_profiler` doesn't always give us
-/// one directly in this dataset; we derive nothing fake here — left `None`
-/// unless a future field supplies it. Kept as a function so tests / future
-/// extensions have one place to extend.
-fn bundle_id(_raw: &RawApp) -> Option<String> {
-    None
+/// Bundle id best-effort extraction: `system_profiler`'s
+/// `SPApplicationsDataType` doesn't include `CFBundleIdentifier`, so we read it
+/// from the app bundle's `Contents/Info.plist`. Any failure (no path, missing
+/// or malformed plist, absent key) yields `None` — fixture apps whose paths
+/// don't exist on disk simply return `None`, which keeps scan tests hermetic.
+fn bundle_id(raw: &RawApp) -> Option<String> {
+    let path = raw.path.as_ref()?;
+    let plist_path = std::path::Path::new(path).join("Contents/Info.plist");
+    let value = plist::Value::from_file(&plist_path).ok()?;
+    value
+        .as_dictionary()?
+        .get("CFBundleIdentifier")?
+        .as_string()
+        .map(str::to_string)
 }
 
 #[async_trait]
