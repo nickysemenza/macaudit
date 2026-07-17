@@ -8,8 +8,8 @@
 //!   installed inventory + versions.
 //! - `brew leaves` — the authoritative "no dependents, user-requested" set.
 //! - `brew outdated --json=v2` — formulae/casks with a newer version available.
-//! - `brew deps --installed --json=v2` — declared deps per formula, used to
-//!   invert the graph into a `dependents` list for every formula.
+//! - `brew deps --installed` — declared deps per formula (plain text, portable
+//!   across brew versions), used to invert the graph into a `dependents` list.
 //! - `brew info --json=v2 --installed --cask` — cask metadata + `artifacts`,
 //!   from which `.app` install paths are extracted into `meta.app_paths` so
 //!   `correlate.rs` can join them against AppsScanner's Unmanaged bucket.
@@ -99,12 +99,22 @@ struct OutdatedCask {
     current_version: String,
 }
 
-/// `brew deps --installed --json=v2` shape: a map of formula name to its
-/// declared runtime dependencies (formula names only).
-#[derive(Debug, Deserialize)]
-struct DepsEntry {
-    #[serde(default)]
-    dependencies: Vec<String>,
+/// Parse plain-text `brew deps --installed` output — one line per installed
+/// formula in the form `name: dep1 dep2 …` (deps may be empty) — into a map of
+/// formula name → its direct dependencies.
+fn parse_deps_plain(stdout: &str) -> BTreeMap<String, Vec<String>> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let (name, rest) = line.split_once(':')?;
+            let name = name.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let deps = rest.split_whitespace().map(str::to_string).collect();
+            Some((name.to_string(), deps))
+        })
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,38 +156,37 @@ impl Scanner for BrewScanner {
     }
 
     async fn scan(&self, ctx: ScanCtx) -> anyhow::Result<()> {
+        // Primary probe: if `brew list --formula` can't run at all, brew isn't
+        // usable — emit the single "not found" finding and stop.
         let Some(formula_out) = brew(&ctx, &["list", "--formula", "--versions"]).await else {
             emit_brew_not_found(&ctx).await;
             return Ok(());
         };
-        let Some(cask_out) = brew(&ctx, &["list", "--cask", "--versions"]).await else {
-            emit_brew_not_found(&ctx).await;
-            return Ok(());
-        };
-        let Some(leaves_out) = brew(&ctx, &["leaves"]).await else {
-            emit_brew_not_found(&ctx).await;
-            return Ok(());
-        };
-        let Some(outdated_out) = brew(&ctx, &["outdated", "--json=v2"]).await else {
-            emit_brew_not_found(&ctx).await;
-            return Ok(());
-        };
-        let Some(deps_out) = brew(&ctx, &["deps", "--installed", "--json=v2"]).await else {
-            emit_brew_not_found(&ctx).await;
-            return Ok(());
-        };
-        let Some(cask_info_out) = brew(&ctx, &["info", "--json=v2", "--installed", "--cask"]).await
-        else {
-            emit_brew_not_found(&ctx).await;
-            return Ok(());
-        };
+        // Auxiliary data. Each degrades to empty if that particular command
+        // isn't supported by the installed brew version (e.g. Homebrew 6.x
+        // rejects `deps --installed --json`), rather than aborting the scan.
+        let cask_out = brew(&ctx, &["list", "--cask", "--versions"]).await;
+        let leaves_out = brew(&ctx, &["leaves"]).await;
+        let outdated_out = brew(&ctx, &["outdated", "--json=v2"]).await;
+        // Plain-text `deps --installed` (lines of `formula: dep1 dep2 …`) is the
+        // form supported across brew versions; `--json=v2` is not accepted here.
+        let deps_out = brew(&ctx, &["deps", "--installed"]).await;
+        let cask_info_out = brew(&ctx, &["info", "--json=v2", "--installed", "--cask"]).await;
 
         let formulae = parse_name_versions(&formula_out.stdout_str());
-        let casks = parse_name_versions(&cask_out.stdout_str());
-        let leaves = parse_leaves(&leaves_out.stdout_str());
+        let casks = cask_out
+            .as_ref()
+            .map(|o| parse_name_versions(&o.stdout_str()))
+            .unwrap_or_default();
+        let leaves = leaves_out
+            .as_ref()
+            .map(|o| parse_leaves(&o.stdout_str()))
+            .unwrap_or_default();
 
-        let outdated: OutdatedRoot =
-            serde_json::from_str(&outdated_out.stdout_str()).unwrap_or(OutdatedRoot {
+        let outdated: OutdatedRoot = outdated_out
+            .as_ref()
+            .and_then(|o| serde_json::from_str(&o.stdout_str()).ok())
+            .unwrap_or(OutdatedRoot {
                 formulae: Vec::new(),
                 casks: Vec::new(),
             });
@@ -192,13 +201,15 @@ impl Scanner for BrewScanner {
             .map(|c| (c.name, c.current_version))
             .collect();
 
-        let deps: BTreeMap<String, DepsEntry> =
-            serde_json::from_str(&deps_out.stdout_str()).unwrap_or_default();
+        let deps: BTreeMap<String, Vec<String>> = deps_out
+            .as_ref()
+            .map(|o| parse_deps_plain(&o.stdout_str()))
+            .unwrap_or_default();
 
         // Invert the dep graph: for every formula, who depends on it.
         let mut dependents: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for (name, entry) in &deps {
-            for dep in &entry.dependencies {
+        for (name, dep_list) in &deps {
+            for dep in dep_list {
                 dependents
                     .entry(dep.clone())
                     .or_default()
@@ -206,7 +217,9 @@ impl Scanner for BrewScanner {
             }
         }
 
-        let cask_info: CaskInfoRoot = serde_json::from_str(&cask_info_out.stdout_str())
+        let cask_info: CaskInfoRoot = cask_info_out
+            .as_ref()
+            .and_then(|o| serde_json::from_str(&o.stdout_str()).ok())
             .unwrap_or(CaskInfoRoot { casks: Vec::new() });
         let cask_app_paths: BTreeMap<String, Vec<String>> = cask_info
             .casks
@@ -226,10 +239,7 @@ impl Scanner for BrewScanner {
                 .await;
 
             let is_leaf = leaves.contains(name);
-            let deps_list: Vec<String> = deps
-                .get(name)
-                .map(|e| e.dependencies.clone())
-                .unwrap_or_default();
+            let deps_list: Vec<String> = deps.get(name).cloned().unwrap_or_default();
             let dependents_list: Vec<String> = dependents
                 .get(name)
                 .cloned()
@@ -347,14 +357,8 @@ mod tests {
             )
             .on(
                 "brew",
-                &["deps", "--installed", "--json=v2"],
-                r#"{
-                  "wget": {"dependencies": ["libidn2", "openssl@3"]},
-                  "libidn2": {"dependencies": []},
-                  "openssl@3": {"dependencies": []},
-                  "ripgrep": {"dependencies": ["pcre2"]},
-                  "pcre2": {"dependencies": []}
-                }"#,
+                &["deps", "--installed"],
+                "wget: libidn2 openssl@3\nlibidn2: \nopenssl@3: \nripgrep: pcre2\npcre2: \n",
             )
             .on(
                 "brew",
@@ -485,5 +489,30 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Info);
         assert_eq!(findings[0].title, "Homebrew not found");
+    }
+
+    #[test]
+    fn parse_deps_plain_handles_empty_and_multi() {
+        let map = parse_deps_plain("wget: libidn2 openssl@3\nripgrep: \nfoo:\n");
+        assert_eq!(map["wget"], vec!["libidn2", "openssl@3"]);
+        assert!(map["ripgrep"].is_empty());
+        assert!(map["foo"].is_empty());
+    }
+
+    /// Regression: a single auxiliary command failing (here `brew deps`, which
+    /// Homebrew 6.x rejects with `--json`) must NOT make the scanner declare
+    /// Homebrew missing — it degrades and still emits formula findings.
+    #[tokio::test]
+    async fn auxiliary_command_failure_still_reports_formulae() {
+        let mock = mock_full().on_fail("brew", &["deps", "--installed"], 1, "Usage: brew deps");
+        let findings = run_scan(mock).await;
+        assert!(
+            findings.iter().any(|f| f.title == "wget"),
+            "should still report formulae when deps fails"
+        );
+        assert!(
+            !findings.iter().any(|f| f.title == "Homebrew not found"),
+            "must not claim brew is missing on an auxiliary failure"
+        );
     }
 }
