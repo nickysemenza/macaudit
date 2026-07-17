@@ -241,13 +241,9 @@ impl AppState {
         })
     }
 
-    /// Run cross-scanner correlation over the in-memory findings (the TUI
-    /// equivalent of the headless path's `correlate()` call): merge the Apps +
-    /// Brew section maps, correlate, write mutated findings back to their
-    /// sections. Sync and cheap (hundreds of items); call once both sections
-    /// are terminal so cask labels appear in the TUI and in auto-saved
-    /// snapshots.
-    pub fn correlate_now(&mut self) {
+    /// A merged snapshot of the Apps + Brew section maps — the input to both
+    /// sync correlation and the async network-enrichment task.
+    pub fn apps_brew_findings(&self) -> BTreeMap<FindingId, Finding> {
         let mut merged: BTreeMap<FindingId, Finding> = BTreeMap::new();
         for id in [ScannerId::Apps, ScannerId::Brew] {
             if let Some(map) = self.findings.get(&id) {
@@ -256,6 +252,17 @@ impl AppState {
                 }
             }
         }
+        merged
+    }
+
+    /// Run cross-scanner correlation over the in-memory findings (the TUI
+    /// equivalent of the headless path's `correlate()` call): merge the Apps +
+    /// Brew section maps, correlate, write mutated findings back to their
+    /// sections. Sync and cheap (hundreds of items); call once both sections
+    /// are terminal so cask labels appear in the TUI and in auto-saved
+    /// snapshots.
+    pub fn correlate_now(&mut self) {
+        let mut merged = self.apps_brew_findings();
         if merged.is_empty() {
             return;
         }

@@ -112,6 +112,11 @@ impl ScannerManager {
         self.paths.clone()
     }
 
+    /// The loaded configuration (the TUI's enrichment task needs NetworkConfig).
+    pub fn config(&self) -> Arc<Config> {
+        self.config.clone()
+    }
+
     /// Attach an HTTP fetcher, enabling network enrichment (cask catalog +
     /// release checks). Without it the manager is fully offline.
     pub fn with_fetcher(mut self, fetcher: Arc<dyn HttpFetcher>) -> Self {

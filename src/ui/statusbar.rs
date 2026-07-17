@@ -18,7 +18,7 @@ pub fn draw(app: &AppState, frame: &mut Frame, area: Rect) {
 
     let (n, bytes) = app.marked_total();
     let left = format!(
-        " jk/arrows:nav  tab:section  space:mark  enter:detail  x:exec  r/R:rescan  /:filter  s:sort({})  h:sys  q:quit",
+        " jk/arrows:nav  tab:section  space:mark  enter:detail  x:exec  r/R:rescan  /:filter  s:sort({})  h:sys  ?:help  q:quit",
         app.sort_label()
     );
     let right = format!(

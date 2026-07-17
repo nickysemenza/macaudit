@@ -27,7 +27,7 @@ use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::ScannerManager;
-use crate::model::{ScanEvent, ScannerId, Severity};
+use crate::model::{Finding, FindingKind, ScanEvent, ScannerId, Severity};
 use crate::remedy::{RealClipboard, RealTrash, RemedyEngine};
 use crate::snapshot::{self, SnapshotStore};
 use crate::ui::app::{AppState, RescanRequest};
@@ -46,6 +46,8 @@ async fn run_loop(
     manager: Arc<ScannerManager>,
 ) -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::channel::<ScanEvent>(1024);
+    // Async network-enrichment results: (gen, enriched App findings).
+    let (enrich_tx, mut enrich_rx) = mpsc::channel::<(u64, Vec<Finding>)>(4);
     let mut app = AppState::default();
     app.set_delete_mode(manager.delete_mode());
     app.set_baseline(load_baseline(&manager));
@@ -86,6 +88,17 @@ async fn run_loop(
                     app.apply(ev);
                 }
             }
+            maybe_enriched = enrich_rx.recv() => {
+                // Network enrichment landed: upsert (stale generations are
+                // dropped inside apply_enriched).
+                if let Some((gen, findings)) = maybe_enriched {
+                    let n = findings.len();
+                    app.apply_enriched(gen, findings);
+                    if n > 0 {
+                        app.push_activity(format!("catalog: enriched {n} app findings"));
+                    }
+                }
+            }
             _ = tick.tick() => {
                 app.tick = app.tick.wrapping_add(1);
             }
@@ -94,12 +107,36 @@ async fn run_loop(
         // Once Apps + Brew both reach terminal state, run cross-scanner
         // correlation (cask-managed labeling) so the TUI — and the snapshot
         // auto-saved below — see correlated findings, matching the headless
-        // path. Once per generation.
+        // path. Then kick the async network half (catalog matching + release
+        // checks) in the background; results arrive on `enrich_rx`. Once per
+        // generation.
         if correlated_gen != full_scan_gen
             && app.sections_terminal(&[ScannerId::Apps, ScannerId::Brew])
         {
             correlated_gen = full_scan_gen;
             app.correlate_now();
+
+            if let Some(fetcher) = manager.fetcher() {
+                let mut map = app.apps_brew_findings();
+                let paths = manager.paths();
+                let config = manager.config();
+                let etx = enrich_tx.clone();
+                let gen = full_scan_gen;
+                tokio::spawn(async move {
+                    let token = CancellationToken::new();
+                    crate::net::enrich(&mut map, Some(fetcher), &paths, &config, &token).await;
+                    // Ship back only findings enrichment actually touched
+                    // (catalog matches carry `available_cask`; the GitHub pass
+                    // only runs on those same matches).
+                    let changed: Vec<Finding> = map
+                        .into_values()
+                        .filter(|f| {
+                            f.kind == FindingKind::App && f.meta.get("available_cask").is_some()
+                        })
+                        .collect();
+                    let _ = etx.send((gen, changed)).await;
+                });
+            }
         }
 
         // Auto-save a snapshot when a full scan completes (spec §8) — cheap, and
