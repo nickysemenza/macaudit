@@ -1,48 +1,127 @@
-//! Keymap: crossterm key events → semantic `Action`s. Lane U extends this with
-//! the full keybinding set; the skeleton wires navigation, marking, rescan, quit.
+//! Keymap: crossterm key events → semantic `Action`s.
 //!
-//! Per spec §4: arrows/jk navigate rows, Tab/arrows switch sections, `space`
-//! marks, `enter` opens detail, `x` executes, `r`/`R` rescan, `/` filters,
-//! `s` cycles sort, `h` toggles System apps, `q` quits.
+//! This layer is deliberately *mode-agnostic* — it maps raw keys (arrows,
+//! Tab/BackTab, Enter/Esc/Backspace, ctrl-c, and every other char) to a small
+//! `Action` enum, without deciding what a key means. That decision belongs to
+//! `AppState::handle`, which interprets the same physical key differently
+//! depending on its current `Mode` (Normal / Filter / Confirm) — e.g. `'q'`
+//! quits in Normal mode but is ordinary filter text in Filter mode. Keeping
+//! that policy out of this file is what makes the filter text box able to
+//! contain any character, including ones that are single-key shortcuts
+//! elsewhere.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
-    Quit,
     Up,
     Down,
-    NextSection,
-    PrevSection,
-    Mark,
-    Detail,
-    RescanSection,
-    RescanAll,
-    Filter,
-    CycleSort,
-    ToggleSystem,
-    Execute,
+    Left,
+    Right,
+    Tab,
+    BackTab,
+    Enter,
+    Esc,
+    Backspace,
+    /// Any printable character, including space — interpretation is
+    /// mode-dependent (e.g. `' '` marks a row in Normal mode but types a
+    /// space in Filter mode).
+    Char(char),
+    /// ctrl-c always quits, in every mode.
+    CtrlC,
 }
 
-/// Map a key event to an action (`None` if unbound).
+/// Map a key event to an action (`None` if unbound/unhandled, e.g. key-release
+/// events on platforms that report them).
 pub fn map(key: KeyEvent) -> Option<Action> {
     use Action::*;
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     Some(match key.code {
-        KeyCode::Char('q') => Quit,
-        KeyCode::Char('c') if ctrl => Quit,
-        KeyCode::Up | KeyCode::Char('k') => Up,
-        KeyCode::Down | KeyCode::Char('j') => Down,
-        KeyCode::Tab | KeyCode::Right => NextSection,
-        KeyCode::BackTab | KeyCode::Left => PrevSection,
-        KeyCode::Char(' ') => Mark,
-        KeyCode::Enter => Detail,
-        KeyCode::Char('r') => RescanSection,
-        KeyCode::Char('R') => RescanAll,
-        KeyCode::Char('/') => Filter,
-        KeyCode::Char('s') => CycleSort,
-        KeyCode::Char('h') => ToggleSystem,
-        KeyCode::Char('x') => Execute,
+        KeyCode::Char('c') if ctrl => CtrlC,
+        KeyCode::Up => Up,
+        KeyCode::Down => Down,
+        KeyCode::Left => Left,
+        KeyCode::Right => Right,
+        KeyCode::Tab => Tab,
+        KeyCode::BackTab => BackTab,
+        KeyCode::Enter => Enter,
+        KeyCode::Esc => Esc,
+        KeyCode::Backspace => Backspace,
+        KeyCode::Char(c) => Char(c),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyEventKind, KeyEventState};
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    #[test]
+    fn ctrl_c_maps_distinctly_from_plain_c() {
+        assert_eq!(
+            map(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(Action::CtrlC)
+        );
+        assert_eq!(
+            map(key(KeyCode::Char('c'), KeyModifiers::NONE)),
+            Some(Action::Char('c'))
+        );
+    }
+
+    #[test]
+    fn every_char_passes_through_unmodified() {
+        for c in ['q', 'j', 'k', 'h', 'r', 'R', 's', 'x', '/', 'y', 'n', ' '] {
+            assert_eq!(
+                map(key(KeyCode::Char(c), KeyModifiers::NONE)),
+                Some(Action::Char(c))
+            );
+        }
+    }
+
+    #[test]
+    fn navigation_and_control_keys_map() {
+        assert_eq!(map(key(KeyCode::Up, KeyModifiers::NONE)), Some(Action::Up));
+        assert_eq!(
+            map(key(KeyCode::Down, KeyModifiers::NONE)),
+            Some(Action::Down)
+        );
+        assert_eq!(
+            map(key(KeyCode::Left, KeyModifiers::NONE)),
+            Some(Action::Left)
+        );
+        assert_eq!(
+            map(key(KeyCode::Right, KeyModifiers::NONE)),
+            Some(Action::Right)
+        );
+        assert_eq!(
+            map(key(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(Action::Tab)
+        );
+        assert_eq!(
+            map(key(KeyCode::BackTab, KeyModifiers::NONE)),
+            Some(Action::BackTab)
+        );
+        assert_eq!(
+            map(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::Enter)
+        );
+        assert_eq!(
+            map(key(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(Action::Esc)
+        );
+        assert_eq!(
+            map(key(KeyCode::Backspace, KeyModifiers::NONE)),
+            Some(Action::Backspace)
+        );
+    }
 }

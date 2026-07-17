@@ -3,13 +3,18 @@
 //! The loop `tokio::select!`s over crossterm's async `EventStream`, the
 //! `ScanEvent` channel, and a ~30fps draw tick. It performs NO blocking I/O —
 //! scanners run as tasks and report over the channel.
-//!
-//! Lane U extends `app.rs` (widgets, confirm dialog, activity log); this file is
-//! the reference loop that keeps the whole thing compiling against ratatui 0.30.
 
 pub mod app;
 pub mod keys;
 pub mod theme;
+
+mod activity;
+mod confirm;
+mod detail;
+mod sidebar;
+mod statusbar;
+mod table;
+mod tree;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,6 +87,19 @@ async fn run_loop(
             };
             let gen = manager.start(&tx, &sections);
             app.begin_scan(gen, &sections);
+        }
+
+        // Service a confirmed batch of remedies. Real execution (RemedyEngine
+        // + CommandRunner + trash, then a targeted rescan of affected
+        // sections) is Phase 2's integration job — it needs a runner/trash
+        // handle threaded into this loop, which isn't part of lane U's owned
+        // surface. For now we just log what *would* run so the confirm ->
+        // pending_execute -> activity-log path is exercised end to end.
+        if let Some(actions) = app.pending_execute.take() {
+            // TODO(phase2): execute via RemedyEngine + runner + trash, then targeted rescan.
+            for a in &actions {
+                app.push_activity(format!("queued: {}", a.rendered));
+            }
         }
 
         if app.should_quit {
