@@ -49,7 +49,10 @@ impl Scanner for PortsScanner {
 
             let binary_path = resolve_binary_path(&ctx, listener.pid).await;
 
-            let key = format!("{}:{}", listener.pid, listener.port);
+            // Include host: a process commonly binds the same port on both IPv4
+            // and IPv6 (two distinct sockets). Omitting host would give them the
+            // same FindingId and the upsert would silently drop one.
+            let key = format!("{}:{}:{}", listener.pid, listener.host, listener.port);
             let title = format!(
                 "PID {} {} — :{}",
                 listener.pid, listener.command, listener.port
@@ -270,5 +273,35 @@ postgres  678  nicky    7u  IPv4 0x0987654321abcd      0t0  TCP 127.0.0.1:5432 (
             "COMMAND   PID   USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME"
         )
         .is_none());
+    }
+
+    /// Regression: a process bound to the same port on IPv4 and IPv6 is two
+    /// distinct sockets and must yield two distinct FindingIds — otherwise the
+    /// upsert-by-id in every downstream sink silently drops one listener.
+    #[tokio::test]
+    async fn dual_stack_same_port_yields_distinct_ids() {
+        const DUAL: &str = "\
+COMMAND   PID   USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+postgres  678  nicky    7u  IPv4 0x0987654321abcd      0t0  TCP 127.0.0.1:5432 (LISTEN)
+postgres  678  nicky    8u  IPv6 0x0987654321abce      0t0  TCP [::1]:5432 (LISTEN)
+";
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        let mock = MockCommandRunner::new()
+            .on("lsof", &["-nP", "-iTCP", "-sTCP:LISTEN"], DUAL)
+            .on(
+                "ps",
+                &["-o", "comm=", "-p", "678"],
+                "/usr/local/bin/postgres\n",
+            );
+        let ctx = ctx_with(mock, tx);
+        PortsScanner.scan(ctx).await.unwrap();
+
+        let mut ids = std::collections::BTreeSet::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let ScanEvent::Finding { finding, .. } = ev {
+                ids.insert(finding.id);
+            }
+        }
+        assert_eq!(ids.len(), 2, "IPv4 and IPv6 listeners must not collide");
     }
 }

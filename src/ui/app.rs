@@ -594,7 +594,7 @@ impl AppState {
                 .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
                 .split(main[0]);
             self.draw_main_panel(frame, split[0]);
-            detail::draw(frame, split[1], self.selected_finding());
+            detail::draw(frame, split[1], self.selected_finding(), self.delete_mode);
         } else {
             self.draw_main_panel(frame, main[0]);
         }

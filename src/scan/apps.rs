@@ -171,8 +171,8 @@ impl Scanner for AppsScanner {
         };
 
         let total = parsed.apps.len() as u64;
-        // Apple Silicon detection: if any app reports arch_arm64 natively and
-        // none report i386-only... simplest reliable signal is `uname -m`.
+        // Apple Silicon detection: the simplest reliable signal is `uname -m`
+        // (== "arm64" on Apple Silicon), independent of per-app arch_kind.
         let is_apple_silicon = {
             let uname = ctx.runner.run("uname", &["-m"], &ctx.token).await;
             matches!(uname, Ok(o) if o.success() && o.stdout_str().trim() == "arm64")
@@ -201,7 +201,12 @@ impl Scanner for AppsScanner {
                 .arch_kind
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
-            let is_intel_only = arch.contains("i386");
+            // Real `system_profiler SPApplicationsDataType -json` reports the
+            // architecture as `arch_kind`: `arch_i64` = Intel-only (x86_64),
+            // `arch_arm` = native Apple Silicon, `arch_arm_i64` = Universal,
+            // `arch_ios`/`arch_other` = iOS-on-Mac / other. Intel-only apps run
+            // under Rosetta on Apple Silicon.
+            let is_intel_only = arch == "arch_i64";
             let rosetta_flag = is_apple_silicon && is_intel_only;
 
             let mut severity = match final_classification {
@@ -277,7 +282,7 @@ mod tests {
           "_name": "Safari",
           "path": "/System/Applications/Safari.app",
           "version": "17.0",
-          "arch_kind": "arch_arm64",
+          "arch_kind": "arch_arm_i64",
           "obtained_from": "apple",
           "signed_by": "Software Signing, Apple Root CA"
         },
@@ -285,7 +290,7 @@ mod tests {
           "_name": "Xcode",
           "path": "/Applications/Xcode.app",
           "version": "15.0",
-          "arch_kind": "arch_arm64",
+          "arch_kind": "arch_arm_i64",
           "obtained_from": "mac_app_store",
           "signed_by": "Apple Mac OS Application Signing"
         },
@@ -293,7 +298,7 @@ mod tests {
           "_name": "Slack",
           "path": "/Applications/Slack.app",
           "version": "4.36.0",
-          "arch_kind": "arch_arm64",
+          "arch_kind": "arch_arm_i64",
           "obtained_from": "identified_developer",
           "signed_by": "Developer ID Application: Slack Technologies, Inc."
         },
@@ -301,7 +306,7 @@ mod tests {
           "_name": "OldTool",
           "path": "/Applications/OldTool.app",
           "version": "1.2",
-          "arch_kind": "arch_i386",
+          "arch_kind": "arch_i64",
           "obtained_from": "identified_developer",
           "signed_by": "Developer ID Application: Some Dev"
         },
@@ -309,7 +314,7 @@ mod tests {
           "_name": "Mystery",
           "path": "/Applications/Mystery.app",
           "version": "0.1",
-          "arch_kind": "arch_arm64",
+          "arch_kind": "arch_arm_i64",
           "obtained_from": "unknown"
         }
       ]

@@ -77,7 +77,7 @@ impl Scanner for FsScanner {
         ScannerId::Fs
     }
 
-    async fn scan(&self, ctx: ScanCtx) -> anyhow::Result<()> {
+    async fn scan(&self, mut ctx: ScanCtx) -> anyhow::Result<()> {
         // Resolve roots (tilde-expanded) or fall back to the home dir.
         let roots: Vec<PathBuf> = if ctx.config.scan.roots.is_empty() {
             ctx.paths.default_roots()
@@ -108,8 +108,11 @@ impl Scanner for FsScanner {
         let discovery_only = ctx.fs_discovery_only;
         let stale_after_days = ctx.config.behavior.stale_after_days;
 
-        // The engine handed us `repo_tx` inside the ctx; move it into the walk.
-        let repo_tx = ctx.repo_tx.clone();
+        // The engine handed us `repo_tx` inside the ctx; TAKE it (not clone) so
+        // the only surviving senders live in `WalkShared`. Otherwise a leftover
+        // sender in `ctx` keeps the fs→git pipe open through the whole sizing
+        // pass, delaying GitScanner's completion until this scan returns.
+        let repo_tx = ctx.repo_tx.take();
 
         let hits: Arc<Mutex<Vec<Hit>>> = Arc::new(Mutex::new(Vec::new()));
 

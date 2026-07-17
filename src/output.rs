@@ -2,7 +2,9 @@
 
 use std::collections::BTreeMap;
 
+use crate::config::DeleteMode;
 use crate::model::{Finding, FindingId};
+use crate::remedy::RemedyEngine;
 
 /// Serialize findings as a JSON array (`Vec<Finding>`), sorted by id for stable
 /// output. This is the contract behind `macaudit scan --json` (spec §5).
@@ -13,16 +15,22 @@ pub fn findings_to_json(findings: &BTreeMap<FindingId, Finding>) -> anyhow::Resu
 
 /// Human-readable dry-run listing of the remedy commands that `clean` would run,
 /// running nothing (spec §5 `clean --dry-run`).
-pub fn dry_run_report(findings: &BTreeMap<FindingId, Finding>) -> String {
+///
+/// Commands are rendered through `RemedyEngine` with the active `delete_mode`, so
+/// under `--rm` the preview shows the literal `rm -rf …` that would actually run
+/// — never `trash …` for an operation that is really irreversible.
+pub fn dry_run_report(findings: &BTreeMap<FindingId, Finding>, delete_mode: DeleteMode) -> String {
     use std::fmt::Write;
+    let engine = RemedyEngine::new(delete_mode);
     let mut out = String::new();
     let mut n = 0usize;
     let mut reclaim: u64 = 0;
     for f in findings.values() {
         for r in &f.remedies {
             if r.destructive {
+                let action = engine.plan_one(f.id, r);
                 let _ = writeln!(out, "# {}  ({})", f.title, f.severity_label());
-                let _ = writeln!(out, "{}", r.command.rendered());
+                let _ = writeln!(out, "{}", action.rendered);
                 n += 1;
                 reclaim += r.reclaims_bytes.unwrap_or(0);
             }
@@ -85,8 +93,17 @@ mod tests {
 
     #[test]
     fn dry_run_lists_command_verbatim() {
-        let report = dry_run_report(&sample());
+        let report = dry_run_report(&sample(), DeleteMode::Trash);
         assert!(report.contains("trash /p/node_modules"));
         assert!(report.contains("destructive remedy"));
+    }
+
+    #[test]
+    fn dry_run_rm_mode_shows_rm_not_trash() {
+        // The whole point of the dry run is an honest preview: in --rm mode it
+        // must show the literal `rm -rf`, never `trash`.
+        let report = dry_run_report(&sample(), DeleteMode::Rm);
+        assert!(report.contains("rm -rf /p/node_modules"), "got: {report}");
+        assert!(!report.contains("trash /p/node_modules"));
     }
 }

@@ -1,4 +1,4 @@
-//! DockerScanner (spec §3.7) — `docker system df -v --format json` → dangling
+//! DockerScanner (spec §3.7) — `docker system df --format json` → dangling
 //! images, stopped containers, unused volumes, build cache. If the CLI is
 //! missing or the daemon is unreachable, emit a single Info finding and
 //! return Ok — never fail the whole scan over an optional tool.
@@ -18,13 +18,13 @@ impl Scanner for DockerScanner {
     }
 
     async fn scan(&self, ctx: ScanCtx) -> anyhow::Result<()> {
+        // NOTE: `--format json` is ignored when `-v`/`--verbose` is passed (docker
+        // prints the human-readable verbose tables instead), so we must NOT pass
+        // `-v`. The plain `docker system df --format json` emits the NDJSON summary
+        // (Type/TotalCount/Active/Size/Reclaimable) this parser expects.
         let out = match ctx
             .runner
-            .run(
-                "docker",
-                &["system", "df", "-v", "--format", "json"],
-                &ctx.token,
-            )
+            .run("docker", &["system", "df", "--format", "json"], &ctx.token)
             .await
         {
             Ok(o) if o.success() => o,
@@ -207,7 +207,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(256);
         let mock = MockCommandRunner::new().on_fail(
             "docker",
-            &["system", "df", "-v", "--format", "json"],
+            &["system", "df", "--format", "json"],
             1,
             "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?",
         );
@@ -251,7 +251,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(256);
         let mock = MockCommandRunner::new().on(
             "docker",
-            &["system", "df", "-v", "--format", "json"],
+            &["system", "df", "--format", "json"],
             DF_FIXTURE,
         );
         let mut ctx = ctx_with(mock);

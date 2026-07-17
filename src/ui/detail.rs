@@ -10,19 +10,21 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
+use crate::config::DeleteMode;
 use crate::model::Finding;
+use crate::remedy::RemedyEngine;
 use crate::ui::theme;
 
-pub fn draw(frame: &mut Frame, area: Rect, selected: Option<&Finding>) {
+pub fn draw(frame: &mut Frame, area: Rect, selected: Option<&Finding>, delete_mode: DeleteMode) {
     let block = Block::default().borders(Borders::ALL).title(" Detail ");
     let text: Vec<Line> = match selected {
         None => vec![Line::from("No selection")],
-        Some(f) => render_finding(f),
+        Some(f) => render_finding(f, delete_mode),
     };
     frame.render_widget(Paragraph::new(text).block(block), area);
 }
 
-fn render_finding(f: &Finding) -> Vec<Line<'static>> {
+fn render_finding(f: &Finding, delete_mode: DeleteMode) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(Span::styled(
             f.title.clone(),
@@ -66,11 +68,15 @@ fn render_finding(f: &Finding) -> Vec<Line<'static>> {
             "Remedies:",
             Style::default().add_modifier(Modifier::BOLD),
         )));
+        // Render through the RemedyEngine so the string shown matches what would
+        // actually run — under `--rm`, a Trash remedy displays as `rm -rf …`.
+        let engine = RemedyEngine::new(delete_mode);
         for r in &f.remedies {
+            let action = engine.plan_one(f.id, r);
             let color = theme::remedy_color(r.destructive);
             lines.push(Line::from(vec![
                 Span::raw(format!("  {} — ", r.label)),
-                Span::styled(r.command.rendered(), Style::default().fg(color)),
+                Span::styled(action.rendered, Style::default().fg(color)),
             ]));
         }
     }

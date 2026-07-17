@@ -109,9 +109,10 @@ impl RemedyEngine {
                 Ok(format!("Revealed {}", path.display()))
             }
             RemedyCommand::CopyToClipboard { text } => {
-                // pbcopy reads stdin; we can't pipe via CommandRunner, so this is
-                // surfaced to the user rather than executed. The UI copies via the
-                // clipboard directly; here we just report.
+                // Not executed: there's no clipboard integration yet, and this
+                // variant is only used for things we deliberately won't run (e.g.
+                // `kill <pid>`). We surface the text so the user can copy it
+                // themselves; the detail pane shows the same string verbatim.
                 Ok(format!("Copy to clipboard: {text}"))
             }
         }

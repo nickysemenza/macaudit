@@ -69,7 +69,10 @@ async fn run_clean(manager: &ScannerManager, args: &CleanArgs) -> anyhow::Result
     }
     let sections = args.sections()?;
     let findings = manager.run_to_completion(&sections).await;
-    print!("{}", output::dry_run_report(&findings));
+    print!(
+        "{}",
+        output::dry_run_report(&findings, manager.delete_mode())
+    );
     Ok(())
 }
 
