@@ -128,10 +128,12 @@ pub fn draw(
             }
             TreeRow::Item(f) => {
                 let mark = if is_marked(f.id) { theme::MARK } else { " " };
+                // Apps/Brew items have no size concept — show it only if present
+                // (blank, not a perpetual `…`).
                 let size = f
                     .size_bytes
                     .map(|b| humansize::format_size(b, humansize::BINARY))
-                    .unwrap_or_else(|| "…".to_string());
+                    .unwrap_or_default();
                 ListItem::new(Line::from(vec![
                     Span::raw(format!("    {mark} ")),
                     Span::raw(format!("{:<32}", f.title)),

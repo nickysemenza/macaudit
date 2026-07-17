@@ -78,6 +78,19 @@ impl Classification {
             Classification::Unmanaged => "unmanaged",
         }
     }
+
+    /// Human-readable label used as the tree-view group header (spec §4). Apps
+    /// are bucketed by this so the user can see System vs Homebrew-cask vs
+    /// Unmanaged at a glance. `correlate` overrides this to "Homebrew Cask" for
+    /// apps matched to an installed cask.
+    fn group_label(self) -> &'static str {
+        match self {
+            Classification::System => "System",
+            Classification::User => "User",
+            Classification::AppStore => "App Store",
+            Classification::Unmanaged => "Unmanaged",
+        }
+    }
 }
 
 fn classify(path: &str, obtained_from: Option<&str>, ctx: &ScanCtx) -> Classification {
@@ -222,6 +235,7 @@ impl Scanner for AppsScanner {
 
             let meta = json!({
                 "classification": final_classification.as_str(),
+                "group": final_classification.group_label(),
                 "arch": arch,
                 "obtained_from": raw.obtained_from,
                 "signed_by": raw.signed_by.as_ref().map(|s| s.display()),

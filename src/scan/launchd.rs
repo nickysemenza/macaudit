@@ -1,8 +1,11 @@
 //! LaunchdScanner — enumerates plists under `~/Library/LaunchAgents`,
 //! `/Library/LaunchAgents`, and `/Library/LaunchDaemons`; cross-references
-//! `launchctl list` for running state and (best-effort) `sfltool dumpbtm` for
-//! the Ventura+ background-items registry; flags orphaned items whose
+//! `launchctl list` for running state; flags orphaned items whose
 //! `Program`/`ProgramArguments[0]` binary no longer exists on disk.
+//!
+//! We deliberately do NOT call `sfltool dumpbtm` (the Ventura+ background-items
+//! registry): it requires admin rights and pops a password prompt on every
+//! scan, which is unacceptable for a read-only audit that rescans freely.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -69,7 +72,6 @@ impl Scanner for LaunchdScanner {
         ];
 
         let running = running_labels(&ctx).await;
-        let bg_registry = background_item_registry(&ctx).await;
 
         for (dir, domain) in dirs {
             if ctx.cancelled() {
@@ -90,8 +92,7 @@ impl Scanner for LaunchdScanner {
                 if ctx.cancelled() {
                     break;
                 }
-                self.emit_for_plist(&ctx, &path, domain, &running, bg_registry.as_deref())
-                    .await;
+                self.emit_for_plist(&ctx, &path, domain, &running).await;
             }
         }
 
@@ -106,7 +107,6 @@ impl LaunchdScanner {
         path: &Path,
         domain: Domain,
         running: &HashSet<String>,
-        bg_registry: Option<&str>,
     ) {
         let parsed: LaunchdPlist = match plist::from_file(path) {
             Ok(v) => v,
@@ -127,9 +127,8 @@ impl LaunchdScanner {
         });
 
         let is_running = running.contains(&label);
-        let in_registry = bg_registry.map(|r| r.contains(&label));
 
-        let mut meta = json!({
+        let meta = json!({
             "label": label,
             "program": program_path,
             "program_arguments": parsed.program_arguments,
@@ -138,9 +137,6 @@ impl LaunchdScanner {
             "run_at_load": parsed.run_at_load,
             "disabled": parsed.disabled,
         });
-        if let Some(in_reg) = in_registry {
-            meta["background_item_registry"] = json!(in_reg);
-        }
 
         let key = path.to_string_lossy().to_string();
         let missing = program_path
@@ -216,17 +212,6 @@ async fn running_labels(ctx: &ScanCtx) -> HashSet<String> {
         }
     }
     set
-}
-
-/// Best-effort dump of the Ventura+ background-items registry. Tolerates
-/// absence/failure of `sfltool` (e.g. running on an older macOS or in CI).
-async fn background_item_registry(ctx: &ScanCtx) -> Option<String> {
-    let out = ctx
-        .runner
-        .run("sfltool", &["dumpbtm"], &ctx.token)
-        .await
-        .ok()?;
-    out.success().then(|| out.stdout_str().to_string())
 }
 
 /// Resolve the `launchctl` domain-target for bootout. LaunchDaemons live in
@@ -334,13 +319,11 @@ mod tests {
             bin.to_str().unwrap(),
         );
 
-        let mock = crate::runner::MockCommandRunner::new()
-            .on(
-                "launchctl",
-                &["list"],
-                "PID\tStatus\tLabel\n1234\t0\tcom.example.ok\n",
-            )
-            .on_fail("sfltool", &["dumpbtm"], 1, "no such tool");
+        let mock = crate::runner::MockCommandRunner::new().on(
+            "launchctl",
+            &["list"],
+            "PID\tStatus\tLabel\n1234\t0\tcom.example.ok\n",
+        );
         let (ctx, mut rx) = ctx_with(&tmp, mock);
 
         LaunchdScanner.scan(ctx).await.unwrap();
@@ -366,8 +349,7 @@ mod tests {
 
         let mock = crate::runner::MockCommandRunner::new()
             .on("launchctl", &["list"], "PID\tStatus\tLabel\n")
-            .on("id", &["-u"], "501\n")
-            .on_fail("sfltool", &["dumpbtm"], 1, "no such tool");
+            .on("id", &["-u"], "501\n");
         let (ctx, mut rx) = ctx_with(&tmp, mock);
 
         LaunchdScanner.scan(ctx).await.unwrap();
@@ -400,9 +382,7 @@ mod tests {
     #[tokio::test]
     async fn missing_launch_agents_dir_emits_nothing_under_fixture_home() {
         let tmp = tempfile::tempdir().unwrap();
-        let mock = crate::runner::MockCommandRunner::new()
-            .on("launchctl", &["list"], "")
-            .on_fail("sfltool", &["dumpbtm"], 1, "");
+        let mock = crate::runner::MockCommandRunner::new().on("launchctl", &["list"], "");
         let (ctx, mut rx) = ctx_with(&tmp, mock);
 
         LaunchdScanner.scan(ctx).await.unwrap();

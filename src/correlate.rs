@@ -1,45 +1,39 @@
 //! Cross-scanner joins applied after a full scan collects into a map.
 //!
-//! Lane S1 implements the apps ↔ brew cask join: for every Unmanaged app
-//! (AppsScanner, `meta.classification == "unmanaged"`), look for a BrewCask
-//! finding whose `meta.app_paths` includes the app's path, or whose token
-//! matches the app's name once normalized. When found, attach a
-//! `brew install --cask --adopt <token>` remedy to the app finding and note
-//! the match in its `meta`.
+//! The apps ↔ brew cask join: an app whose bundle path matches an **installed**
+//! cask's artifact paths (from `brew info --installed --cask`) is managed by
+//! Homebrew. We mark those apps so the UI can group them under "Homebrew Cask"
+//! and stop flagging them as Unmanaged — answering "which apps did brew
+//! install?" at a glance.
 //!
-//! Findings are keyed by id in a `BTreeMap`, so joins are done in two passes:
-//! first collect `(app_id, cask_token)` matches by immutable iteration, then
-//! mutate the map — this satisfies the borrow checker without cloning the
-//! whole map. Defensive throughout: missing/malformed `meta` fields are
-//! tolerated, never panicked on.
+//! We do NOT offer a `brew install --cask --adopt` remedy here: matching only
+//! against *installed* casks means a match is already-managed (adopting it would
+//! be a no-op), and detecting a manually-installed app that an *available* cask
+//! could adopt requires the online cask catalog (formulae.brew.sh), which is
+//! v1.1. The `meta.app_paths`/`meta.classification` fields are left in place for
+//! that future pass.
+//!
+//! Findings are keyed by id in a `BTreeMap`, so the join is two passes: collect
+//! `(app_id, cask_token)` matches by immutable iteration, then mutate — this
+//! satisfies the borrow checker without cloning the whole map. Defensive
+//! throughout: missing/malformed `meta` fields are tolerated, never panicked on.
 
 use std::collections::BTreeMap;
 
-use crate::model::{Finding, FindingId, FindingKind, Remedy, RemedyCommand};
+use crate::model::{Finding, FindingId, FindingKind, Severity};
 
 /// Enrich findings in place using information across scanners.
 pub fn correlate(findings: &mut BTreeMap<FindingId, Finding>) {
-    correlate_apps_to_casks(findings);
+    mark_cask_managed_apps(findings);
 }
 
-/// Normalize a display name into something comparable to a brew cask token:
-/// lowercase, strip a trailing ".app", collapse whitespace to single hyphens.
-fn normalize_for_cask_match(name: &str) -> String {
-    let name = name.trim().trim_end_matches(".app");
-    name.to_ascii_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join("-")
-}
-
-/// One cask candidate available for correlation, collected from the map
-/// before any mutation.
+/// One installed cask, collected from the map before any mutation.
 struct CaskCandidate {
     token: String,
     app_paths: Vec<String>,
 }
 
-fn correlate_apps_to_casks(findings: &mut BTreeMap<FindingId, Finding>) {
+fn mark_cask_managed_apps(findings: &mut BTreeMap<FindingId, Finding>) {
     let casks: Vec<CaskCandidate> = findings
         .values()
         .filter(|f| f.kind == FindingKind::BrewCask)
@@ -68,62 +62,35 @@ fn correlate_apps_to_casks(findings: &mut BTreeMap<FindingId, Finding>) {
         return;
     }
 
-    // Pass 1: find matches without mutating.
+    // Pass 1: find apps whose path matches an installed cask's artifact paths.
     let mut matches: Vec<(FindingId, String)> = Vec::new();
     for f in findings.values() {
         if f.kind != FindingKind::App {
             continue;
         }
-        let is_unmanaged = f
-            .meta
-            .get("classification")
-            .and_then(|v| v.as_str())
-            .map(|s| s == "unmanaged")
-            .unwrap_or(false);
-        if !is_unmanaged {
+        let Some(app_path) = f.path.as_ref().map(|p| p.to_string_lossy().to_string()) else {
             continue;
-        }
-
-        let app_path = f.path.as_ref().map(|p| p.to_string_lossy().to_string());
-        let app_name_normalized = normalize_for_cask_match(&f.title);
-
-        let found = casks.iter().find(|c| {
-            let path_match = app_path
-                .as_deref()
-                .map(|p| c.app_paths.iter().any(|ap| ap == p))
-                .unwrap_or(false);
-            let name_match = c.token == app_name_normalized;
-            path_match || name_match
-        });
-
-        if let Some(cask) = found {
+        };
+        if let Some(cask) = casks
+            .iter()
+            .find(|c| c.app_paths.iter().any(|ap| ap == &app_path))
+        {
             matches.push((f.id, cask.token.clone()));
         }
     }
 
-    // Pass 2: mutate.
+    // Pass 2: mark the matched apps as cask-managed.
     for (app_id, token) in matches {
         if let Some(app) = findings.get_mut(&app_id) {
-            app.remedies.push(Remedy {
-                label: format!("Adopt into Homebrew cask `{token}`"),
-                command: RemedyCommand::Shell {
-                    program: "brew".to_string(),
-                    args: vec![
-                        "install".to_string(),
-                        "--cask".to_string(),
-                        "--adopt".to_string(),
-                        token.clone(),
-                    ],
-                },
-                reclaims_bytes: None,
-                destructive: false,
-            });
-
-            let mut meta = app.meta.clone();
-            if let Some(obj) = meta.as_object_mut() {
-                obj.insert("matched_cask".to_string(), serde_json::Value::String(token));
+            if let Some(obj) = app.meta.as_object_mut() {
+                obj.insert("group".to_string(), serde_json::json!("Homebrew Cask"));
+                obj.insert("classification".to_string(), serde_json::json!("cask"));
+                obj.insert("managed_by_cask".to_string(), serde_json::json!(token));
             }
-            app.meta = meta;
+            // A brew-managed app isn't an "unmanaged" concern.
+            if app.severity == Severity::Attention {
+                app.severity = Severity::Info;
+            }
         }
     }
 }
@@ -131,14 +98,14 @@ fn correlate_apps_to_casks(findings: &mut BTreeMap<FindingId, Finding>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{FindingKind, Severity};
+    use crate::model::Severity;
     use serde_json::json;
 
     fn app_finding(path: &str, name: &str) -> Finding {
         Finding::new(FindingKind::App, path, name)
             .path(path)
             .severity(Severity::Attention)
-            .meta(json!({ "classification": "unmanaged" }))
+            .meta(json!({ "classification": "unmanaged", "group": "Unmanaged" }))
     }
 
     fn cask_finding(token: &str, app_paths: Vec<&str>) -> Finding {
@@ -147,7 +114,7 @@ mod tests {
     }
 
     #[test]
-    fn adds_adopt_remedy_when_app_path_matches_cask_app_paths() {
+    fn marks_app_cask_managed_when_path_matches() {
         let mut map = BTreeMap::new();
         let app = app_finding("/Applications/Slack.app", "Slack");
         let cask = cask_finding("slack", vec!["/Applications/Slack.app"]);
@@ -157,45 +124,29 @@ mod tests {
         correlate(&mut map);
 
         let updated = map.get(&app.id).unwrap();
-        assert!(updated.remedies.iter().any(|r| matches!(
-            &r.command,
-            RemedyCommand::Shell { program, args }
-                if program == "brew" && args == &vec![
-                    "install".to_string(), "--cask".to_string(), "--adopt".to_string(), "slack".to_string()
-                ]
-        )));
-        assert_eq!(updated.meta["matched_cask"], "slack");
-    }
-
-    #[test]
-    fn adds_adopt_remedy_when_name_matches_token() {
-        let mut map = BTreeMap::new();
-        // No app_paths overlap, but the normalized name matches the token.
-        let app = app_finding("/Applications/Visual Studio Code.app", "Visual Studio Code");
-        let cask = cask_finding("visual-studio-code", vec![]);
-        map.insert(app.id, app.clone());
-        map.insert(cask.id, cask);
-
-        correlate(&mut map);
-
-        let updated = map.get(&app.id).unwrap();
-        assert_eq!(updated.remedies.len(), 1);
-        assert_eq!(updated.meta["matched_cask"], "visual-studio-code");
-    }
-
-    #[test]
-    fn does_not_touch_managed_apps() {
-        let mut map = BTreeMap::new();
-        let mut app = app_finding("/Applications/Xcode.app", "Xcode");
-        app.meta = json!({ "classification": "app_store" });
-        let cask = cask_finding("xcode", vec!["/Applications/Xcode.app"]);
-        map.insert(app.id, app.clone());
-        map.insert(cask.id, cask);
-
-        correlate(&mut map);
-
-        let updated = map.get(&app.id).unwrap();
+        assert_eq!(updated.meta["group"], "Homebrew Cask");
+        assert_eq!(updated.meta["classification"], "cask");
+        assert_eq!(updated.meta["managed_by_cask"], "slack");
+        // No longer an "unmanaged" attention item.
+        assert_eq!(updated.severity, Severity::Info);
+        // We do not offer an adopt remedy in v1.
         assert!(updated.remedies.is_empty());
+    }
+
+    #[test]
+    fn name_only_match_is_not_marked() {
+        // Same normalized name but the cask's app_paths don't include this path:
+        // without a path match we can't claim it's the installed one.
+        let mut map = BTreeMap::new();
+        let app = app_finding("/Applications/Visual Studio Code.app", "Visual Studio Code");
+        let cask = cask_finding("visual-studio-code", vec!["/some/other/path.app"]);
+        map.insert(app.id, app.clone());
+        map.insert(cask.id, cask);
+
+        correlate(&mut map);
+
+        let updated = map.get(&app.id).unwrap();
+        assert_eq!(updated.meta["group"], "Unmanaged");
     }
 
     #[test]
@@ -205,22 +156,16 @@ mod tests {
         let cask = Finding::new(FindingKind::BrewCask, "weird", "weird");
         map.insert(app.id, app);
         map.insert(cask.id, cask);
-
         correlate(&mut map); // must not panic
     }
 
     #[test]
-    fn unrelated_app_with_no_cask_gets_no_remedy() {
+    fn app_with_no_cask_is_untouched() {
         let mut map = BTreeMap::new();
-        let app = app_finding("/Applications/Nothing.app", "Nothing");
-        let cask = cask_finding("slack", vec!["/Applications/Slack.app"]);
+        let app = app_finding("/Applications/Bespoke.app", "Bespoke");
         map.insert(app.id, app.clone());
-        map.insert(cask.id, cask);
-
         correlate(&mut map);
-
         let updated = map.get(&app.id).unwrap();
-        assert!(updated.remedies.is_empty());
-        assert!(updated.meta.get("matched_cask").is_none());
+        assert_eq!(updated.meta["group"], "Unmanaged");
     }
 }

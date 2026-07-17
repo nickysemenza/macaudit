@@ -618,6 +618,7 @@ impl AppState {
         match registry::section(id).view {
             ViewKind::Table => {
                 let rows = self.visible_findings();
+                let is_scanning = matches!(self.status_of(id), SectionStatus::Scanning { .. });
                 table::draw(
                     frame,
                     area,
@@ -625,6 +626,7 @@ impl AppState {
                     &rows,
                     |fid| self.marked.contains(&fid),
                     self.selected_row,
+                    is_scanning,
                 );
             }
             ViewKind::Tree => {
