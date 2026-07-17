@@ -12,9 +12,10 @@
 //! walk drops `repo_tx` the instant it finishes so GitScanner's channel closes
 //! before the (potentially long) sizing pass — the two run concurrently.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use ignore::{WalkBuilder, WalkState};
@@ -24,6 +25,7 @@ use crate::model::{Finding, FindingKind, Remedy, RemedyCommand, ScanEvent, Scann
 use crate::scan::pipe::{RepoDiscovery, RepoSender};
 use crate::scan::sizing::{du_blocks, on_disk_bytes};
 use crate::scan::{ScanCtx, Scanner};
+use crate::size_cache::{self, CachedSize, SizeCache};
 
 #[derive(Default)]
 pub struct FsScanner;
@@ -121,25 +123,66 @@ impl Scanner for FsScanner {
         // (potentially long) walk finishes.
         let (hit_tx, hit_rx) = crossbeam_channel::unbounded::<Hit>();
 
+        // Sizes computed fresh this scan, accumulated here and flushed to the
+        // cache db once (after) the sizing pass finishes.
+        let fresh_entries: Arc<Mutex<Vec<(PathBuf, CachedSize)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+
         let sizing = if discovery_only {
             // Discovery-only feeds the git pipe and emits no disk findings.
             None
         } else {
             let tx_sz = tx.clone();
             let token_sz = token.clone();
+            let fresh_sz = fresh_entries.clone();
+            let ttl_hours = config.scan.size_cache_ttl_hours;
+
+            // Load the on-disk size cache before the walk starts. An
+            // unopenable/corrupt db (or any load failure) degrades to an empty
+            // cache — a scan must never fail because of it.
+            let paths_sz = paths.clone();
+            let cache: Arc<HashMap<PathBuf, CachedSize>> = Arc::new(
+                tokio::task::spawn_blocking(move || load_cache(&size_cache::db_path(&paths_sz)))
+                    .await
+                    .unwrap_or_default(),
+            );
+            let now_secs = unix_secs(SystemTime::now());
+
             Some(tokio::task::spawn_blocking(move || {
                 use rayon::iter::{ParallelBridge, ParallelIterator};
                 hit_rx.into_iter().par_bridge().for_each(|hit| {
                     if token_sz.is_cancelled() {
                         return;
                     }
-                    let size = du_blocks(&hit.path, &|| token_sz.is_cancelled());
+                    let root_mtime = root_mtime_secs(&hit.path);
+                    let cached = cache
+                        .get(&hit.path)
+                        .copied()
+                        .filter(|c| is_fresh(c, root_mtime, now_secs, ttl_hours));
+
+                    let (size, was_cached) = match cached {
+                        Some(c) => (c.size, true),
+                        None => {
+                            let size = du_blocks(&hit.path, &|| token_sz.is_cancelled());
+                            fresh_sz.lock().unwrap().push((
+                                hit.path.clone(),
+                                CachedSize {
+                                    size,
+                                    computed_at: now_secs,
+                                    root_mtime,
+                                },
+                            ));
+                            (size, false)
+                        }
+                    };
+
                     let f = artifact_finding(
                         &hit.path,
                         &hit.label,
                         hit.last_used,
                         hit.stale,
                         Some(size),
+                        was_cached,
                     );
                     let _ = tx_sz.blocking_send(ScanEvent::Finding {
                         scanner: ScannerId::Fs,
@@ -176,6 +219,18 @@ impl Scanner for FsScanner {
 
         if let Some(sizing) = sizing {
             sizing.await?;
+        }
+
+        // Persist freshly measured sizes for next time (best-effort — a save
+        // failure is silently ignored, the cache is never load-bearing).
+        let entries: Vec<(PathBuf, CachedSize)> =
+            std::mem::take(&mut *fresh_entries.lock().unwrap());
+        if !entries.is_empty() {
+            let paths_save = paths.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                save_cache(&size_cache::db_path(&paths_save), &entries)
+            })
+            .await;
         }
 
         if discovery_only {
@@ -264,7 +319,7 @@ fn visit(shared: &WalkShared, result: Result<ignore::DirEntry, ignore::Error>) -
             if !shared.discovery_only {
                 let last_used = path.parent().and_then(parent_max_mtime);
                 let stale = is_stale(last_used, shared.stale_after_days);
-                let f = artifact_finding(path, name, last_used, stale, None);
+                let f = artifact_finding(path, name, last_used, stale, None, false);
                 let _ = shared.tx.blocking_send(ScanEvent::Finding {
                     scanner: ScannerId::Fs,
                     gen: shared.gen,
@@ -330,13 +385,16 @@ fn is_artifact(name: &str, path: &Path, config: &crate::config::Config) -> bool 
 }
 
 /// Build an artifact finding. `None` size marks the initial (pending) emit; the
-/// re-emit passes `Some` — same `(kind, key)` ⇒ same `FindingId`.
+/// re-emit passes `Some` — same `(kind, key)` ⇒ same `FindingId`. `cached`
+/// marks a re-emit whose size came from the size cache rather than a fresh
+/// `du_blocks` (surfaced to the UI via `meta.size_cached`).
 fn artifact_finding(
     path: &Path,
     label: &str,
     last_used: Option<SystemTime>,
     stale: bool,
     size: Option<u64>,
+    cached: bool,
 ) -> Finding {
     let key = path.to_string_lossy();
     let parent_name = path
@@ -346,11 +404,16 @@ fn artifact_finding(
         .unwrap_or_default();
     let title = format!("{label} — {parent_name}");
 
+    let mut meta = json!({ "stale": stale, "artifact": label });
+    if cached {
+        meta["size_cached"] = json!(true);
+    }
+
     let mut f = Finding::new(FindingKind::BuildArtifact, &key, title)
         .path(path.to_path_buf())
         .detail(format!("Build artifact ({label})"))
         .severity(Severity::Reclaimable)
-        .meta(json!({ "stale": stale, "artifact": label }));
+        .meta(meta);
     if let Some(sz) = size {
         f = f.size(sz);
     }
@@ -574,6 +637,55 @@ fn emit_fixed(
         gen,
         finding: Box::new(f),
     });
+}
+
+// --- Artifact size cache integration -------------------------------------
+//
+// The cache is consulted per-`Hit` in the sizing consumer above: a hit is
+// re-used (no `du_blocks`) when its cached entry is both within the TTL and
+// keyed to the artifact root's current mtime; otherwise it's measured fresh
+// and queued for a single batched `upsert_batch` after the sizing pass ends.
+
+/// Best-effort cache open + load. An unopenable or corrupt db degrades to an
+/// empty cache rather than failing the scan.
+fn load_cache(path: &Path) -> HashMap<PathBuf, CachedSize> {
+    SizeCache::open(path)
+        .and_then(|c| c.load_all())
+        .unwrap_or_default()
+}
+
+/// Best-effort persistence of freshly measured sizes. Failure is silently
+/// ignored — the cache is a performance optimization, never load-bearing.
+fn save_cache(path: &Path, entries: &[(PathBuf, CachedSize)]) {
+    if let Ok(mut cache) = SizeCache::open(path) {
+        let _ = cache.upsert_batch(entries);
+    }
+}
+
+/// Unix-seconds mtime of `path` itself (the artifact root), 0 on any failure
+/// (missing path, permission error, platforms without mtime support).
+fn root_mtime_secs(path: &Path) -> i64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .map(unix_secs)
+        .unwrap_or(0)
+}
+
+fn unix_secs(t: SystemTime) -> i64 {
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Is a cached size still trustworthy: measured within the TTL window AND the
+/// artifact root's mtime hasn't moved since (a changed mtime means the tree
+/// was touched, so the old size can no longer be trusted).
+fn is_fresh(cached: &CachedSize, current_root_mtime: i64, now_secs: i64, ttl_hours: u64) -> bool {
+    let ttl_secs = (ttl_hours as i64).saturating_mul(3600);
+    let not_expired = cached.computed_at > now_secs.saturating_sub(ttl_secs);
+    let mtime_matches = cached.root_mtime == current_root_mtime;
+    not_expired && mtime_matches
 }
 
 #[cfg(test)]
@@ -834,5 +946,157 @@ mod tests {
                 .any(|f| f.path.as_deref() == Some(lib.join("node_modules").as_path())),
             "~/Library must be skipped by the walk"
         );
+    }
+
+    /// Build a fixture tree with one sizeable `node_modules` artifact. Returns
+    /// its path.
+    fn fixture_node_modules(home: &Path) -> PathBuf {
+        let proj = home.join("app");
+        fs::create_dir_all(proj.join("node_modules/pkg")).unwrap();
+        fs::write(proj.join("package.json"), "{}").unwrap();
+        fs::write(proj.join("node_modules/pkg/blob.bin"), vec![7u8; 4096]).unwrap();
+        proj.join("node_modules")
+    }
+
+    #[tokio::test]
+    async fn cold_scan_populates_size_cache_db() {
+        let home = tempfile::tempdir().unwrap();
+        let nm = fixture_node_modules(home.path());
+
+        let (ctx, rx, _) = ctx_for(home.path(), false, false, vec![]);
+        FsScanner.scan(ctx).await.unwrap();
+
+        let findings = drain(rx);
+        let sized = findings
+            .iter()
+            .find(|f| {
+                f.path.as_deref() == Some(nm.as_path()) && f.size_bytes.is_some_and(|v| v > 0)
+            })
+            .expect("expected a sized node_modules finding");
+        assert!(
+            sized.meta.get("size_cached").is_none(),
+            "a cold scan must not claim a cached size"
+        );
+
+        // The size we just computed should now be persisted in the cache db.
+        let db = size_cache::db_path(&Paths::from_home(home.path()));
+        let cache = SizeCache::open(&db).unwrap();
+        let all = cache.load_all().unwrap();
+        let entry = all
+            .get(&nm)
+            .expect("expected a node_modules row in the size cache db");
+        assert!(entry.size > 0);
+        assert_eq!(entry.size, sized.size_bytes.unwrap());
+    }
+
+    #[tokio::test]
+    async fn warm_cache_within_ttl_and_matching_mtime_is_reused() {
+        let home = tempfile::tempdir().unwrap();
+        let nm = fixture_node_modules(home.path());
+        let root_mtime = root_mtime_secs(&nm);
+        let now = unix_secs(SystemTime::now());
+
+        let db = size_cache::db_path(&Paths::from_home(home.path()));
+        {
+            let mut cache = SizeCache::open(&db).unwrap();
+            cache
+                .upsert_batch(&[(
+                    nm.clone(),
+                    CachedSize {
+                        size: 999_999,
+                        computed_at: now,
+                        root_mtime,
+                    },
+                )])
+                .unwrap();
+        }
+
+        let (ctx, rx, _) = ctx_for(home.path(), false, false, vec![]);
+        FsScanner.scan(ctx).await.unwrap();
+
+        let findings = drain(rx);
+        let hit = findings
+            .iter()
+            .find(|f| f.path.as_deref() == Some(nm.as_path()) && f.size_bytes == Some(999_999))
+            .expect("expected the cached size to be reused verbatim");
+        assert_eq!(hit.meta["size_cached"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn cache_entry_with_wrong_root_mtime_is_ignored() {
+        let home = tempfile::tempdir().unwrap();
+        let nm = fixture_node_modules(home.path());
+        let now = unix_secs(SystemTime::now());
+
+        let db = size_cache::db_path(&Paths::from_home(home.path()));
+        {
+            let mut cache = SizeCache::open(&db).unwrap();
+            cache
+                .upsert_batch(&[(
+                    nm.clone(),
+                    CachedSize {
+                        size: 999_999,
+                        computed_at: now,
+                        root_mtime: 1, // deliberately wrong — the tree "changed"
+                    },
+                )])
+                .unwrap();
+        }
+
+        let (ctx, rx, _) = ctx_for(home.path(), false, false, vec![]);
+        FsScanner.scan(ctx).await.unwrap();
+
+        let findings = drain(rx);
+        let hit = findings
+            .iter()
+            .find(|f| {
+                f.path.as_deref() == Some(nm.as_path()) && f.size_bytes.is_some_and(|v| v > 0)
+            })
+            .expect("expected a re-measured sized finding");
+        assert_ne!(
+            hit.size_bytes,
+            Some(999_999),
+            "a cache entry with a stale root_mtime must be re-du'd"
+        );
+        assert!(hit.meta.get("size_cached").is_none());
+    }
+
+    #[tokio::test]
+    async fn cache_entry_older_than_ttl_is_ignored() {
+        let home = tempfile::tempdir().unwrap();
+        let nm = fixture_node_modules(home.path());
+        let root_mtime = root_mtime_secs(&nm);
+
+        let db = size_cache::db_path(&Paths::from_home(home.path()));
+        {
+            let mut cache = SizeCache::open(&db).unwrap();
+            cache
+                .upsert_batch(&[(
+                    nm.clone(),
+                    CachedSize {
+                        size: 999_999,
+                        computed_at: 0, // unix epoch — far past the default 24h TTL
+                        root_mtime,
+                    },
+                )])
+                .unwrap();
+        }
+
+        let (ctx, rx, _) = ctx_for(home.path(), false, false, vec![]);
+        FsScanner.scan(ctx).await.unwrap();
+
+        let findings = drain(rx);
+        let hit = findings
+            .iter()
+            .find(|f| {
+                f.path.as_deref() == Some(nm.as_path()) && f.size_bytes.is_some_and(|v| v > 0)
+            })
+            .expect("expected a re-measured sized finding");
+        assert_ne!(
+            hit.size_bytes,
+            Some(999_999),
+            "an expired cache entry must be re-du'd"
+        );
+        assert!(hit.meta.get("size_cached").is_none());
     }
 }

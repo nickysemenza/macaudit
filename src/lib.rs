@@ -15,5 +15,6 @@ pub mod registry;
 pub mod remedy;
 pub mod runner;
 pub mod scan;
+pub mod size_cache;
 pub mod snapshot;
 pub mod ui;
