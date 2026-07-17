@@ -1,9 +1,19 @@
 //! `ScannerManager`: owns scan generations, cancellation, and the lifecycle
 //! bookkeeping that scanners are deliberately kept out of.
 //!
-//! - **Generations**: every scan run gets a monotonic `gen`. Starting a new run
-//!   cancels the previous generation's `CancellationToken` and bumps the counter.
-//!   Events carry their `gen`; consumers drop stale-generation events.
+//! - **Generations are per-section.** Every `start()` mints one globally-unique
+//!   monotonic `gen` shared by that request, and registers a fresh
+//!   `CancellationToken` for each *requested* section — cancelling only those
+//!   sections' previous runs. Rescanning Ports never disturbs an in-flight Disk
+//!   scan. Events carry `(scanner, gen)`; the UI accepts an event only when its
+//!   gen exactly matches the section's expected gen.
+//! - The discovery-only `Fs` helper spawned by a git-only request borrows Git's
+//!   token and is NOT registered in the runs map: it dies with Git's run, never
+//!   displaces a real in-flight Fs run, and its lifecycle events are dropped by
+//!   the UI (Fs's expected gen never points at it).
+//! - Known coupling: rescanning Disk mid-run closes the fs→git pipe early, so a
+//!   concurrently-running Git scan finishes normally but may report fewer repos
+//!   than a full walk would find. Inherent to the pipe; accepted.
 //! - **Lifecycle**: the manager wraps each scanner, sending `Started` before and
 //!   `Finished`/`Failed` after. Scanners only ever send `Progress`/`Finding`.
 //! - **fs→git pipe**: if `Git` is in the run, the manager wires the discovery
@@ -12,7 +22,7 @@
 //!   `scan --json`, `snapshot save`, and `clean --dry-run` — the same engine the
 //!   TUI drives.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -24,6 +34,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{Config, Paths};
 use crate::fake::FakeScanner;
 use crate::model::{Finding, FindingId, ScanEvent, ScannerId};
+use crate::net::HttpFetcher;
 use crate::registry;
 use crate::runner::CommandRunner;
 use crate::scan::pipe::repo_channel;
@@ -38,13 +49,29 @@ pub enum Mode {
     Fake,
 }
 
+/// One registered in-flight run for a section.
+struct SectionRun {
+    /// The run's generation — read by tests to assert slot identity; runtime
+    /// supersession is purely token-based (insert replaces + cancels).
+    #[cfg_attr(not(test), allow(dead_code))]
+    gen: u64,
+    token: CancellationToken,
+}
+
 pub struct ScannerManager {
     config: Arc<Config>,
     paths: Arc<Paths>,
     runner: Arc<dyn CommandRunner>,
     mode: Mode,
+    /// Global monotonic generation counter — every `start()` mints one unique
+    /// gen; global uniqueness is what makes the UI's exact-match rule unambiguous.
     gen: AtomicU64,
-    token: Mutex<CancellationToken>,
+    /// Per-section in-flight run registry. Cancelling/rescanning section X
+    /// touches only X's slot.
+    runs: Mutex<HashMap<ScannerId, SectionRun>>,
+    /// HTTP access for network enrichment. `None` = offline: enrichment
+    /// degrades to a no-op and every existing test stays network-free.
+    fetcher: Option<Arc<dyn HttpFetcher>>,
 }
 
 impl ScannerManager {
@@ -60,7 +87,8 @@ impl ScannerManager {
             runner,
             mode,
             gen: AtomicU64::new(0),
-            token: Mutex::new(CancellationToken::new()),
+            runs: Mutex::new(HashMap::new()),
+            fetcher: None,
         }
     }
 
@@ -84,20 +112,73 @@ impl ScannerManager {
         self.paths.clone()
     }
 
-    /// Cancel the in-flight generation without starting a new one.
-    pub fn cancel(&self) {
-        self.token.lock().unwrap().cancel();
+    /// Attach an HTTP fetcher, enabling network enrichment (cask catalog +
+    /// release checks). Without it the manager is fully offline.
+    pub fn with_fetcher(mut self, fetcher: Arc<dyn HttpFetcher>) -> Self {
+        self.fetcher = Some(fetcher);
+        self
     }
 
-    /// Begin a new generation: cancel the old token, mint a fresh one, bump the
-    /// counter. Returns the new `(gen, token)`.
-    fn begin_generation(&self) -> (u64, CancellationToken) {
-        let mut guard = self.token.lock().unwrap();
-        guard.cancel();
-        let fresh = CancellationToken::new();
-        *guard = fresh.clone();
-        let g = self.gen.fetch_add(1, Ordering::SeqCst) + 1;
-        (g, fresh)
+    /// The attached fetcher, if any — the TUI needs it for its enrichment task.
+    pub fn fetcher(&self) -> Option<Arc<dyn HttpFetcher>> {
+        self.fetcher.clone()
+    }
+
+    /// Cancel every in-flight section run (shutdown semantics).
+    pub fn cancel(&self) {
+        for run in self.runs.lock().unwrap().values() {
+            run.token.cancel();
+        }
+    }
+
+    /// Begin a run: cancel the in-flight run of each section in `requested`
+    /// (ONLY those), mint one fresh generation shared by this request, and
+    /// register a fresh per-section token for every requested section.
+    ///
+    /// Returns the gen plus a token for every section in `planned`. The
+    /// discovery-only Fs helper (present in `planned` but not `requested`, only
+    /// ever for git-only requests) borrows Git's token and is NOT registered in
+    /// the runs map: it must die with Git's run, must not displace a real
+    /// in-flight Fs run, and its lifecycle events are dropped by the UI's
+    /// exact-match rule.
+    ///
+    /// Tokens are per-section, not per-request — a shared per-request token
+    /// would recreate the everything-cancelled bug one level down after an `R`.
+    fn begin_sections(
+        &self,
+        requested: &[ScannerId],
+        planned: &[ScannerId],
+    ) -> (u64, HashMap<ScannerId, CancellationToken>) {
+        let mut runs = self.runs.lock().unwrap();
+        let gen = self.gen.fetch_add(1, Ordering::SeqCst) + 1;
+
+        let mut tokens: HashMap<ScannerId, CancellationToken> = HashMap::new();
+        for &id in requested {
+            if let Some(old) = runs.get(&id) {
+                old.token.cancel();
+            }
+            let token = CancellationToken::new();
+            runs.insert(
+                id,
+                SectionRun {
+                    gen,
+                    token: token.clone(),
+                },
+            );
+            tokens.insert(id, token);
+        }
+        // Unrequested-but-planned section (the discovery-only Fs): borrow Git's
+        // token; leave the runs map alone.
+        for &id in planned {
+            if !tokens.contains_key(&id) {
+                let git_token = tokens
+                    .get(&ScannerId::Git)
+                    .cloned()
+                    .unwrap_or_else(CancellationToken::new);
+                tokens.insert(id, git_token);
+            }
+        }
+        (gen, tokens)
     }
 
     /// Resolve which sections actually run, plus the fs-discovery-only flag.
@@ -112,6 +193,16 @@ impl ScannerManager {
             sections.push(ScannerId::Fs);
         }
         (sections, discovery_only)
+    }
+
+    /// Test-only view of a section's registered run.
+    #[cfg(test)]
+    fn section_run(&self, id: ScannerId) -> Option<(u64, CancellationToken)> {
+        self.runs
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|r| (r.gen, r.token.clone()))
     }
 
     /// Build a scanner instance for a section per the manager's mode.
@@ -130,7 +221,7 @@ impl ScannerManager {
         sections: &[ScannerId],
         discovery_only: bool,
         gen: u64,
-        token: CancellationToken,
+        tokens: &HashMap<ScannerId, CancellationToken>,
     ) -> Vec<JoinHandle<()>> {
         // Wire the repo-discovery pipe only when Git participates.
         let git_present = sections.contains(&ScannerId::Git);
@@ -143,7 +234,7 @@ impl ScannerManager {
 
         let base = ScanCtx {
             tx: tx.clone(),
-            token: token.clone(),
+            token: CancellationToken::new(), // placeholder; stamped per-scanner below
             gen,
             config: self.config.clone(),
             paths: self.paths.clone(),
@@ -158,6 +249,10 @@ impl ScannerManager {
         for &id in sections {
             let scanner = self.build_scanner(id);
             let mut ctx = base.clone().with_current(id);
+            ctx.token = tokens
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(CancellationToken::new);
             match id {
                 ScannerId::Fs => {
                     ctx.repo_tx = repo_tx.clone();
@@ -179,9 +274,9 @@ impl ScannerManager {
     /// Start a scan for the TUI: spawns detached tasks that report over `tx`
     /// (which the caller keeps alive across rescans). Returns the new generation.
     pub fn start(&self, tx: &mpsc::Sender<ScanEvent>, requested: &[ScannerId]) -> u64 {
-        let (gen, token) = self.begin_generation();
         let (sections, discovery_only) = Self::plan(requested);
-        self.spawn_set(tx, &sections, discovery_only, gen, token);
+        let (gen, tokens) = self.begin_sections(requested, &sections);
+        self.spawn_set(tx, &sections, discovery_only, gen, &tokens);
         gen
     }
 
@@ -190,9 +285,9 @@ impl ScannerManager {
     /// earlier unsized finding). Used by all headless commands.
     pub async fn run_to_completion(&self, requested: &[ScannerId]) -> BTreeMap<FindingId, Finding> {
         let (tx, mut rx) = mpsc::channel::<ScanEvent>(1024);
-        let (gen, token) = self.begin_generation();
         let (sections, discovery_only) = Self::plan(requested);
-        self.spawn_set(&tx, &sections, discovery_only, gen, token);
+        let (gen, tokens) = self.begin_sections(requested, &sections);
+        self.spawn_set(&tx, &sections, discovery_only, gen, &tokens);
         drop(tx); // channel closes once all tasks finish
 
         let mut map: BTreeMap<FindingId, Finding> = BTreeMap::new();
@@ -206,7 +301,23 @@ impl ScannerManager {
                 }
             }
         }
+        // Sync correlation first (installed-cask marking must precede catalog
+        // matching), then optional network enrichment. The Apps-section token is
+        // representative for cancellation; if Apps wasn't in the run, enrich
+        // early-returns anyway (no unmanaged apps).
         crate::correlate::correlate(&mut map);
+        let enrich_token = tokens
+            .get(&ScannerId::Apps)
+            .cloned()
+            .unwrap_or_else(CancellationToken::new);
+        crate::net::enrich(
+            &mut map,
+            self.fetcher.clone(),
+            &self.paths,
+            &self.config,
+            &enrich_token,
+        )
+        .await;
         map
     }
 }
@@ -302,5 +413,61 @@ mod tests {
         let (sections, discovery_only) = ScannerManager::plan(&[ScannerId::Git]);
         assert!(sections.contains(&ScannerId::Fs));
         assert!(discovery_only);
+    }
+
+    #[tokio::test]
+    async fn targeted_start_cancels_only_requested() {
+        let m = mgr(Mode::Fake);
+        let (tx, _rx) = mpsc::channel(1024);
+        m.start(&tx, &[ScannerId::Apps, ScannerId::Ports]);
+        let (apps_gen, apps_token) = m.section_run(ScannerId::Apps).unwrap();
+        let (_, old_ports_token) = m.section_run(ScannerId::Ports).unwrap();
+
+        m.start(&tx, &[ScannerId::Ports]);
+
+        // Apps untouched: same slot gen, token not cancelled.
+        let (apps_gen2, _) = m.section_run(ScannerId::Apps).unwrap();
+        assert_eq!(apps_gen, apps_gen2);
+        assert!(!apps_token.is_cancelled(), "Apps must keep running");
+        // Ports superseded: old token cancelled, slot on a newer gen.
+        assert!(old_ports_token.is_cancelled());
+        let (ports_gen2, _) = m.section_run(ScannerId::Ports).unwrap();
+        assert!(ports_gen2 > apps_gen);
+    }
+
+    #[tokio::test]
+    async fn start_all_cancels_everything() {
+        let m = mgr(Mode::Fake);
+        let (tx, _rx) = mpsc::channel(1024);
+        m.start(&tx, ScannerId::ALL);
+        let old_tokens: Vec<_> = ScannerId::ALL
+            .iter()
+            .map(|id| m.section_run(*id).unwrap().1)
+            .collect();
+
+        let gen2 = m.start(&tx, ScannerId::ALL);
+
+        for t in &old_tokens {
+            assert!(t.is_cancelled(), "R must cancel every previous run");
+        }
+        for id in ScannerId::ALL {
+            assert_eq!(m.section_run(*id).unwrap().0, gen2);
+        }
+    }
+
+    #[tokio::test]
+    async fn git_only_start_leaves_fs_slot_alone() {
+        let m = mgr(Mode::Fake);
+        let (tx, _rx) = mpsc::channel(1024);
+        m.start(&tx, &[ScannerId::Fs]);
+        let (fs_gen, fs_token) = m.section_run(ScannerId::Fs).unwrap();
+
+        let git_gen = m.start(&tx, &[ScannerId::Git]);
+
+        // The discovery-only Fs helper must not displace the real Fs run.
+        let (fs_gen2, _) = m.section_run(ScannerId::Fs).unwrap();
+        assert_eq!(fs_gen, fs_gen2, "Fs slot displaced by discovery helper");
+        assert!(!fs_token.is_cancelled());
+        assert_eq!(m.section_run(ScannerId::Git).unwrap().0, git_gen);
     }
 }

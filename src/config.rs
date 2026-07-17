@@ -81,6 +81,7 @@ pub struct Config {
     pub scan: ScanConfig,
     pub artifacts: ArtifactsConfig,
     pub behavior: BehaviorConfig,
+    pub network: NetworkConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -92,6 +93,34 @@ pub struct ScanConfig {
     pub ignore: Vec<String>,
     /// Loose files larger than this are flagged.
     pub large_file_threshold_gb: f64,
+    /// How long a cached artifact size stays fresh before it's re-measured.
+    pub size_cache_ttl_hours: u64,
+}
+
+/// Network policy (spec M7). All network access is optional and degrades
+/// silently: `--offline`/`offline = true` disables everything.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NetworkConfig {
+    /// Disable all network access.
+    pub offline: bool,
+    /// Refresh the cask catalog at most this often (ETag-revalidated).
+    pub catalog_max_age_days: u64,
+    /// Max GitHub release lookups that may hit the network per scan.
+    pub github_max_checks_per_scan: usize,
+    /// How long a cached GitHub release result stays fresh.
+    pub github_cache_ttl_hours: u64,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        NetworkConfig {
+            offline: false,
+            catalog_max_age_days: 7,
+            github_max_checks_per_scan: 10,
+            github_cache_ttl_hours: 72,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -130,6 +159,7 @@ impl Default for ScanConfig {
             roots: Vec::new(),
             ignore: Vec::new(),
             large_file_threshold_gb: 1.0,
+            size_cache_ttl_hours: 24,
         }
     }
 }

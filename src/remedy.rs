@@ -42,6 +42,39 @@ impl TrashOps for RealTrash {
     }
 }
 
+/// Abstraction over the system clipboard so tests don't touch it.
+pub trait ClipboardOps: Send + Sync {
+    fn copy(&self, text: &str) -> anyhow::Result<()>;
+}
+
+/// Production clipboard via `pbcopy` (macOS). Spawns the process directly with
+/// piped stdin — `CommandRunner` deliberately has no stdin support and doesn't
+/// need it for anything else.
+pub struct RealClipboard;
+
+impl ClipboardOps for RealClipboard {
+    fn copy(&self, text: &str) -> anyhow::Result<()> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("pbcopy")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to spawn pbcopy: {e}"))?;
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin was piped")
+            .write_all(text.as_bytes())?;
+        let status = child.wait()?;
+        if !status.success() {
+            anyhow::bail!("pbcopy exited with {status}");
+        }
+        Ok(())
+    }
+}
+
 pub struct RemedyEngine {
     pub delete_mode: DeleteMode,
 }
@@ -82,6 +115,7 @@ impl RemedyEngine {
         action: &PlannedAction,
         runner: &dyn CommandRunner,
         trash: &dyn TrashOps,
+        clipboard: &dyn ClipboardOps,
         token: &CancellationToken,
     ) -> anyhow::Result<String> {
         match &action.command {
@@ -109,11 +143,11 @@ impl RemedyEngine {
                 Ok(format!("Revealed {}", path.display()))
             }
             RemedyCommand::CopyToClipboard { text } => {
-                // Not executed: there's no clipboard integration yet, and this
-                // variant is only used for things we deliberately won't run (e.g.
-                // `kill <pid>`). We surface the text so the user can copy it
-                // themselves; the detail pane shows the same string verbatim.
-                Ok(format!("Copy to clipboard: {text}"))
+                // This variant is for things we deliberately won't run (e.g.
+                // `kill <pid>`): put the text on the clipboard so the user can
+                // paste and run it themselves.
+                clipboard.copy(text)?;
+                Ok(format!("Copied to clipboard: {text}"))
             }
         }
     }
@@ -169,6 +203,15 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FakeClipboard(Mutex<Vec<String>>);
+    impl ClipboardOps for FakeClipboard {
+        fn copy(&self, text: &str) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn execute_trash_uses_trashops_not_fs() {
         let eng = RemedyEngine::new(DeleteMode::Trash);
@@ -184,7 +227,13 @@ mod tests {
         let trash = FakeTrash(Mutex::new(vec![]));
         let runner = crate::runner::MockCommandRunner::new();
         let line = eng
-            .execute(&a, &runner, &trash, &CancellationToken::new())
+            .execute(
+                &a,
+                &runner,
+                &trash,
+                &FakeClipboard::default(),
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert!(line.contains("Trashed"));
@@ -211,9 +260,45 @@ mod tests {
             crate::runner::MockCommandRunner::new().on("brew", &["upgrade", "ripgrep"], "");
         let trash = FakeTrash(Mutex::new(vec![]));
         let line = eng
-            .execute(&a, &runner, &trash, &CancellationToken::new())
+            .execute(
+                &a,
+                &runner,
+                &trash,
+                &FakeClipboard::default(),
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert!(line.contains("Ran: brew upgrade ripgrep"));
+    }
+
+    #[tokio::test]
+    async fn execute_copy_uses_clipboard_ops() {
+        let eng = RemedyEngine::new(DeleteMode::Trash);
+        let r = Remedy {
+            label: "Copy kill".into(),
+            command: RemedyCommand::CopyToClipboard {
+                text: "kill 1234".into(),
+            },
+            reclaims_bytes: None,
+            destructive: false,
+        };
+        let a = eng.plan_one(fid(), &r);
+        let clip = FakeClipboard::default();
+        let line = eng
+            .execute(
+                &a,
+                &crate::runner::MockCommandRunner::new(),
+                &FakeTrash(Mutex::new(vec![])),
+                &clip,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(line.contains("Copied to clipboard"));
+        assert_eq!(
+            clip.0.lock().unwrap().as_slice(),
+            &["kill 1234".to_string()]
+        );
     }
 }

@@ -22,16 +22,20 @@ async fn main() -> anyhow::Result<()> {
     if cli.rm {
         config.behavior.delete_mode = DeleteMode::Rm;
     }
+    if cli.offline {
+        config.network.offline = true;
+    }
     let config = Arc::new(config);
     let runner: Arc<dyn CommandRunner> = Arc::new(RealCommandRunner);
     let mode = if cli.fake { Mode::Fake } else { Mode::Real };
 
-    let manager = Arc::new(ScannerManager::new(
-        config.clone(),
-        paths.clone(),
-        runner,
-        mode,
-    ));
+    let mut manager = ScannerManager::new(config.clone(), paths.clone(), runner, mode);
+    // Network enrichment only when online and scanning for real — synthetic
+    // findings don't need the cask catalog.
+    if !config.network.offline && mode == Mode::Real {
+        manager = manager.with_fetcher(Arc::new(macaudit::net::ReqwestFetcher::new()));
+    }
+    let manager = Arc::new(manager);
 
     match cli.command {
         None => {

@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::engine::ScannerManager;
 use crate::model::{ScanEvent, ScannerId, Severity};
-use crate::remedy::{RealTrash, RemedyEngine};
+use crate::remedy::{RealClipboard, RealTrash, RemedyEngine};
 use crate::snapshot::{self, SnapshotStore};
 use crate::ui::app::{AppState, RescanRequest};
 
@@ -53,7 +53,10 @@ async fn run_loop(
     let all = ScannerId::ALL.to_vec();
     let mut active_scan = all.clone();
     let mut scan_saved = false;
+    // Generation for which correlation has already run (0 = never).
+    let mut correlated_gen: u64 = 0;
     let gen = manager.start(&tx, &all);
+    let mut full_scan_gen = gen;
     app.begin_scan(gen, &all);
 
     let mut events = EventStream::new();
@@ -87,6 +90,17 @@ async fn run_loop(
             }
         }
 
+        // Once Apps + Brew both reach terminal state, run cross-scanner
+        // correlation (cask-managed labeling) so the TUI — and the snapshot
+        // auto-saved below — see correlated findings, matching the headless
+        // path. Once per generation.
+        if correlated_gen != full_scan_gen
+            && app.sections_terminal(&[ScannerId::Apps, ScannerId::Brew])
+        {
+            correlated_gen = full_scan_gen;
+            app.correlate_now();
+        }
+
         // Auto-save a snapshot when a full scan completes (spec §8) — cheap, and
         // makes `snapshot diff` useful without ceremony. Only full scans, once.
         if !scan_saved
@@ -100,7 +114,10 @@ async fn run_loop(
             }
         }
 
-        // Service a requested rescan (new generation cancels the old).
+        // Service a requested rescan. Per-section generations mean a targeted
+        // rescan cancels ONLY the requested sections; an in-flight full scan
+        // keeps running, so its auto-snapshot bookkeeping must survive — only
+        // `R` (rescan all) resets it.
         if let Some(req) = app.pending_rescan.take() {
             let sections: Vec<ScannerId> = match req {
                 RescanRequest::All => ScannerId::ALL.to_vec(),
@@ -108,8 +125,17 @@ async fn run_loop(
             };
             let gen = manager.start(&tx, &sections);
             app.begin_scan(gen, &sections);
-            active_scan = sections;
-            scan_saved = false;
+            if matches!(req, RescanRequest::All) {
+                active_scan = sections;
+                scan_saved = false;
+                full_scan_gen = gen;
+            } else if sections
+                .iter()
+                .any(|s| matches!(s, ScannerId::Apps | ScannerId::Brew))
+            {
+                // Rescanning Apps/Brew invalidates correlation for the new data.
+                full_scan_gen = gen;
+            }
         }
 
         // Service a confirmed batch of remedies: execute each (Trash via the
@@ -129,7 +155,10 @@ async fn run_loop(
                         affected.push(sec);
                     }
                 }
-                match engine.execute(a, runner.as_ref(), &RealTrash, &token).await {
+                match engine
+                    .execute(a, runner.as_ref(), &RealTrash, &RealClipboard, &token)
+                    .await
+                {
                     Ok(line) => app.push_activity(line),
                     Err(e) => app.push_activity(format!("error: {} — {e}", a.rendered)),
                 }

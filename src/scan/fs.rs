@@ -375,24 +375,19 @@ fn large_file_finding(path: &Path, size: u64) -> Finding {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    Finding::new(
-        FindingKind::BuildArtifact,
-        &key,
-        format!("Large file — {name}"),
-    )
-    .path(path.to_path_buf())
-    .detail("Large loose file over the size threshold".to_string())
-    .size(size)
-    .severity(Severity::Attention)
-    .meta(json!({ "large_file": true }))
-    .remedy(Remedy {
-        label: "Reveal in Finder".into(),
-        command: RemedyCommand::RevealInFinder {
-            path: path.to_path_buf(),
-        },
-        reclaims_bytes: None,
-        destructive: false,
-    })
+    Finding::new(FindingKind::LargeFile, &key, format!("Large file — {name}"))
+        .path(path.to_path_buf())
+        .detail("Large loose file over the size threshold".to_string())
+        .size(size)
+        .severity(Severity::Attention)
+        .remedy(Remedy {
+            label: "Reveal in Finder".into(),
+            command: RemedyCommand::RevealInFinder {
+                path: path.to_path_buf(),
+            },
+            reclaims_bytes: None,
+            destructive: false,
+        })
 }
 
 /// Cheap staleness heuristic: max mtime of the *files* directly in `parent`

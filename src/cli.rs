@@ -22,6 +22,10 @@ pub struct Cli {
     /// Delete for real (`rm -rf`) instead of moving to Trash. Off by default.
     #[arg(long, global = true)]
     pub rm: bool,
+
+    /// Disable all network access (cask-catalog matching + release checks).
+    #[arg(long, global = true)]
+    pub offline: bool,
 }
 
 #[derive(Subcommand, Debug)]

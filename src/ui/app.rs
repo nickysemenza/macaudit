@@ -110,8 +110,10 @@ pub struct AppState {
     /// snapshot at startup, used to render "Δ since last snapshot" badges.
     baseline: HashMap<ScannerId, (usize, u64)>,
 
-    /// The generation whose events we accept; stale events are dropped.
-    pub current_gen: u64,
+    /// Per-section generation whose events we accept (exact match — see
+    /// `apply`). Absent ⇒ no scan has been requested for that section yet;
+    /// its events are dropped.
+    expected_gen: HashMap<ScannerId, u64>,
     pub tick: usize,
     pub should_quit: bool,
     /// Set when the user requests a rescan; the loop consumes and clears it.
@@ -149,7 +151,7 @@ impl Default for AppState {
             delete_mode: DeleteMode::Trash,
             activity: Vec::new(),
             baseline: HashMap::new(),
-            current_gen: 0,
+            expected_gen: HashMap::new(),
             tick: 0,
             should_quit: false,
             pending_rescan: None,
@@ -217,12 +219,56 @@ impl AppState {
     /// Whether every section in `sections` has reached a terminal status
     /// (Done or Failed) — i.e. the scan is complete.
     pub fn scan_complete(&self, sections: &[ScannerId]) -> bool {
+        self.sections_terminal(sections)
+    }
+
+    /// Whether every listed section is Done or Failed.
+    pub fn sections_terminal(&self, sections: &[ScannerId]) -> bool {
         sections.iter().all(|id| {
             matches!(
                 self.status_of(*id),
                 SectionStatus::Done { .. } | SectionStatus::Failed { .. }
             )
         })
+    }
+
+    /// Run cross-scanner correlation over the in-memory findings (the TUI
+    /// equivalent of the headless path's `correlate()` call): merge the Apps +
+    /// Brew section maps, correlate, write mutated findings back to their
+    /// sections. Sync and cheap (hundreds of items); call once both sections
+    /// are terminal so cask labels appear in the TUI and in auto-saved
+    /// snapshots.
+    pub fn correlate_now(&mut self) {
+        let mut merged: BTreeMap<FindingId, Finding> = BTreeMap::new();
+        for id in [ScannerId::Apps, ScannerId::Brew] {
+            if let Some(map) = self.findings.get(&id) {
+                for (fid, f) in map {
+                    merged.insert(*fid, f.clone());
+                }
+            }
+        }
+        if merged.is_empty() {
+            return;
+        }
+        crate::correlate::correlate(&mut merged);
+        for (fid, f) in merged {
+            self.findings
+                .entry(f.kind.scanner())
+                .or_default()
+                .insert(fid, f);
+        }
+    }
+
+    /// Upsert a batch of enriched findings (async network enrichment results)
+    /// for generation `gen`. Batches from superseded generations are dropped:
+    /// every enriched finding's section must still expect `gen`.
+    pub fn apply_enriched(&mut self, gen: u64, findings: Vec<Finding>) {
+        for f in findings {
+            let section = f.kind.scanner();
+            if self.expected_gen.get(&section) == Some(&gen) {
+                self.findings.entry(section).or_default().insert(f.id, f);
+            }
+        }
     }
 
     /// Append a line to the activity log (capped so it can't grow unbounded
@@ -234,10 +280,14 @@ impl AppState {
         }
     }
 
-    /// Apply a scan event. Drops events from stale generations. This is the sole
-    /// mutation path for findings; upsert-by-id keeps sizes/dedup correct.
+    /// Apply a scan event. Accepts an event only when its gen EXACTLY matches
+    /// the section's expected gen — `<` drops superseded/cancelled runs, and
+    /// `>` drops runs the UI never requested for that section (the discovery-
+    /// only Fs helper spawned by a git-only rescan, whose `Started{Fs}` would
+    /// otherwise wipe the Disk pane). This is the sole mutation path for
+    /// findings; upsert-by-id keeps sizes/dedup correct.
     pub fn apply(&mut self, ev: ScanEvent) {
-        if ev.generation() != self.current_gen {
+        if self.expected_gen.get(&ev.scanner()) != Some(&ev.generation()) {
             return;
         }
         match ev {
@@ -282,9 +332,14 @@ impl AppState {
         }
     }
 
-    /// Reset section statuses to Scanning-pending for a fresh generation.
+    /// Reset the given sections to Scanning-pending and register `gen` as their
+    /// expected generation. Callers pass the *requested* set, never the
+    /// engine's planned set (the discovery-only Fs helper must stay
+    /// unexpected so its events are dropped).
     pub fn begin_scan(&mut self, gen: u64, sections: &[ScannerId]) {
-        self.current_gen = gen;
+        for id in sections {
+            self.expected_gen.insert(*id, gen);
+        }
         for id in sections {
             self.findings.entry(*id).or_default().clear();
             self.status.insert(
@@ -702,13 +757,14 @@ mod tests {
         }
     }
 
-    /// `AppState::default()` with `current_gen` set, so tests that need to
-    /// accept events don't trip clippy's `field_reassign_with_default`.
+    /// `AppState::default()` expecting `gen` for every section, so tests that
+    /// need to accept events can do so for any scanner.
     fn app_with_gen(gen: u64) -> AppState {
-        AppState {
-            current_gen: gen,
-            ..Default::default()
+        let mut app = AppState::default();
+        for id in ScannerId::ALL {
+            app.expected_gen.insert(*id, gen);
         }
+        app
     }
 
     #[test]
@@ -726,6 +782,136 @@ mod tests {
         let mut app = app_with_gen(2);
         app.apply(finding_event(1, "/old", Some(1))); // stale gen
         assert_eq!(app.section_count(ScannerId::Apps), 0);
+    }
+
+    #[test]
+    fn per_section_staleness_exact_match() {
+        let mut app = AppState::default();
+        app.begin_scan(2, &[ScannerId::Apps]);
+        app.apply(finding_event(1, "/older", Some(1))); // gen < expected: dropped
+        app.apply(finding_event(3, "/newer", Some(1))); // gen > expected: dropped
+        app.apply(finding_event(2, "/right", Some(1))); // exact: applied
+        assert_eq!(app.section_count(ScannerId::Apps), 1);
+    }
+
+    #[test]
+    fn section_rescan_keeps_other_sections_events() {
+        // The headline regression: rescanning Ports must not orphan the rest of
+        // an in-flight full scan.
+        let mut app = AppState::default();
+        app.begin_scan(1, ScannerId::ALL);
+        app.begin_scan(2, &[ScannerId::Ports]);
+
+        // Old-gen events from the still-running full scan keep landing.
+        app.apply(finding_event(1, "/apps-item", Some(1)));
+        app.apply(ScanEvent::Finished {
+            scanner: ScannerId::Brew,
+            gen: 1,
+            duration: Duration::from_secs(1),
+        });
+        app.apply(ScanEvent::Finished {
+            scanner: ScannerId::Ports,
+            gen: 2,
+            duration: Duration::from_secs(1),
+        });
+
+        assert_eq!(
+            app.section_count(ScannerId::Apps),
+            1,
+            "full-scan finding kept"
+        );
+        assert!(
+            matches!(app.status_of(ScannerId::Brew), SectionStatus::Done { .. }),
+            "old code left Brew stuck Scanning"
+        );
+        assert!(matches!(
+            app.status_of(ScannerId::Ports),
+            SectionStatus::Done { .. }
+        ));
+    }
+
+    #[test]
+    fn git_rescan_discovery_fs_does_not_clobber_disk() {
+        let mut app = AppState::default();
+        app.begin_scan(1, ScannerId::ALL);
+        // Disk finishes with findings.
+        let mut f = Finding::new(FindingKind::BuildArtifact, "/p/node_modules", "nm");
+        f.size_bytes = Some(10);
+        app.apply(ScanEvent::Finding {
+            scanner: ScannerId::Fs,
+            gen: 1,
+            finding: Box::new(f),
+        });
+        app.apply(ScanEvent::Finished {
+            scanner: ScannerId::Fs,
+            gen: 1,
+            duration: Duration::from_secs(1),
+        });
+
+        // Git-only rescan: engine spawns a discovery-only Fs at gen 2, whose
+        // Started{Fs} previously wiped the Disk pane.
+        app.begin_scan(2, &[ScannerId::Git]);
+        app.apply(ScanEvent::Started {
+            scanner: ScannerId::Fs,
+            gen: 2,
+        });
+
+        assert_eq!(app.section_count(ScannerId::Fs), 1, "Disk findings wiped");
+        assert!(matches!(
+            app.status_of(ScannerId::Fs),
+            SectionStatus::Done { .. }
+        ));
+    }
+
+    #[test]
+    fn double_rescan_drops_old_run_events() {
+        let mut app = AppState::default();
+        app.begin_scan(1, &[ScannerId::Apps]);
+        app.begin_scan(2, &[ScannerId::Apps]);
+        app.apply(finding_event(1, "/from-old-run", Some(1))); // dropped
+        app.apply(finding_event(2, "/from-new-run", Some(1))); // kept
+        let map = app.findings.get(&ScannerId::Apps).unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.values().next().unwrap().title, "/from-new-run");
+    }
+
+    #[test]
+    fn correlate_now_marks_installed_cask_apps() {
+        let mut app = app_with_gen(1);
+        let cask = Finding::new(FindingKind::BrewCask, "slack", "slack")
+            .meta(serde_json::json!({"token": "slack", "app_paths": ["/Applications/Slack.app"]}));
+        let mut a = Finding::new(FindingKind::App, "/Applications/Slack.app", "Slack")
+            .path("/Applications/Slack.app")
+            .meta(serde_json::json!({"classification": "unmanaged", "group": "Unmanaged"}));
+        a.severity = Severity::Attention;
+        app.apply(ScanEvent::Finding {
+            scanner: ScannerId::Brew,
+            gen: 1,
+            finding: Box::new(cask),
+        });
+        app.apply(ScanEvent::Finding {
+            scanner: ScannerId::Apps,
+            gen: 1,
+            finding: Box::new(a.clone()),
+        });
+
+        app.correlate_now();
+
+        let apps = app.findings.get(&ScannerId::Apps).unwrap();
+        let updated = apps.get(&a.id).unwrap();
+        assert_eq!(updated.meta["group"], "Homebrew Cask");
+        assert_eq!(updated.meta["managed_by_cask"], "slack");
+    }
+
+    #[test]
+    fn apply_enriched_respects_generation() {
+        let mut app = AppState::default();
+        app.begin_scan(2, &[ScannerId::Apps]);
+        let f = Finding::new(FindingKind::App, "/Applications/X.app", "X");
+        app.apply_enriched(1, vec![f.clone()]); // stale batch dropped
+        assert_eq!(app.section_count(ScannerId::Apps), 0);
+        app.apply_enriched(2, vec![f]); // current batch applied
+        assert_eq!(app.section_count(ScannerId::Apps), 1);
     }
 
     #[test]

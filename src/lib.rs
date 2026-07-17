@@ -9,6 +9,7 @@ pub mod correlate;
 pub mod engine;
 pub mod fake;
 pub mod model;
+pub mod net;
 pub mod output;
 pub mod registry;
 pub mod remedy;

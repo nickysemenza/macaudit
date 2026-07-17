@@ -127,6 +127,8 @@ pub enum FindingKind {
     SshKey,
     IosBackup,
     LocalSnapshot,
+    /// A single loose file over the configured size threshold.
+    LargeFile,
 }
 
 impl FindingKind {
@@ -138,9 +140,10 @@ impl FindingKind {
         match self {
             FindingKind::App => ScannerId::Apps,
             FindingKind::BrewFormula | FindingKind::BrewCask => ScannerId::Brew,
-            FindingKind::BuildArtifact | FindingKind::CacheDir | FindingKind::IosBackup => {
-                ScannerId::Fs
-            }
+            FindingKind::BuildArtifact
+            | FindingKind::CacheDir
+            | FindingKind::IosBackup
+            | FindingKind::LargeFile => ScannerId::Fs,
             FindingKind::LaunchdItem => ScannerId::Launchd,
             FindingKind::PathEntry => ScannerId::ShellEnv,
             FindingKind::RuntimeVersion => ScannerId::Runtimes,
@@ -171,6 +174,7 @@ impl FindingKind {
             FindingKind::SshKey => "ssh_key",
             FindingKind::IosBackup => "ios_backup",
             FindingKind::LocalSnapshot => "local_snapshot",
+            FindingKind::LargeFile => "large_file",
         }
     }
 }
