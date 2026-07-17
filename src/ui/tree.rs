@@ -134,11 +134,18 @@ pub fn draw(
                     .size_bytes
                     .map(|b| humansize::format_size(b, humansize::BINARY))
                     .unwrap_or_default();
-                ListItem::new(Line::from(vec![
+                let mut spans = vec![
                     Span::raw(format!("    {mark} ")),
                     Span::raw(format!("{:<32}", f.title)),
                     Span::styled(size, Style::default().fg(theme::severity_color(f.severity))),
-                ]))
+                ];
+                if let Some(badge) = cask_badge(f) {
+                    spans.push(Span::styled(
+                        badge,
+                        Style::default().fg(theme::severity_color(Severity::Attention)),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
             }
         })
         .collect();
@@ -155,6 +162,14 @@ pub fn draw(
         state.select(Some(selected.min(rows.len() - 1)));
     }
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// Warning badge for an app the cask catalog says could be brew-managed
+/// (`meta.available_cask` from network enrichment): the user can swap it to
+/// Homebrew with the adopt remedy shown in the detail pane / confirm dialog.
+pub fn cask_badge(f: &Finding) -> Option<String> {
+    let token = f.meta.get("available_cask")?.as_str()?;
+    Some(format!("  ⚠ brew cask available: {token}"))
 }
 
 #[cfg(test)]
@@ -204,5 +219,26 @@ mod tests {
     #[test]
     fn group_label_title_cases_underscored_key() {
         assert_eq!(group_label("brew_formula"), "Brew Formula");
+    }
+
+    #[test]
+    fn cask_badge_only_for_catalog_matches() {
+        let mut matched = finding(FindingKind::App, "/Applications/Slack.app", "Slack");
+        matched.meta = serde_json::json!({
+            "classification": "unmanaged",
+            "available_cask": "slack"
+        });
+        assert_eq!(
+            cask_badge(&matched).as_deref(),
+            Some("  ⚠ brew cask available: slack")
+        );
+
+        let unmatched = finding(FindingKind::App, "/Applications/Bespoke.app", "Bespoke");
+        assert_eq!(cask_badge(&unmatched), None);
+
+        // Malformed meta (non-string) must not badge or panic.
+        let mut weird = finding(FindingKind::App, "/Applications/W.app", "W");
+        weird.meta = serde_json::json!({ "available_cask": 42 });
+        assert_eq!(cask_badge(&weird), None);
     }
 }
