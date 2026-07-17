@@ -47,12 +47,25 @@ pub fn draw(app: &AppState, frame: &mut Frame, area: Rect) {
             } else {
                 Style::default()
             };
-            ListItem::new(Line::from(vec![
+            // "Δ since last snapshot" badge: growth red, shrink green.
+            let mut spans = vec![
                 Span::raw(format!("{glyph} ")),
                 Span::raw(format!("{:<10}", meta.title)),
                 Span::styled(suffix, Style::default().fg(Color::DarkGray)),
-            ]))
-            .style(style)
+            ];
+            if let Some(delta) = app.section_reclaimable_delta(meta.id) {
+                let mag = humansize::format_size(delta.unsigned_abs(), humansize::BINARY);
+                let (sign, color) = if delta > 0 {
+                    ("+", Color::Red)
+                } else {
+                    ("-", Color::Green)
+                };
+                spans.push(Span::styled(
+                    format!(" Δ{sign}{mag}"),
+                    Style::default().fg(color),
+                ));
+            }
+            ListItem::new(Line::from(spans)).style(style)
         })
         .collect();
     let list = List::new(items).block(Block::default().borders(Borders::ALL).title(" macaudit "));

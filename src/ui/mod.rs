@@ -16,15 +16,19 @@ mod statusbar;
 mod table;
 mod tree;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{Event, EventStream};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
+use tokio_util::sync::CancellationToken;
 
 use crate::engine::ScannerManager;
-use crate::model::{ScanEvent, ScannerId};
+use crate::model::{ScanEvent, ScannerId, Severity};
+use crate::remedy::{RealTrash, RemedyEngine};
+use crate::snapshot::{self, SnapshotStore};
 use crate::ui::app::{AppState, RescanRequest};
 
 /// Run the TUI to completion. Owns the manager and the app state, wiring
@@ -42,9 +46,13 @@ async fn run_loop(
 ) -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::channel::<ScanEvent>(1024);
     let mut app = AppState::default();
+    app.set_delete_mode(manager.delete_mode());
+    app.set_baseline(load_baseline(&manager));
 
     // Kick off an initial full scan.
     let all = ScannerId::ALL.to_vec();
+    let mut active_scan = all.clone();
+    let mut scan_saved = false;
     let gen = manager.start(&tx, &all);
     app.begin_scan(gen, &all);
 
@@ -79,6 +87,19 @@ async fn run_loop(
             }
         }
 
+        // Auto-save a snapshot when a full scan completes (spec §8) — cheap, and
+        // makes `snapshot diff` useful without ceremony. Only full scans, once.
+        if !scan_saved
+            && active_scan.len() == ScannerId::ALL.len()
+            && app.scan_complete(&active_scan)
+        {
+            scan_saved = true;
+            match save_snapshot(&manager, &app) {
+                Ok(id) => app.push_activity(format!("saved snapshot #{id}")),
+                Err(e) => app.push_activity(format!("snapshot save failed: {e}")),
+            }
+        }
+
         // Service a requested rescan (new generation cancels the old).
         if let Some(req) = app.pending_rescan.take() {
             let sections: Vec<ScannerId> = match req {
@@ -87,18 +108,36 @@ async fn run_loop(
             };
             let gen = manager.start(&tx, &sections);
             app.begin_scan(gen, &sections);
+            active_scan = sections;
+            scan_saved = false;
         }
 
-        // Service a confirmed batch of remedies. Real execution (RemedyEngine
-        // + CommandRunner + trash, then a targeted rescan of affected
-        // sections) is Phase 2's integration job — it needs a runner/trash
-        // handle threaded into this loop, which isn't part of lane U's owned
-        // surface. For now we just log what *would* run so the confirm ->
-        // pending_execute -> activity-log path is exercised end to end.
+        // Service a confirmed batch of remedies: execute each (Trash via the
+        // trash crate, Shell/Reveal via the runner), stream results into the
+        // activity log, then targeted-rescan the affected sections so their
+        // findings re-check. Execution is awaited inline; remedies are fast
+        // (trash is instant) and user-initiated, so briefly pausing input is
+        // acceptable for v1.
         if let Some(actions) = app.pending_execute.take() {
-            // TODO(phase2): execute via RemedyEngine + runner + trash, then targeted rescan.
+            let engine = RemedyEngine::new(manager.delete_mode());
+            let runner = manager.runner();
+            let token = CancellationToken::new();
+            let mut affected: Vec<ScannerId> = Vec::new();
             for a in &actions {
-                app.push_activity(format!("queued: {}", a.rendered));
+                if let Some(sec) = app.section_of(a.finding_id) {
+                    if !affected.contains(&sec) {
+                        affected.push(sec);
+                    }
+                }
+                match engine.execute(a, runner.as_ref(), &RealTrash, &token).await {
+                    Ok(line) => app.push_activity(line),
+                    Err(e) => app.push_activity(format!("error: {} — {e}", a.rendered)),
+                }
+            }
+            if !affected.is_empty() {
+                let gen = manager.start(&tx, &affected);
+                app.begin_scan(gen, &affected);
+                // A targeted rescan is not a full snapshot; don't auto-save it.
             }
         }
 
@@ -107,4 +146,29 @@ async fn run_loop(
         }
     }
     Ok(())
+}
+
+/// Load the most recent snapshot's per-section (count, reclaimable-bytes)
+/// baseline for Δ badges. Best-effort: any failure yields an empty baseline.
+fn load_baseline(manager: &ScannerManager) -> HashMap<ScannerId, (usize, u64)> {
+    let mut base: HashMap<ScannerId, (usize, u64)> = HashMap::new();
+    let Ok(store) = SnapshotStore::open(&manager.paths().history_db()) else {
+        return base;
+    };
+    if let Ok(Some(findings)) = store.latest_findings() {
+        for f in findings {
+            let entry = base.entry(f.kind.scanner()).or_insert((0, 0));
+            entry.0 += 1;
+            if f.severity == Severity::Reclaimable {
+                entry.1 += f.size_bytes.unwrap_or(0);
+            }
+        }
+    }
+    base
+}
+
+/// Persist the current findings as a snapshot.
+fn save_snapshot(manager: &ScannerManager, app: &AppState) -> anyhow::Result<i64> {
+    let mut store = SnapshotStore::open(&manager.paths().history_db())?;
+    store.save(&snapshot::machine_name(), &app.all_findings())
 }

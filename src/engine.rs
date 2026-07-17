@@ -69,6 +69,21 @@ impl ScannerManager {
         self.gen.load(Ordering::SeqCst)
     }
 
+    /// The configured delete mode (Trash vs rm) — the UI needs it to plan remedies.
+    pub fn delete_mode(&self) -> crate::config::DeleteMode {
+        self.config.behavior.delete_mode
+    }
+
+    /// A shared handle to the command runner, for executing remedies.
+    pub fn runner(&self) -> Arc<dyn CommandRunner> {
+        self.runner.clone()
+    }
+
+    /// Resolved paths (for the snapshot history db, etc.).
+    pub fn paths(&self) -> Arc<Paths> {
+        self.paths.clone()
+    }
+
     /// Cancel the in-flight generation without starting a new one.
     pub fn cancel(&self) {
         self.token.lock().unwrap().cancel();
@@ -266,7 +281,8 @@ mod tests {
         let map = m.run_to_completion(&[ScannerId::Ports]).await;
         assert!(m.current_generation() >= 1);
         assert!(
-            map.values().all(|f| f.severity == crate::model::Severity::Info),
+            map.values()
+                .all(|f| f.severity == crate::model::Severity::Info),
             "a blank-runner real scan should only yield Info fallbacks"
         );
     }

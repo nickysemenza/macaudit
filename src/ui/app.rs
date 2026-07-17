@@ -106,6 +106,10 @@ pub struct AppState {
     delete_mode: DeleteMode,
     pub(crate) activity: Vec<String>,
 
+    /// Per-section baseline (count, reclaimable bytes) from the most recent
+    /// snapshot at startup, used to render "Δ since last snapshot" badges.
+    baseline: HashMap<ScannerId, (usize, u64)>,
+
     /// The generation whose events we accept; stale events are dropped.
     pub current_gen: u64,
     pub tick: usize,
@@ -144,6 +148,7 @@ impl Default for AppState {
             confirm_actions: Vec::new(),
             delete_mode: DeleteMode::Trash,
             activity: Vec::new(),
+            baseline: HashMap::new(),
             current_gen: 0,
             tick: 0,
             should_quit: false,
@@ -160,6 +165,64 @@ impl AppState {
 
     pub(crate) fn selected_section_index(&self) -> usize {
         self.selected_section
+    }
+
+    /// Set the delete mode used when planning remedies (wired from `Config` by
+    /// the run loop, honoring `--rm`).
+    pub fn set_delete_mode(&mut self, mode: DeleteMode) {
+        self.delete_mode = mode;
+    }
+
+    /// Install the per-section baseline (count, reclaimable bytes) from the most
+    /// recent snapshot so the sidebar can show Δ badges.
+    pub fn set_baseline(&mut self, baseline: HashMap<ScannerId, (usize, u64)>) {
+        self.baseline = baseline;
+    }
+
+    /// Δ in reclaimable bytes for a section vs the last snapshot, if a baseline
+    /// exists and the section has finished scanning. `None` ⇒ no badge.
+    pub(crate) fn section_reclaimable_delta(&self, id: ScannerId) -> Option<i64> {
+        if !matches!(self.status_of(id), SectionStatus::Done { .. }) {
+            return None;
+        }
+        let (_, base) = self.baseline.get(&id)?;
+        let now = self.section_reclaimable(id);
+        let delta = now as i64 - *base as i64;
+        if delta == 0 {
+            None
+        } else {
+            Some(delta)
+        }
+    }
+
+    /// Which section currently holds a finding, for post-remedy targeted rescan.
+    pub fn section_of(&self, id: FindingId) -> Option<ScannerId> {
+        self.findings
+            .iter()
+            .find(|(_, m)| m.contains_key(&id))
+            .map(|(s, _)| *s)
+    }
+
+    /// A flat snapshot of every current finding, keyed by id — for `snapshot save`.
+    pub fn all_findings(&self) -> BTreeMap<FindingId, Finding> {
+        let mut out = BTreeMap::new();
+        for m in self.findings.values() {
+            for (id, f) in m {
+                out.insert(*id, f.clone());
+            }
+        }
+        out
+    }
+
+    /// Whether every section in `sections` has reached a terminal status
+    /// (Done or Failed) — i.e. the scan is complete.
+    pub fn scan_complete(&self, sections: &[ScannerId]) -> bool {
+        sections.iter().all(|id| {
+            matches!(
+                self.status_of(*id),
+                SectionStatus::Done { .. } | SectionStatus::Failed { .. }
+            )
+        })
     }
 
     /// Append a line to the activity log (capped so it can't grow unbounded

@@ -31,6 +31,21 @@ pub struct SnapshotDiff {
     pub grown: Vec<(Finding, u64, u64)>,
 }
 
+/// Best-effort machine name for snapshot provenance. Shared by the CLI and the
+/// TUI's auto-save.
+pub fn machine_name() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 pub struct SnapshotStore {
     conn: Connection,
 }
@@ -145,6 +160,14 @@ impl SnapshotStore {
     /// The most recent snapshot's id, if any.
     pub fn latest_id(&self) -> anyhow::Result<Option<i64>> {
         Ok(self.list()?.first().map(|m| m.id))
+    }
+
+    /// All findings from the most recent snapshot (for the TUI's Δ baseline).
+    pub fn latest_findings(&self) -> anyhow::Result<Option<Vec<Finding>>> {
+        match self.latest_id()? {
+            Some(id) => Ok(Some(self.load_findings(id)?.into_values().collect())),
+            None => Ok(None),
+        }
     }
 
     fn load_findings(&self, snapshot_id: i64) -> anyhow::Result<BTreeMap<FindingId, Finding>> {

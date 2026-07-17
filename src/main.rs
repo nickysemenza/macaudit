@@ -82,8 +82,7 @@ async fn run_snapshot(
     match cmd {
         SnapshotCmd::Save => {
             let findings = manager.run_to_completion(ScannerId::ALL).await;
-            let machine = hostname();
-            let id = store.save(&machine, &findings)?;
+            let id = store.save(&snapshot::machine_name(), &findings)?;
             println!("saved snapshot #{id} ({} findings)", findings.len());
         }
         SnapshotCmd::List => {
@@ -149,17 +148,4 @@ fn run_config(paths: &Paths, cmd: ConfigCmd) -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-fn hostname() -> String {
-    std::env::var("HOSTNAME")
-        .ok()
-        .or_else(|| {
-            std::process::Command::new("hostname")
-                .output()
-                .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        })
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
 }

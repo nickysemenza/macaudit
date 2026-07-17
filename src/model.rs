@@ -130,6 +130,29 @@ pub enum FindingKind {
 }
 
 impl FindingKind {
+    /// The scanner that produces this kind of finding. Every kind maps to
+    /// exactly one section — used to bucket snapshot findings back into sidebar
+    /// sections for Δ badges (a stored `Finding` carries its kind, not its
+    /// originating `ScannerId`).
+    pub fn scanner(self) -> ScannerId {
+        match self {
+            FindingKind::App => ScannerId::Apps,
+            FindingKind::BrewFormula | FindingKind::BrewCask => ScannerId::Brew,
+            FindingKind::BuildArtifact | FindingKind::CacheDir | FindingKind::IosBackup => {
+                ScannerId::Fs
+            }
+            FindingKind::LaunchdItem => ScannerId::Launchd,
+            FindingKind::PathEntry => ScannerId::ShellEnv,
+            FindingKind::RuntimeVersion => ScannerId::Runtimes,
+            FindingKind::DockerObject => ScannerId::Docker,
+            FindingKind::PortListener => ScannerId::Ports,
+            FindingKind::GitRepo => ScannerId::Git,
+            FindingKind::Simulator => ScannerId::Simulator,
+            FindingKind::SshKey => ScannerId::SshKeys,
+            FindingKind::LocalSnapshot => ScannerId::TmSnapshots,
+        }
+    }
+
     /// A stable string tag for id hashing (independent of enum layout).
     pub fn tag(self) -> &'static str {
         match self {
