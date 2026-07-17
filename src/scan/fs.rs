@@ -164,6 +164,14 @@ impl Scanner for FsScanner {
                         Some(c) => (c.size, true),
                         None => {
                             let size = du_blocks(&hit.path, &|| token_sz.is_cancelled());
+                            // A du interrupted by cancellation returns a PARTIAL
+                            // sum. Never record that: with an unchanged root
+                            // mtime it would be served as a "fresh" cache hit
+                            // (a wrong size) for up to the whole TTL. Skip the
+                            // emit too — the run is superseded anyway.
+                            if token_sz.is_cancelled() {
+                                return;
+                            }
                             fresh_sz.lock().unwrap().push((
                                 hit.path.clone(),
                                 CachedSize {
@@ -223,8 +231,13 @@ impl Scanner for FsScanner {
 
         // Persist freshly measured sizes for next time (best-effort — a save
         // failure is silently ignored, the cache is never load-bearing).
-        let entries: Vec<(PathBuf, CachedSize)> =
-            std::mem::take(&mut *fresh_entries.lock().unwrap());
+        // Belt-and-braces with the per-hit guard above: a cancelled scan
+        // persists nothing, so a partial du can never poison the cache.
+        let entries: Vec<(PathBuf, CachedSize)> = if token.is_cancelled() {
+            Vec::new()
+        } else {
+            std::mem::take(&mut *fresh_entries.lock().unwrap())
+        };
         if !entries.is_empty() {
             let paths_save = paths.clone();
             let _ = tokio::task::spawn_blocking(move || {
@@ -987,6 +1000,30 @@ mod tests {
             .expect("expected a node_modules row in the size cache db");
         assert!(entry.size > 0);
         assert_eq!(entry.size, sized.size_bytes.unwrap());
+    }
+
+    /// Regression: a scan cancelled mid-sizing must not persist anything — a
+    /// du interrupted by cancellation returns a PARTIAL sum, and with the root
+    /// mtime unchanged it would be served as a "fresh" (wrong) cached size for
+    /// up to the whole TTL on subsequent scans.
+    #[tokio::test]
+    async fn cancelled_scan_never_persists_sizes() {
+        let home = tempfile::tempdir().unwrap();
+        let _nm = fixture_node_modules(home.path());
+
+        let (ctx, _rx, _) = ctx_for(home.path(), false, false, vec![]);
+        // Cancel before the scan even starts sizing — every du is "interrupted".
+        ctx.token.cancel();
+        FsScanner.scan(ctx).await.unwrap();
+
+        let db = size_cache::db_path(&Paths::from_home(home.path()));
+        // Either no db was created, or it contains no rows — never a partial size.
+        if let Ok(cache) = SizeCache::open(&db) {
+            assert!(
+                cache.load_all().unwrap().is_empty(),
+                "cancelled scan must not write size-cache rows"
+            );
+        }
     }
 
     #[tokio::test]

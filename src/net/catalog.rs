@@ -34,16 +34,34 @@ pub struct CatalogCask {
 }
 
 /// The parsed catalog plus lookup indices for the three match rules.
+///
+/// Every index uses "ambiguity poisoning": a key claimed by two or more
+/// distinct casks maps to `None` and never matches. This matters because a
+/// match feeds a `brew install --cask --adopt` command — an arbitrary
+/// first-cask-wins pick could install the wrong package (Homebrew genuinely
+/// ships distinct casks sharing an `.app` filename: beta/variant families).
 #[derive(Clone, Debug)]
 pub struct CaskCatalog {
     casks: Vec<CatalogCask>,
-    /// lowercased bundle id → cask index
-    bundle_index: HashMap<String, usize>,
-    /// lowercased app file name → cask index
-    app_index: HashMap<String, usize>,
-    /// normalized name/token → cask index, or `None` if the key is ambiguous
-    /// (maps to two or more distinct casks — "ambiguity poisoning").
+    /// lowercased bundle id → cask index (`None` = ambiguous, poisoned)
+    bundle_index: HashMap<String, Option<usize>>,
+    /// lowercased app file name → cask index (`None` = ambiguous, poisoned)
+    app_index: HashMap<String, Option<usize>>,
+    /// normalized name/token → cask index (`None` = ambiguous, poisoned)
     name_index: HashMap<String, Option<usize>>,
+}
+
+/// Insert a key claiming `idx`, poisoning the slot if a different cask already
+/// claimed it.
+fn claim(index: &mut HashMap<String, Option<usize>>, key: String, idx: usize) {
+    index
+        .entry(key)
+        .and_modify(|slot| {
+            if *slot != Some(idx) {
+                *slot = None;
+            }
+        })
+        .or_insert(Some(idx));
 }
 
 impl CaskCatalog {
@@ -58,14 +76,14 @@ impl CaskCatalog {
     ) -> Option<(&CatalogCask, &'static str)> {
         if let Some(bid) = bundle_id {
             let key = bid.to_lowercase();
-            if let Some(&idx) = self.bundle_index.get(&key) {
-                return Some((&self.casks[idx], "bundle_id"));
+            if let Some(Some(idx)) = self.bundle_index.get(&key) {
+                return Some((&self.casks[*idx], "bundle_id"));
             }
         }
         let app_key = app_file_name.to_lowercase();
         if !app_key.is_empty() {
-            if let Some(&idx) = self.app_index.get(&app_key) {
-                return Some((&self.casks[idx], "app_name"));
+            if let Some(Some(idx)) = self.app_index.get(&app_key) {
+                return Some((&self.casks[*idx], "app_name"));
             }
         }
         let name_key = normalize(display_name);
@@ -87,15 +105,15 @@ impl CaskCatalog {
     }
 
     fn from_casks(casks: Vec<CatalogCask>) -> Self {
-        let mut bundle_index = HashMap::new();
-        let mut app_index = HashMap::new();
+        let mut bundle_index: HashMap<String, Option<usize>> = HashMap::new();
+        let mut app_index: HashMap<String, Option<usize>> = HashMap::new();
         let mut name_index: HashMap<String, Option<usize>> = HashMap::new();
         for (idx, cask) in casks.iter().enumerate() {
             for bid in &cask.bundle_ids {
-                bundle_index.entry(bid.to_lowercase()).or_insert(idx);
+                claim(&mut bundle_index, bid.to_lowercase(), idx);
             }
             for app in &cask.app_names {
-                app_index.entry(app.to_lowercase()).or_insert(idx);
+                claim(&mut app_index, app.to_lowercase(), idx);
             }
             let mut keys: Vec<String> = cask.names.iter().map(|n| normalize(n)).collect();
             keys.push(normalize(&cask.token));
@@ -103,15 +121,7 @@ impl CaskCatalog {
                 if key.is_empty() {
                     continue;
                 }
-                name_index
-                    .entry(key)
-                    .and_modify(|slot| {
-                        // A different cask claiming the same key poisons it.
-                        if *slot != Some(idx) {
-                            *slot = None;
-                        }
-                    })
-                    .or_insert(Some(idx));
+                claim(&mut name_index, key, idx);
             }
         }
         CaskCatalog {
@@ -310,14 +320,15 @@ fn write_meta(path: &Path, meta: &CacheMeta) {
     }
 }
 
-/// Write via a sibling `.tmp` then rename, so readers never see a partial file.
-/// Best-effort: any error is swallowed (caching is a nicety, never required).
+/// Write via a process-unique sibling `.tmp` then rename, so readers never see
+/// a partial file and two concurrent enrichment tasks can't tear each other's
+/// tmp file. Best-effort: any error is swallowed (caching is a nicety).
 fn write_atomic(path: &Path, bytes: &[u8]) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(".tmp.{}", std::process::id()));
     let tmp = PathBuf::from(tmp);
     if std::fs::write(&tmp, bytes).is_ok() {
         let _ = std::fs::rename(&tmp, path);
@@ -454,6 +465,35 @@ mod tests {
         // But an unambiguous token still matches directly.
         let (m, _) = c.match_app("", "foo", None).unwrap();
         assert_eq!(m.token, "foo");
+    }
+
+    /// Regression: poisoning must apply to ALL indexes, not just names. Two
+    /// casks sharing an `.app` filename (beta/variant families exist in the
+    /// real catalog) or a `quit:` bundle id must never yield an arbitrary
+    /// first-cask-wins match — a wrong match feeds `brew install --adopt`.
+    #[test]
+    fn ambiguous_app_name_and_bundle_id_never_match() {
+        let body = r#"[
+            {"token": "tool", "name": ["Tool"],
+             "artifacts": [{"app": ["Tool.app"]},
+                           {"uninstall": [{"quit": "com.example.tool"}]}]},
+            {"token": "tool-beta", "name": ["Tool Beta"],
+             "artifacts": [{"app": ["Tool.app"]},
+                           {"uninstall": [{"quit": "com.example.tool"}]}]}
+        ]"#;
+        let c = parse_catalog(body.as_bytes()).unwrap();
+        // Shared app filename: poisoned.
+        assert!(c.match_app("Tool.app", "zzz", None).is_none());
+        // Shared bundle id: poisoned.
+        assert!(c
+            .match_app("zzz.app", "zzz", Some("com.example.tool"))
+            .is_none());
+        // Unambiguous name rules still work for each cask.
+        assert_eq!(c.match_app("", "Tool", None).unwrap().0.token, "tool");
+        assert_eq!(
+            c.match_app("", "Tool Beta", None).unwrap().0.token,
+            "tool-beta"
+        );
     }
 
     // ---- cache behavior ----

@@ -205,6 +205,15 @@ async fn run_loop(
                 let gen = manager.start(&tx, &affected);
                 app.begin_scan(gen, &affected);
                 // A targeted rescan is not a full snapshot; don't auto-save it.
+                // But rescanning Apps/Brew re-emits findings uncorrelated, so
+                // correlation (and enrichment) must re-fire once they finish —
+                // same rule as the `r`-key rescan path above.
+                if affected
+                    .iter()
+                    .any(|s| matches!(s, ScannerId::Apps | ScannerId::Brew))
+                {
+                    full_scan_gen = gen;
+                }
             }
         }
 

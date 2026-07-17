@@ -188,12 +188,14 @@ fn parse_tag(body: &[u8]) -> Option<String> {
     v.get("tag_name")?.as_str().map(|s| s.to_string())
 }
 
+/// Process-unique tmp suffix so concurrent enrichment tasks can't tear each
+/// other's in-progress write (see catalog.rs's twin).
 fn write_atomic(path: &Path, bytes: &[u8]) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(".tmp.{}", std::process::id()));
     let tmp = PathBuf::from(tmp);
     if std::fs::write(&tmp, bytes).is_ok() {
         let _ = std::fs::rename(&tmp, path);
