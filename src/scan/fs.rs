@@ -13,12 +13,11 @@
 //! before the (potentially long) sizing pass — the two run concurrently.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use ignore::{WalkBuilder, WalkState};
-use rayon::prelude::*;
 use serde_json::json;
 
 use crate::model::{Finding, FindingKind, Remedy, RemedyCommand, ScanEvent, ScannerId, Severity};
@@ -60,7 +59,8 @@ struct WalkShared {
     token: tokio_util::sync::CancellationToken,
     config: Arc<crate::config::Config>,
     repo_tx: Option<RepoSender>,
-    hits: Arc<Mutex<Vec<Hit>>>,
+    /// Discovered artifact hits go here to be sized concurrently with the walk.
+    hit_tx: crossbeam_channel::Sender<Hit>,
     /// Never descend into these (tilde-expanded ignore list).
     ignore_paths: Vec<PathBuf>,
     /// `~/Library` — skipped wholesale (fixed cache targets are sized directly).
@@ -114,7 +114,41 @@ impl Scanner for FsScanner {
         // pass, delaying GitScanner's completion until this scan returns.
         let repo_tx = ctx.repo_tx.take();
 
-        let hits: Arc<Mutex<Vec<Hit>>> = Arc::new(Mutex::new(Vec::new()));
+        // Artifacts discovered by the walk are sized CONCURRENTLY with it: the
+        // walker sends each hit down this channel and a rayon-backed consumer
+        // du's them as they arrive, re-emitting the finding with its size. So
+        // sizes start streaming in almost immediately instead of only after the
+        // (potentially long) walk finishes.
+        let (hit_tx, hit_rx) = crossbeam_channel::unbounded::<Hit>();
+
+        let sizing = if discovery_only {
+            // Discovery-only feeds the git pipe and emits no disk findings.
+            None
+        } else {
+            let tx_sz = tx.clone();
+            let token_sz = token.clone();
+            Some(tokio::task::spawn_blocking(move || {
+                use rayon::iter::{ParallelBridge, ParallelIterator};
+                hit_rx.into_iter().par_bridge().for_each(|hit| {
+                    if token_sz.is_cancelled() {
+                        return;
+                    }
+                    let size = du_blocks(&hit.path, &|| token_sz.is_cancelled());
+                    let f = artifact_finding(
+                        &hit.path,
+                        &hit.label,
+                        hit.last_used,
+                        hit.stale,
+                        Some(size),
+                    );
+                    let _ = tx_sz.blocking_send(ScanEvent::Finding {
+                        scanner: ScannerId::Fs,
+                        gen,
+                        finding: Box::new(f),
+                    });
+                });
+            }))
+        };
 
         let shared = Arc::new(WalkShared {
             tx: tx.clone(),
@@ -122,7 +156,7 @@ impl Scanner for FsScanner {
             token: token.clone(),
             config: config.clone(),
             repo_tx,
-            hits: hits.clone(),
+            hit_tx,
             ignore_paths,
             library: paths.home.join("Library"),
             large_file_threshold: config.large_file_threshold_bytes(),
@@ -135,38 +169,17 @@ impl Scanner for FsScanner {
         let walk = tokio::task::spawn_blocking(move || run_walk(&walk_shared, &roots));
         walk.await?;
 
-        // The walk task has dropped its `WalkShared` clone; dropping ours releases
-        // the last `repo_tx`, closing the pipe so GitScanner terminates while we
-        // go on to size artifacts below.
+        // Dropping our WalkShared releases the last `repo_tx` (closing the fs→git
+        // pipe so GitScanner terminates) AND the last `hit_tx` (closing the
+        // sizing channel so the consumer drains and finishes).
         drop(shared);
+
+        if let Some(sizing) = sizing {
+            sizing.await?;
+        }
 
         if discovery_only {
             return Ok(());
-        }
-
-        // Size artifact subtrees in parallel and re-emit with the same id.
-        let hits = std::mem::take(&mut *hits.lock().unwrap());
-        if !hits.is_empty() {
-            let tx2 = tx.clone();
-            let token2 = token.clone();
-            tokio::task::spawn_blocking(move || {
-                hits.par_iter().for_each(|hit| {
-                    let size = du_blocks(&hit.path, &|| token2.is_cancelled());
-                    let f = artifact_finding(
-                        &hit.path,
-                        &hit.label,
-                        hit.last_used,
-                        hit.stale,
-                        Some(size),
-                    );
-                    let _ = tx2.blocking_send(ScanEvent::Finding {
-                        scanner: ScannerId::Fs,
-                        gen,
-                        finding: Box::new(f),
-                    });
-                });
-            })
-            .await?;
         }
 
         // Fixed cache/backup paths — sized directly, no walk.
@@ -257,7 +270,9 @@ fn visit(shared: &WalkShared, result: Result<ignore::DirEntry, ignore::Error>) -
                     gen: shared.gen,
                     finding: Box::new(f),
                 });
-                shared.hits.lock().unwrap().push(Hit {
+                // Hand the hit to the concurrent sizing consumer immediately so
+                // its size is computed while the walk continues.
+                let _ = shared.hit_tx.send(Hit {
                     path: path.to_path_buf(),
                     label: name.to_string(),
                     last_used,
