@@ -27,7 +27,8 @@ impl Scanner for SshKeysScanner {
     async fn scan(&self, ctx: ScanCtx) -> anyhow::Result<()> {
         let ssh_dir = ctx.paths.expand("~/.ssh");
         let Ok(entries) = std::fs::read_dir(&ssh_dir) else {
-            return Ok(()); // no ~/.ssh — nothing to report
+            emit_no_keys(&ctx, &ssh_dir).await;
+            return Ok(());
         };
 
         let config_text = std::fs::read_to_string(ssh_dir.join("config")).unwrap_or_default();
@@ -39,6 +40,13 @@ impl Scanner for SshKeysScanner {
             .collect();
         pub_files.sort();
 
+        // An empty section reads as broken — say explicitly that there was
+        // nothing to find (spec: this scanner audits ~/.ssh key hygiene).
+        if pub_files.is_empty() {
+            emit_no_keys(&ctx, &ssh_dir).await;
+            return Ok(());
+        }
+
         for pub_path in pub_files {
             if ctx.cancelled() {
                 break;
@@ -48,6 +56,22 @@ impl Scanner for SshKeysScanner {
 
         Ok(())
     }
+}
+
+/// Explanatory empty-state finding: this section audits SSH key hygiene
+/// (key type/strength, age, config coverage); an empty pane would otherwise
+/// look like a scan failure.
+async fn emit_no_keys(ctx: &ScanCtx, ssh_dir: &Path) {
+    ctx.emit(
+        Finding::new(FindingKind::SshKey, "ssh:no-keys", "No SSH keys found")
+            .path(ssh_dir.to_path_buf())
+            .detail(
+                "This section audits SSH keys in ~/.ssh (type/strength, age, and whether \
+                 each key is referenced by ~/.ssh/config). No .pub key files were found.",
+            )
+            .severity(Severity::Info),
+    )
+    .await;
 }
 
 async fn emit_for_pubkey(ctx: &ScanCtx, pub_path: &Path, config_text: &str) {
@@ -440,10 +464,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_ssh_dir_emits_nothing() {
+    async fn missing_ssh_dir_emits_explanatory_empty_state() {
         let tmp = tempfile::tempdir().unwrap();
         let (ctx, mut rx) = ctx_with(&tmp, crate::runner::MockCommandRunner::new());
         SshKeysScanner.scan(ctx).await.unwrap();
-        assert!(rx.try_recv().is_err());
+        let mut findings = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let crate::model::ScanEvent::Finding { finding, .. } = ev {
+                findings.push(*finding);
+            }
+        }
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].title, "No SSH keys found");
+        assert_eq!(findings[0].severity, Severity::Info);
     }
 }

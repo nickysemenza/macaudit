@@ -80,7 +80,9 @@ impl Scanner for PortsScanner {
                 });
 
             if let Some(path) = binary_path {
-                finding = finding.remedy(Remedy {
+                // The listener's path IS the process binary — show it in the
+                // Path column, not just inside the reveal remedy.
+                finding = finding.path(path.clone()).remedy(Remedy {
                     label: "Reveal in Finder".to_string(),
                     command: RemedyCommand::RevealInFinder { path: path.into() },
                     reclaims_bytes: None,

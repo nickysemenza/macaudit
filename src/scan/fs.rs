@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use ignore::{WalkBuilder, WalkState};
@@ -146,7 +146,10 @@ impl Scanner for FsScanner {
                     .await
                     .unwrap_or_default(),
             );
-            let now_secs = unix_secs(SystemTime::now());
+            let now_secs = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
 
             Some(tokio::task::spawn_blocking(move || {
                 use rayon::iter::{ParallelBridge, ParallelIterator};
@@ -675,31 +678,9 @@ fn save_cache(path: &Path, entries: &[(PathBuf, CachedSize)]) {
     }
 }
 
-/// Unix-seconds mtime of `path` itself (the artifact root), 0 on any failure
-/// (missing path, permission error, platforms without mtime support).
-fn root_mtime_secs(path: &Path) -> i64 {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .map(unix_secs)
-        .unwrap_or(0)
-}
-
-fn unix_secs(t: SystemTime) -> i64 {
-    t.duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-/// Is a cached size still trustworthy: measured within the TTL window AND the
-/// artifact root's mtime hasn't moved since (a changed mtime means the tree
-/// was touched, so the old size can no longer be trusted).
-fn is_fresh(cached: &CachedSize, current_root_mtime: i64, now_secs: i64, ttl_hours: u64) -> bool {
-    let ttl_secs = (ttl_hours as i64).saturating_mul(3600);
-    let not_expired = cached.computed_at > now_secs.saturating_sub(ttl_secs);
-    let mtime_matches = cached.root_mtime == current_root_mtime;
-    not_expired && mtime_matches
-}
+// Freshness/mtime helpers live in `size_cache` so GitScanner's repo sizing can
+// share the exact same staleness semantics.
+use crate::size_cache::{is_fresh, root_mtime_secs};
 
 #[cfg(test)]
 mod tests {
@@ -749,6 +730,12 @@ mod tests {
             fs_discovery_only: discovery_only,
         };
         (ctx, rx, repo_rx)
+    }
+
+    fn unix_secs(t: SystemTime) -> i64 {
+        t.duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
     }
 
     /// Collect all findings from the receiver into path→findings.

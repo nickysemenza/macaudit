@@ -119,6 +119,33 @@ pub fn db_path(paths: &crate::config::Paths) -> PathBuf {
     paths.state_dir.join("sizes.db")
 }
 
+/// Unix-seconds mtime of `path` itself (the measured tree's root), 0 on any
+/// failure (missing path, permission error, platforms without mtime support).
+pub fn root_mtime_secs(path: &Path) -> i64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Is a cached size still trustworthy: measured within the TTL window AND the
+/// tree root's mtime hasn't moved since (a changed mtime means the tree was
+/// touched, so the old size can no longer be trusted). Shared by FsScanner's
+/// artifact sizing and GitScanner's repo sizing.
+pub fn is_fresh(
+    cached: &CachedSize,
+    current_root_mtime: i64,
+    now_secs: i64,
+    ttl_hours: u64,
+) -> bool {
+    let ttl_secs = (ttl_hours as i64).saturating_mul(3600);
+    let not_expired = cached.computed_at > now_secs.saturating_sub(ttl_secs);
+    let mtime_matches = cached.root_mtime == current_root_mtime;
+    not_expired && mtime_matches
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

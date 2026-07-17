@@ -20,7 +20,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::Frame;
 
 use crate::config::DeleteMode;
-use crate::model::{Finding, FindingId, Remedy, ScanEvent, ScannerId, Severity};
+use crate::model::{Finding, FindingId, FindingKind, Remedy, ScanEvent, ScannerId, Severity};
 use crate::registry::{self, ViewKind};
 use crate::remedy::{PlannedAction, RemedyEngine};
 use crate::ui::keys::Action;
@@ -772,10 +772,13 @@ fn matches_filter(f: &Finding, needle: &str) -> bool {
 /// Whether a finding is a System app (hidden unless `h` toggled). Heuristic on
 /// path; the real classification lives in AppsScanner's meta.
 fn is_system_app(f: &Finding) -> bool {
-    f.path
-        .as_ref()
-        .map(|p| p.starts_with("/System/"))
-        .unwrap_or(false)
+    // Scoped to App findings: other sections (e.g. Ports) legitimately carry
+    // /System/… binary paths and must not vanish behind the `h` toggle.
+    f.kind == FindingKind::App
+        && f.path
+            .as_ref()
+            .map(|p| p.starts_with("/System/"))
+            .unwrap_or(false)
 }
 
 #[cfg(test)]
