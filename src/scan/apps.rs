@@ -83,14 +83,27 @@ impl Classification {
     /// are bucketed by this so the user can see System vs Homebrew-cask vs
     /// Unmanaged at a glance. `correlate` overrides this to "Homebrew Cask" for
     /// apps matched to an installed cask.
-    fn group_label(self) -> &'static str {
+    ///
+    /// Unmanaged is split by location: apps the user actually installed live in
+    /// `/Applications` (or `~/Applications`); everything else is overwhelmingly
+    /// vendor helpers/uninstallers scattered around `/Library`, app bundles,
+    /// etc. — separating them keeps the actionable bucket readable.
+    fn group_label(self, in_applications: bool) -> &'static str {
         match self {
             Classification::System => "System",
             Classification::User => "User",
             Classification::AppStore => "App Store",
-            Classification::Unmanaged => "Unmanaged",
+            Classification::Unmanaged if in_applications => "Unmanaged (Applications)",
+            Classification::Unmanaged => "Unmanaged (helpers & other locations)",
         }
     }
+}
+
+/// Whether an app bundle lives in a user-facing applications directory
+/// (`/Applications` or `~/Applications`) rather than a vendor/support location.
+fn in_applications_dir(path: &str, ctx: &ScanCtx) -> bool {
+    let home_apps = ctx.paths.expand("~/Applications");
+    path.starts_with("/Applications/") || path.starts_with(home_apps.to_string_lossy().as_ref())
 }
 
 fn classify(path: &str, obtained_from: Option<&str>, ctx: &ScanCtx) -> Classification {
@@ -243,7 +256,7 @@ impl Scanner for AppsScanner {
 
             let meta = json!({
                 "classification": final_classification.as_str(),
-                "group": final_classification.group_label(),
+                "group": final_classification.group_label(in_applications_dir(&path, &ctx)),
                 "arch": arch,
                 "obtained_from": raw.obtained_from,
                 "signed_by": raw.signed_by.as_ref().map(|s| s.display()),
@@ -338,6 +351,14 @@ mod tests {
           "version": "0.1",
           "arch_kind": "arch_arm_i64",
           "obtained_from": "unknown"
+        },
+        {
+          "_name": "VendorHelper",
+          "path": "/Library/Application Support/Vendor/VendorHelper.app",
+          "version": "9.9",
+          "arch_kind": "arch_arm_i64",
+          "obtained_from": "identified_developer",
+          "signed_by": "Developer ID Application: Vendor Inc"
         }
       ]
     }
@@ -377,7 +398,30 @@ mod tests {
     #[tokio::test]
     async fn emits_one_finding_per_app() {
         let findings = run_scan().await;
-        assert_eq!(findings.len(), 5);
+        assert_eq!(findings.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn unmanaged_group_splits_by_applications_dir() {
+        let findings = run_scan().await;
+        let by_path = |p: &str| {
+            findings
+                .iter()
+                .find(|f| f.path.as_deref() == Some(std::path::Path::new(p)))
+                .unwrap()
+        };
+        // A real app in /Applications the user installed manually.
+        let slack = by_path("/Applications/Slack.app");
+        assert_eq!(slack.meta["classification"], "unmanaged");
+        assert_eq!(slack.meta["group"], "Unmanaged (Applications)");
+        // A vendor helper living outside /Applications: same classification
+        // (correlate/enrich still consider it), different display bucket.
+        let helper = by_path("/Library/Application Support/Vendor/VendorHelper.app");
+        assert_eq!(helper.meta["classification"], "unmanaged");
+        assert_eq!(
+            helper.meta["group"],
+            "Unmanaged (helpers & other locations)"
+        );
     }
 
     #[tokio::test]
