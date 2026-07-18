@@ -420,7 +420,7 @@ fn artifact_finding(
         .unwrap_or_default();
     let title = format!("{label} — {parent_name}");
 
-    let mut meta = json!({ "stale": stale, "artifact": label });
+    let mut meta = json!({ "stale": stale, "artifact": label, "group": label });
     if cached {
         meta["size_cached"] = json!(true);
     }
@@ -459,6 +459,7 @@ fn large_file_finding(path: &Path, size: u64) -> Finding {
         .detail("Large loose file over the size threshold".to_string())
         .size(size)
         .severity(Severity::Attention)
+        .meta(json!({ "group": "Large files" }))
         .remedy(Remedy {
             label: "Reveal in Finder".into(),
             command: RemedyCommand::RevealInFinder {
@@ -643,10 +644,15 @@ fn emit_fixed(
             },
         )
     };
+    let group = match kind {
+        FindingKind::IosBackup => "iOS Backups",
+        _ => "Caches",
+    };
     let f = Finding::new(kind, &key, name)
         .path(path.to_path_buf())
         .size(size)
         .severity(severity)
+        .meta(json!({ "group": group }))
         .remedy(remedy);
     let _ = tx.blocking_send(ScanEvent::Finding {
         scanner: ScannerId::Fs,

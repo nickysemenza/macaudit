@@ -54,7 +54,9 @@ pub const REGISTRY: &[SectionMeta] = &[
     SectionMeta {
         id: ScannerId::Fs,
         title: "Disk",
-        view: ViewKind::Table,
+        // Grouped by artifact category (node_modules / target / Caches /
+        // Large files / iOS Backups …) — thousands of flat rows are unreadable.
+        view: ViewKind::Tree,
         build: || Box::new(FsScanner),
     },
     SectionMeta {

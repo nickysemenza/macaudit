@@ -430,11 +430,20 @@ impl AppState {
             .filter(|f| needle.is_empty() || matches_filter(f, &needle))
             .collect();
         match self.sort {
-            Sort::SizeDesc => {
-                rows.sort_by(|a, b| b.size_bytes.unwrap_or(0).cmp(&a.size_bytes.unwrap_or(0)))
-            }
+            // Tie-break by title so size-less sections (Apps/Brew) read
+            // alphabetically under the default sort instead of map-order.
+            Sort::SizeDesc => rows.sort_by(|a, b| {
+                b.size_bytes
+                    .unwrap_or(0)
+                    .cmp(&a.size_bytes.unwrap_or(0))
+                    .then_with(|| a.title.cmp(&b.title))
+            }),
             Sort::Title => rows.sort_by(|a, b| a.title.cmp(&b.title)),
-            Sort::Severity => rows.sort_by(|a, b| b.severity.cmp(&a.severity)),
+            Sort::Severity => rows.sort_by(|a, b| {
+                b.severity
+                    .cmp(&a.severity)
+                    .then_with(|| a.title.cmp(&b.title))
+            }),
         }
         rows
     }
