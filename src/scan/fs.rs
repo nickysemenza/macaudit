@@ -315,6 +315,12 @@ fn visit(shared: &WalkShared, result: Result<ignore::DirEntry, ignore::Error>) -
         if shared.ignore_paths.iter().any(|ig| path == ig) {
             return WalkState::Skip;
         }
+        // Never descend into Trash: everything in it is already slated for
+        // deletion — re-reporting trashed node_modules (or piping trashed
+        // repos to GitScanner) is noise, and a Trash remedy would be absurd.
+        if path.file_name().and_then(|n| n.to_str()) == Some(".Trash") {
+            return WalkState::Skip;
+        }
 
         let name = match path.file_name().and_then(|n| n.to_str()) {
             Some(n) => n,
@@ -505,8 +511,22 @@ struct FixedTarget {
     kind: FindingKind,
     /// Emit one finding per immediate subdir instead of one for the whole dir.
     per_subdir: bool,
-    /// Offer a destructive Trash remedy (false ⇒ reveal-only, e.g. iOS backups).
-    trashable: bool,
+    /// What action to offer for this target.
+    remedy: FixedRemedy,
+}
+
+/// Remedy shape for a fixed target. Most caches are safely trashable; some
+/// need a tool-specific cleanup command instead (trashing `~/Library/pnpm`
+/// would also nuke pnpm's global bin shims, so `pnpm store prune` is the
+/// correct action there); backups get reveal-only.
+enum FixedRemedy {
+    Trash,
+    Reveal,
+    Shell {
+        label: &'static str,
+        program: &'static str,
+        args: &'static [&'static str],
+    },
 }
 
 const FIXED_TARGETS: &[FixedTarget] = &[
@@ -514,61 +534,73 @@ const FIXED_TARGETS: &[FixedTarget] = &[
         rel: "~/Library/Developer/Xcode/DerivedData",
         kind: FindingKind::CacheDir,
         per_subdir: false,
-        trashable: true,
+        remedy: FixedRemedy::Trash,
     },
     FixedTarget {
         rel: "~/Library/Developer/Xcode/iOS DeviceSupport",
         kind: FindingKind::CacheDir,
         per_subdir: false,
-        trashable: true,
+        remedy: FixedRemedy::Trash,
     },
     FixedTarget {
         rel: "~/Library/Developer/CoreSimulator/Caches",
         kind: FindingKind::CacheDir,
         per_subdir: false,
-        trashable: true,
+        remedy: FixedRemedy::Trash,
     },
     FixedTarget {
         rel: "~/.npm",
         kind: FindingKind::CacheDir,
         per_subdir: false,
-        trashable: true,
+        remedy: FixedRemedy::Trash,
     },
     FixedTarget {
         rel: "~/.pnpm-store",
         kind: FindingKind::CacheDir,
         per_subdir: false,
-        trashable: true,
+        remedy: FixedRemedy::Trash,
+    },
+    FixedTarget {
+        // Modern pnpm's default home on macOS: content-addressable store plus
+        // global bin shims — do NOT offer Trash; prune is the correct cleanup.
+        rel: "~/Library/pnpm",
+        kind: FindingKind::CacheDir,
+        per_subdir: false,
+        remedy: FixedRemedy::Shell {
+            label: "Prune unreferenced packages (pnpm store prune)",
+            program: "pnpm",
+            args: &["store", "prune"],
+        },
     },
     FixedTarget {
         rel: "~/.cargo/registry",
         kind: FindingKind::CacheDir,
         per_subdir: false,
-        trashable: true,
+        remedy: FixedRemedy::Trash,
     },
     FixedTarget {
         rel: "~/.rustup/toolchains",
         kind: FindingKind::CacheDir,
         per_subdir: false,
-        trashable: true,
+        remedy: FixedRemedy::Trash,
     },
     FixedTarget {
         rel: "~/go/pkg/mod",
         kind: FindingKind::CacheDir,
         per_subdir: false,
-        trashable: true,
+        remedy: FixedRemedy::Trash,
     },
     FixedTarget {
         rel: "~/Library/Caches",
         kind: FindingKind::CacheDir,
         per_subdir: true,
-        trashable: true,
+        remedy: FixedRemedy::Trash,
     },
     FixedTarget {
         rel: "~/Library/Application Support/MobileSync/Backup",
         kind: FindingKind::IosBackup,
         per_subdir: true,
-        trashable: false,
+        remedy: FixedRemedy::Reveal,
     },
 ];
 
@@ -597,11 +629,11 @@ fn size_fixed_paths(
                     continue;
                 }
                 let size = du_blocks(&p, &|| token.is_cancelled());
-                emit_fixed(tx, gen, &p, target.kind, target.trashable, size);
+                emit_fixed(tx, gen, &p, target.kind, &target.remedy, size);
             }
         } else {
             let size = du_blocks(&root, &|| token.is_cancelled());
-            emit_fixed(tx, gen, &root, target.kind, target.trashable, size);
+            emit_fixed(tx, gen, &root, target.kind, &target.remedy, size);
         }
     }
 }
@@ -611,7 +643,7 @@ fn emit_fixed(
     gen: u64,
     path: &Path,
     kind: FindingKind,
-    trashable: bool,
+    fixed_remedy: &FixedRemedy,
     size: u64,
 ) {
     let key = path.to_string_lossy();
@@ -619,8 +651,8 @@ fn emit_fixed(
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| key.to_string());
-    let (severity, remedy) = if trashable {
-        (
+    let (severity, remedy) = match fixed_remedy {
+        FixedRemedy::Trash => (
             Severity::Reclaimable,
             Remedy {
                 label: "Move to Trash".into(),
@@ -630,9 +662,8 @@ fn emit_fixed(
                 reclaims_bytes: Some(size),
                 destructive: true,
             },
-        )
-    } else {
-        (
+        ),
+        FixedRemedy::Reveal => (
             Severity::Attention,
             Remedy {
                 label: "Reveal in Finder".into(),
@@ -642,7 +673,25 @@ fn emit_fixed(
                 reclaims_bytes: None,
                 destructive: false,
             },
-        )
+        ),
+        FixedRemedy::Shell {
+            label,
+            program,
+            args,
+        } => (
+            Severity::Reclaimable,
+            Remedy {
+                label: (*label).into(),
+                command: RemedyCommand::Shell {
+                    program: (*program).into(),
+                    args: args.iter().map(|a| (*a).to_string()).collect(),
+                },
+                // The tool decides what's actually reclaimable (e.g. prune only
+                // removes unreferenced packages) — don't promise the full size.
+                reclaims_bytes: None,
+                destructive: true,
+            },
+        ),
     };
     let group = match kind {
         FindingKind::IosBackup => "iOS Backups",
@@ -951,6 +1000,31 @@ mod tests {
                 .iter()
                 .any(|f| f.path.as_deref() == Some(lib.join("node_modules").as_path())),
             "~/Library must be skipped by the walk"
+        );
+    }
+
+    /// Regression: trashed projects were being re-reported — a node_modules
+    /// sitting in ~/.Trash is already slated for deletion and must be ignored
+    /// (and its .git must not be piped to GitScanner).
+    #[tokio::test]
+    async fn trash_is_not_descended() {
+        let home = tempfile::tempdir().unwrap();
+        let trashed = home.path().join(".Trash/old-project");
+        fs::create_dir_all(trashed.join("node_modules/x")).unwrap();
+        fs::write(trashed.join("package.json"), "{}").unwrap();
+        fs::create_dir_all(trashed.join(".git")).unwrap();
+
+        let (ctx, rx, repo_rx) = ctx_for(home.path(), true, false, vec![]);
+        FsScanner.scan(ctx).await.unwrap();
+
+        assert!(
+            drain(rx).is_empty(),
+            "nothing inside ~/.Trash may produce findings"
+        );
+        let mut repo_rx = repo_rx.unwrap();
+        assert!(
+            repo_rx.try_recv().is_err(),
+            "trashed repos must not reach GitScanner"
         );
     }
 

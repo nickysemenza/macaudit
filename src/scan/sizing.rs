@@ -4,13 +4,24 @@
 //! `len()`: APFS clones and sparse files make apparent size a lie (spec §2).
 //! `du_blocks` sums a subtree; FsScanner runs it on a rayon pool and re-emits
 //! the finding with the size once known.
+//!
+//! Hard links are counted ONCE per walk (like real `du`): pnpm's store model
+//! hard-links every package file into each `node_modules`, so counting per
+//! path would wildly overstate pnpm projects. Only multi-link files pay the
+//! dedup bookkeeping cost. (Dedup is per-`du_blocks` call — two separate
+//! findings that hard-link the same file each still report it, which is the
+//! honest per-tree number.)
 
 use std::path::Path;
 
 /// Sum the on-disk size (in bytes) of everything under `root`, following no
-/// symlinks. Best-effort: unreadable entries are skipped. Checks `cancelled`
-/// periodically so a long walk stops promptly on rescan.
+/// symlinks, counting hard-linked files once. Best-effort: unreadable entries
+/// are skipped. Checks `cancelled` periodically so a long walk stops promptly
+/// on rescan.
 pub fn du_blocks(root: &Path, cancelled: &dyn Fn() -> bool) -> u64 {
+    #[cfg(unix)]
+    let mut seen_links: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+
     let mut total: u64 = 0;
     let mut stack = vec![root.to_path_buf()];
     let mut counter: u32 = 0;
@@ -35,6 +46,15 @@ pub fn du_blocks(root: &Path, cancelled: &dyn Fn() -> bool) -> u64 {
             if meta.is_dir() {
                 stack.push(entry.path());
             } else {
+                // A file with multiple hard links must only count once no
+                // matter how many of its links live under this root.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if meta.nlink() > 1 && !seen_links.insert((meta.dev(), meta.ino())) {
+                        continue;
+                    }
+                }
                 total = total.saturating_add(on_disk_bytes(&meta));
             }
         }
@@ -81,6 +101,23 @@ mod tests {
         let size = du_blocks(dir.path(), &|| false);
         // At least the 8 KiB we wrote (block rounding may make it larger).
         assert!(size >= 8192, "got {size}");
+    }
+
+    /// Regression: pnpm hard-links every package file into each node_modules;
+    /// counting per path would overstate such trees. Hard links count once.
+    #[test]
+    #[cfg(unix)]
+    fn hard_links_count_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original.bin");
+        std::fs::write(&original, vec![0u8; 8192]).unwrap();
+        std::fs::hard_link(&original, dir.path().join("link1.bin")).unwrap();
+        std::fs::hard_link(&original, dir.path().join("link2.bin")).unwrap();
+
+        let size = du_blocks(dir.path(), &|| false);
+        // Three directory entries, one payload: must count ~8 KiB once, not 3×.
+        assert!(size >= 8192, "got {size}");
+        assert!(size < 2 * 8192, "hard links double-counted: {size}");
     }
 
     #[test]
