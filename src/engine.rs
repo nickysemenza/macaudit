@@ -285,10 +285,12 @@ impl ScannerManager {
         gen
     }
 
-    /// Run a scan to completion and collect findings into an upserting map keyed
-    /// by stable `FindingId` (last write wins — deferred size updates replace the
-    /// earlier unsized finding). Used by all headless commands.
-    pub async fn run_to_completion(&self, requested: &[ScannerId]) -> BTreeMap<FindingId, Finding> {
+    /// Run a scan to completion, collecting findings into an upserting map keyed
+    /// by stable `FindingId` plus the list of sections that FAILED (scanner
+    /// returned an error). Callers that persist results must check `failures` —
+    /// silently saving a partial snapshot would make the next diff report whole
+    /// sections as removed. Used by all headless commands.
+    pub async fn run_to_completion(&self, requested: &[ScannerId]) -> ScanOutcome {
         let (tx, mut rx) = mpsc::channel::<ScanEvent>(1024);
         let (sections, discovery_only) = Self::plan(requested);
         let (gen, tokens) = self.begin_sections(requested, &sections);
@@ -296,14 +298,22 @@ impl ScannerManager {
         drop(tx); // channel closes once all tasks finish
 
         let mut map: BTreeMap<FindingId, Finding> = BTreeMap::new();
+        let mut failures: Vec<(ScannerId, String)> = Vec::new();
         while let Some(ev) = rx.recv().await {
-            if let ScanEvent::Finding {
-                finding, gen: g, ..
-            } = ev
-            {
-                if g == gen {
+            match ev {
+                ScanEvent::Finding {
+                    finding, gen: g, ..
+                } if g == gen => {
                     map.insert(finding.id, *finding);
                 }
+                ScanEvent::Failed {
+                    scanner,
+                    gen: g,
+                    error,
+                } if g == gen => {
+                    failures.push((scanner, error));
+                }
+                _ => {}
             }
         }
         // Sync correlation first (installed-cask marking must precede catalog
@@ -323,8 +333,18 @@ impl ScannerManager {
             &enrich_token,
         )
         .await;
-        map
+        ScanOutcome {
+            findings: map,
+            failures,
+        }
     }
+}
+
+/// The result of a headless scan: everything found, plus which sections failed.
+pub struct ScanOutcome {
+    pub findings: BTreeMap<FindingId, Finding>,
+    /// Sections whose scanner returned an error, with the error text.
+    pub failures: Vec<(ScannerId, String)>,
 }
 
 /// Wrap one scanner: emit `Started`, run, emit `Finished`/`Failed`.
@@ -378,11 +398,16 @@ mod tests {
     #[tokio::test]
     async fn fake_run_produces_findings() {
         let m = mgr(Mode::Fake);
-        let map = m.run_to_completion(&[ScannerId::Apps]).await;
+        let outcome = m.run_to_completion(&[ScannerId::Apps]).await;
         // 3 distinct ids (item 1 upserted, not duplicated).
-        assert_eq!(map.len(), 3);
+        assert_eq!(outcome.findings.len(), 3);
+        assert!(outcome.failures.is_empty());
         // Item 1's size was set by the deferred update.
-        let sized = map.values().filter(|f| f.size_bytes.is_some()).count();
+        let sized = outcome
+            .findings
+            .values()
+            .filter(|f| f.size_bytes.is_some())
+            .count();
         assert!(sized >= 2, "expected deferred size to land");
     }
 
@@ -394,10 +419,12 @@ mod tests {
         // asserts the engine drives a real scanner end-to-end and terminates,
         // and that anything emitted is a non-actionable Info fallback.
         let m = mgr(Mode::Real);
-        let map = m.run_to_completion(&[ScannerId::Ports]).await;
+        let outcome = m.run_to_completion(&[ScannerId::Ports]).await;
         assert!(m.current_generation() >= 1);
         assert!(
-            map.values()
+            outcome
+                .findings
+                .values()
                 .all(|f| f.severity == crate::model::Severity::Info),
             "a blank-runner real scan should only yield Info fallbacks"
         );

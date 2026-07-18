@@ -23,20 +23,31 @@ dev-environment sprawl, with safe, explicit remediation.
 
 ## Safety model
 
-macaudit is **read-only by default**. Scanning never modifies your system.
+Scanning never modifies the things it audits: no files are deleted, no
+packages touched, no settings changed. Honest fine print on what a scan
+*does* do:
 
+- **Read-only inspection commands are executed** (`system_profiler`, `brew`,
+  `git status`, `lsof`, …). Two worth knowing about: `brew` is always run
+  with `HOMEBREW_NO_AUTO_UPDATE=1` so it can't trigger Homebrew's
+  auto-update, and the Shell section starts an interactive `zsh` to read
+  your real login `$PATH` and measure startup time — which, by definition,
+  executes your own shell configuration files.
+- **macaudit writes its own state**: size caches and the catalog cache
+  (`~/Library/Caches/macaudit`), and snapshot history
+  (`~/.local/state/macaudit`). Never anything outside its own directories.
 - **Nothing runs unseen.** Every remedy — delete, `brew upgrade`, `docker
-  system prune`, whatever — is rendered as a literal command string and
+  builder prune`, whatever — is rendered as a literal command string and
   shown to you (in the detail pane, and again in the confirm dialog) before
   it ever executes. You always see exactly what will run.
 - **Deletions default to Trash**, not `rm -rf`. Pass `--rm` if you want real
   deletion instead; that choice is explicit, global, and visible in every
   rendered command.
-- **Network access is optional and narrow.** Nothing talks to the network
-  unless you enable it; run with `--offline` to guarantee zero network
-  calls. When enabled, the only endpoints ever contacted are
-  `formulae.brew.sh` (Homebrew cask catalog) and `api.github.com` (release
-  checks), both cached to disk so repeated scans don't re-fetch.
+- **Network access is on by default, narrow, and easy to disable.** The only
+  endpoints ever contacted are `formulae.brew.sh` (Homebrew cask catalog)
+  and `api.github.com` (release checks), both cached to disk so repeated
+  scans don't re-fetch. Run with `--offline` (or set `[network] offline =
+  true`) to guarantee zero HTTP — cached catalog data still works offline.
 
 ## Install
 
@@ -97,6 +108,9 @@ file falls back to these defaults:
 roots = []                       # fs walk roots; empty -> [$HOME]
 ignore = []                      # paths to never descend into (tilde-expanded)
 large_file_threshold_gb = 1.0    # loose files larger than this are flagged
+# Cached sizes are reused while the tree root's mtime is unchanged AND the
+# entry is younger than this TTL. Deep-nested changes don't bump a root's
+# mtime, so a stale size can persist up to the TTL — lower it if that matters.
 size_cache_ttl_hours = 24        # how long a cached artifact size stays fresh
 
 [artifacts]
@@ -124,16 +138,16 @@ github_cache_ttl_hours = 72      # how long a cached GitHub release result stays
 | Apps | Installed applications, classified System / User / cask-managed / App Store / Unmanaged, with arch (Intel/Rosetta) and code-signing info. |
 | Brew | Installed formulae and casks, dependency tree, outdated packages, casks correlated to installed `.app`s. |
 | Disk | Build artifacts (`node_modules`, `target`, `.venv`, etc.), package-manager caches, and large loose files found by a parallel filesystem walk. |
-| Daemons | LaunchAgents/LaunchDaemons and Ventura+ background items, flagging orphaned entries whose binary no longer exists. |
+| Daemons | LaunchAgents/LaunchDaemons, flagging orphaned entries whose binary no longer exists. |
 | Shell | `$PATH` duplicates and dead entries, plus shell startup time. |
 | Runtimes | Language version managers (nvm/fnm/volta/mise/asdf/pyenv/rustup) and their installed toolchain versions. |
-| Docker | Docker images, stopped containers, unused volumes, and build cache, when the daemon is reachable. |
+| Docker | Reclaimable space per category (images, containers, volumes, build cache) via `docker system df`, when the daemon is reachable. |
 | Ports | Listening TCP ports with the owning process and PID. |
-| Git | Local repos with uncommitted work, unpushed commits, or stale branches. |
-| Simulators | iOS Simulator devices and runtimes, flagging unavailable/legacy ones. |
+| Git | Local repos with uncommitted work, unpushed commits (including branches with no upstream), stashes, and working-tree sizes; package-manager checkouts are filtered out. |
+| Simulators | iOS Simulator devices and runtimes, with targeted delete remedies for unavailable ones. |
 | Keys | SSH keys in `~/.ssh`, flagging old or weak ones. |
 | Snapshots | Time Machine local disk snapshots, which silently consume disk space. |
 
 ## License
 
-MIT (or your choice)
+MIT

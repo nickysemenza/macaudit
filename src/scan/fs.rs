@@ -579,10 +579,13 @@ const FIXED_TARGETS: &[FixedTarget] = &[
         remedy: FixedRemedy::Trash,
     },
     FixedTarget {
+        // Trashing this wholesale would delete the ACTIVE toolchain and break
+        // the user's Rust install. The Runtimes section lists toolchains
+        // individually with `rustup toolchain uninstall` as the safe path.
         rel: "~/.rustup/toolchains",
         kind: FindingKind::CacheDir,
         per_subdir: false,
-        remedy: FixedRemedy::Trash,
+        remedy: FixedRemedy::Reveal,
     },
     FixedTarget {
         rel: "~/go/pkg/mod",

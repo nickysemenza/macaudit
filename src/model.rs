@@ -2,27 +2,42 @@
 //! sink consumes. These are **frozen contracts**: parallel implementation lanes
 //! depend on them, so changes here ripple everywhere. Append-only during fan-out.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-/// Stable identity for a Finding across runs — a hash of (kind discriminant,
-/// canonical key). This is what makes snapshot diffing (§8) work: the same
-/// artifact/app/daemon must produce the same id every scan.
+/// Stable identity for a Finding across runs — a hash of (kind tag, canonical
+/// key). This is what makes snapshot diffing (§8) work: the same
+/// artifact/app/daemon must produce the same id every scan, INCLUDING across
+/// macaudit rebuilds with different Rust toolchains — which is why this uses a
+/// pinned FNV-1a implementation rather than `DefaultHasher` (whose algorithm is
+/// deliberately unspecified between releases). Changing this function is a
+/// snapshot-format break: every stored finding would diff as removed+added.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Debug)]
 pub struct FindingId(pub u64);
+
+/// FNV-1a 64-bit, fixed constants — stable forever by construction.
+fn fnv1a_64(chunks: &[&[u8]]) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = OFFSET;
+    for chunk in chunks {
+        for &b in *chunk {
+            h ^= b as u64;
+            h = h.wrapping_mul(PRIME);
+        }
+        // Separator byte so ("ab","c") never collides with ("a","bc").
+        h ^= 0xff;
+        h = h.wrapping_mul(PRIME);
+    }
+    h
+}
 
 impl FindingId {
     /// Build a stable id from a kind and a canonical key (path or name).
     pub fn new(kind: FindingKind, key: &str) -> Self {
-        let mut h = DefaultHasher::new();
-        // discriminant name is stable across runs; avoids relying on enum layout.
-        kind.tag().hash(&mut h);
-        key.hash(&mut h);
-        FindingId(h.finish())
+        FindingId(fnv1a_64(&[kind.tag().as_bytes(), key.as_bytes()]))
     }
 }
 
@@ -212,7 +227,7 @@ pub enum RemedyCommand {
     Shell { program: String, args: Vec<String> },
     /// `open -R <path>` — reveal in Finder.
     RevealInFinder { path: PathBuf },
-    /// Put text on the clipboard (for things we won't run ourselves, e.g. kill <pid>).
+    /// Put text on the clipboard (for things we won't run ourselves, e.g. `kill <pid>`).
     CopyToClipboard { text: String },
 }
 
@@ -390,6 +405,17 @@ mod tests {
         let a = FindingId::new(FindingKind::BuildArtifact, "/Users/x/proj/node_modules");
         let b = FindingId::new(FindingKind::BuildArtifact, "/Users/x/proj/node_modules");
         assert_eq!(a, b);
+    }
+
+    /// Golden value: the id algorithm is part of the snapshot format. If this
+    /// test fails, every stored snapshot will diff as fully removed+added —
+    /// do not "fix" the assertion without a deliberate migration decision.
+    #[test]
+    fn finding_id_algorithm_is_pinned() {
+        assert_eq!(
+            FindingId::new(FindingKind::App, "/Applications/Foo.app").0,
+            0xf0197d6fd8a33708
+        );
     }
 
     #[test]

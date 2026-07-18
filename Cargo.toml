@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.93"
 description = "A 'why is my Mac like this' audit TUI"
+license = "MIT"
+repository = "https://github.com/nickysemenza/macaudit"
 
 [lib]
 name = "macaudit"
@@ -27,10 +29,8 @@ plist = "1.10"
 trash = "5.2.6"
 clap = { version = "4.6.2", features = ["derive"] }
 anyhow = "1.0.103"
-thiserror = "2.0.18"
 humansize = "2.1.3"
 toml = "1.1.3"
-directories = "6.0"
 rusqlite = { version = "0.37", features = ["bundled"] }
 async-trait = "0.1.89"
 crossbeam-channel = "0.5"

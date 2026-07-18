@@ -66,7 +66,7 @@ impl Scanner for DockerScanner {
                     vec!["container", "prune", "-f"],
                 )),
                 "Local Volumes" => Some(("Remove unused volumes", vec!["volume", "prune", "-f"])),
-                "Build Cache" => Some(("Prune build cache", vec!["system", "prune", "-f"])),
+                "Build Cache" => Some(("Prune build cache", vec!["builder", "prune", "-f"])),
                 _ => None,
             };
 
@@ -95,8 +95,15 @@ impl Scanner for DockerScanner {
                 "reclaimable": reclaimable_str,
             }));
 
-            if let Some(bytes) = size_bytes {
+            // Show what a prune would actually RECLAIM as the finding's size —
+            // total usage includes active images/containers that no remedy
+            // touches, and the sidebar sums size_bytes of Reclaimable findings.
+            // Total stays visible in the detail/meta.
+            if let Some(bytes) = reclaimable_bytes.or(size_bytes) {
                 finding = finding.size(bytes);
+            }
+            if let Some(total) = size_bytes {
+                finding.meta["total_size_bytes"] = serde_json::json!(total);
             }
 
             if reclaimable_nonzero {
@@ -271,7 +278,9 @@ mod tests {
             .find(|f| f.meta["type"] == "Images")
             .unwrap();
         assert_eq!(images.severity, Severity::Reclaimable);
-        assert_eq!(images.size_bytes, Some(1_113_000_000));
+        // size_bytes now reports RECLAIMABLE (what a prune frees), not total.
+        assert_eq!(images.size_bytes, Some(800_000_000));
+        assert_eq!(images.meta["total_size_bytes"], 1_113_000_000u64);
         assert_eq!(images.remedies.len(), 1);
         assert!(images.remedies[0].destructive);
         assert_eq!(

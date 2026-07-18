@@ -103,6 +103,31 @@ mod tests {
         assert!(size >= 8192, "got {size}");
     }
 
+    /// Refutation of an external-audit claim: `std::fs::DirEntry::metadata()`
+    /// does NOT follow symlinks (unlike `fs::metadata` on a path), so the
+    /// `is_symlink()` guard works and a symlink pointing at data outside the
+    /// tree is never counted or traversed.
+    #[test]
+    #[cfg(unix)]
+    fn symlinks_are_not_followed_or_counted() {
+        let outside = tempfile::tempdir().unwrap();
+        let big = outside.path().join("big.bin");
+        std::fs::write(&big, vec![0u8; 1_000_000]).unwrap();
+
+        let tree = tempfile::tempdir().unwrap();
+        std::fs::write(tree.path().join("small.bin"), vec![0u8; 4096]).unwrap();
+        std::os::unix::fs::symlink(&big, tree.path().join("link-to-big")).unwrap();
+        // Symlinked DIRECTORY must not be descended either (cycle safety).
+        std::os::unix::fs::symlink(outside.path(), tree.path().join("link-to-dir")).unwrap();
+
+        let size = du_blocks(tree.path(), &|| false);
+        assert!(size >= 4096, "got {size}");
+        assert!(
+            size < 1_000_000,
+            "symlink target was counted/traversed: {size}"
+        );
+    }
+
     /// Regression: pnpm hard-links every package file into each node_modules;
     /// counting per path would overstate such trees. Hard links count once.
     #[test]

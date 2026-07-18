@@ -1,7 +1,8 @@
 //! SimulatorScanner (spec §3.10) — `xcrun simctl list devices -j` and
 //! `xcrun simctl list runtimes -j` → one finding per device and per runtime.
-//! Unavailable/legacy runtimes are Reclaimable with a destructive
-//! `xcrun simctl delete unavailable` remedy. If xcrun/simctl is absent, emit
+//! Unavailable/legacy runtimes are Reclaimable with a destructive, per-
+//! identifier `xcrun simctl runtime delete <id>` remedy (NOT `simctl delete
+//! unavailable`, which deletes devices). If xcrun/simctl is absent, emit
 //! a single Info finding and return Ok.
 
 use std::collections::HashMap;
@@ -100,14 +101,18 @@ impl Scanner for SimulatorScanner {
                 }));
 
             if !available {
+                // `simctl delete unavailable` deletes DEVICES, not runtimes —
+                // runtime deletion is its own subcommand, targeted by identifier
+                // so selecting several runtime findings runs distinct commands.
                 finding = finding.remedy(Remedy {
-                    label: "Delete unavailable runtimes".to_string(),
+                    label: "Delete this runtime".to_string(),
                     command: RemedyCommand::Shell {
                         program: "xcrun".to_string(),
                         args: vec![
                             "simctl".to_string(),
+                            "runtime".to_string(),
                             "delete".to_string(),
-                            "unavailable".to_string(),
+                            identifier.to_string(),
                         ],
                     },
                     reclaims_bytes: None,
@@ -165,6 +170,23 @@ impl Scanner for SimulatorScanner {
 
                 if let Some(bytes) = size_bytes {
                     finding = finding.size(bytes);
+                }
+                if !available {
+                    // Targeted per-device delete (not the global `delete
+                    // unavailable`, which would act far beyond this finding).
+                    finding = finding.severity(Severity::Reclaimable).remedy(Remedy {
+                        label: "Delete this simulator device".to_string(),
+                        command: RemedyCommand::Shell {
+                            program: "xcrun".to_string(),
+                            args: vec![
+                                "simctl".to_string(),
+                                "delete".to_string(),
+                                udid.to_string(),
+                            ],
+                        },
+                        reclaims_bytes: size_bytes,
+                        destructive: true,
+                    });
                 }
 
                 ctx.emit(finding).await;
@@ -315,7 +337,12 @@ mod tests {
             unavailable_runtime.remedies[0].command,
             RemedyCommand::Shell {
                 program: "xcrun".into(),
-                args: vec!["simctl".into(), "delete".into(), "unavailable".into()],
+                args: vec![
+                    "simctl".into(),
+                    "runtime".into(),
+                    "delete".into(),
+                    "com.apple.CoreSimulator.SimRuntime.iOS-15-0".into()
+                ],
             }
         );
 
@@ -341,7 +368,16 @@ mod tests {
             .iter()
             .find(|f| f.meta["kind"] == "device" && f.meta["udid"] == "BBBB-2222")
             .unwrap();
-        assert_eq!(unavailable_device.severity, Severity::Attention);
+        // Unavailable devices are reclaimable via a TARGETED per-udid delete —
+        // never the global `simctl delete unavailable`.
+        assert_eq!(unavailable_device.severity, Severity::Reclaimable);
+        assert_eq!(
+            unavailable_device.remedies[0].command,
+            RemedyCommand::Shell {
+                program: "xcrun".into(),
+                args: vec!["simctl".into(), "delete".into(), "BBBB-2222".into()],
+            }
+        );
     }
 
     #[tokio::test]

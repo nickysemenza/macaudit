@@ -17,7 +17,11 @@ use macaudit::{output, snapshot};
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let paths = Arc::new(Paths::resolve());
+    // A scan must never mutate Homebrew state: `brew outdated` triggers brew's
+    // auto-update unless this is set. Applies to every child process we spawn.
+    std::env::set_var("HOMEBREW_NO_AUTO_UPDATE", "1");
+
+    let paths = Arc::new(Paths::resolve()?);
     let mut config = Config::load(&paths.config_file()).context("loading config")?;
     if cli.rm {
         config.behavior.delete_mode = DeleteMode::Rm;
@@ -51,20 +55,28 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_scan(manager: &ScannerManager, args: &ScanArgs) -> anyhow::Result<()> {
     let sections = args.sections()?;
-    let findings = manager.run_to_completion(&sections).await;
+    let outcome = manager.run_to_completion(&sections).await;
+    warn_failures(&outcome.failures);
     if args.json {
-        println!("{}", output::findings_to_json(&findings)?);
+        println!("{}", output::findings_to_json(&outcome.findings)?);
     } else {
-        for f in findings.values() {
+        for f in outcome.findings.values() {
             let size = f
                 .size_bytes
                 .map(|b| humansize::format_size(b, humansize::BINARY))
                 .unwrap_or_else(|| "-".to_string());
             println!("[{}] {:>10}  {}", f.severity_label(), size, f.title);
         }
-        println!("\n{} findings", findings.len());
+        println!("\n{} findings", outcome.findings.len());
     }
     Ok(())
+}
+
+/// Surface failed sections on stderr — stdout stays machine-readable.
+fn warn_failures(failures: &[(ScannerId, String)]) {
+    for (id, err) in failures {
+        eprintln!("warning: {} scan failed: {err}", id.slug());
+    }
 }
 
 async fn run_clean(manager: &ScannerManager, args: &CleanArgs) -> anyhow::Result<()> {
@@ -72,10 +84,11 @@ async fn run_clean(manager: &ScannerManager, args: &CleanArgs) -> anyhow::Result
         anyhow::bail!("only --dry-run is supported from the CLI; use the TUI to execute remedies");
     }
     let sections = args.sections()?;
-    let findings = manager.run_to_completion(&sections).await;
+    let outcome = manager.run_to_completion(&sections).await;
+    warn_failures(&outcome.failures);
     print!(
         "{}",
-        output::dry_run_report(&findings, manager.delete_mode())
+        output::dry_run_report(&outcome.findings, manager.delete_mode())
     );
     Ok(())
 }
@@ -88,9 +101,20 @@ async fn run_snapshot(
     let mut store = snapshot::SnapshotStore::open(&paths.history_db())?;
     match cmd {
         SnapshotCmd::Save => {
-            let findings = manager.run_to_completion(ScannerId::ALL).await;
-            let id = store.save(&snapshot::machine_name(), &findings)?;
-            println!("saved snapshot #{id} ({} findings)", findings.len());
+            let outcome = manager.run_to_completion(ScannerId::ALL).await;
+            if !outcome.failures.is_empty() {
+                // A partial snapshot would make the next diff report whole
+                // sections as removed — refuse rather than silently mislead.
+                let failed: Vec<&str> = outcome.failures.iter().map(|(id, _)| id.slug()).collect();
+                warn_failures(&outcome.failures);
+                anyhow::bail!(
+                    "not saving a partial snapshot: {} section(s) failed ({})",
+                    outcome.failures.len(),
+                    failed.join(", ")
+                );
+            }
+            let id = store.save(&snapshot::machine_name(), &outcome.findings)?;
+            println!("saved snapshot #{id} ({} findings)", outcome.findings.len());
         }
         SnapshotCmd::List => {
             for m in store.list()? {
@@ -107,7 +131,10 @@ async fn run_snapshot(
             let list = store.list()?;
             let (a, b) = match (a, b) {
                 (Some(a), Some(b)) => (a, b),
-                _ if list.len() >= 2 => (list[1].id, list[0].id),
+                (Some(_), None) | (None, Some(_)) => {
+                    anyhow::bail!("snapshot diff takes two ids or none (none = latest two)")
+                }
+                (None, None) if list.len() >= 2 => (list[1].id, list[0].id),
                 _ => anyhow::bail!("need at least two snapshots (or specify ids) to diff"),
             };
             let d = store.diff(a, b)?;

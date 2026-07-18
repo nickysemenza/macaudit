@@ -294,6 +294,9 @@ struct RepoStatus {
     ahead: u64,
     behind: u64,
     branch: Option<String>,
+    /// Whether the branch has an upstream at all. Without one, `branch.ab`
+    /// never appears — every local commit is unpushed, but `ahead` reads 0.
+    has_upstream: bool,
 }
 
 /// Parse porcelain v2 output. Header lines start with `# `; any other non-empty
@@ -304,6 +307,8 @@ fn parse_status(out: &str) -> RepoStatus {
         if let Some(header) = line.strip_prefix("# ") {
             if let Some(name) = header.strip_prefix("branch.head ") {
                 st.branch = Some(name.trim().to_string());
+            } else if header.strip_prefix("branch.upstream ").is_some() {
+                st.has_upstream = true;
             } else if let Some(ab) = header.strip_prefix("branch.ab ") {
                 // Format: "+<ahead> -<behind>"
                 for tok in ab.split_whitespace() {
@@ -334,7 +339,10 @@ fn build_finding(
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| root_str.to_string());
 
-    let unpushed = st.ahead > 0;
+    // Commits on a branch with no upstream are unpushed by definition —
+    // `branch.ab` never appears for them, so `ahead` alone under-reports.
+    let no_upstream = !st.has_upstream && last_used.is_some();
+    let unpushed = st.ahead > 0 || no_upstream;
     let severity = if st.dirty || unpushed {
         Severity::Attention
     } else {
@@ -345,8 +353,10 @@ fn build_finding(
     if st.dirty {
         bits.push("uncommitted changes".to_string());
     }
-    if unpushed {
+    if st.ahead > 0 {
         bits.push(format!("{} unpushed", st.ahead));
+    } else if no_upstream {
+        bits.push("no upstream (nothing pushed)".to_string());
     }
     if st.behind > 0 {
         bits.push(format!("{} behind", st.behind));
@@ -370,6 +380,7 @@ fn build_finding(
             "behind": st.behind,
             "stash_count": stash_count,
             "branch": st.branch,
+            "has_upstream": st.has_upstream,
         }))
         .remedy(Remedy {
             label: "Reveal in Finder".into(),
@@ -588,6 +599,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn branch_without_upstream_counts_as_unpushed() {
+        // `branch.ab` never appears without an upstream, so ahead reads 0 —
+        // but every commit on such a branch is unpushed by definition.
+        let repo = "/Users/x/code/local-only";
+        let runner = MockCommandRunner::new()
+            .on(
+                "git",
+                &["-C", repo, "status", "--porcelain=v2", "--branch"],
+                "# branch.head main\n",
+            )
+            .on(
+                "git",
+                &["-C", repo, "log", "-1", "--format=%ct"],
+                "1700000000\n",
+            )
+            .on("git", &["-C", repo, "stash", "list"], "");
+        let (ctx, mut rx, repo_tx) = ctx_with(runner);
+        repo_tx
+            .send(RepoDiscovery {
+                root: PathBuf::from(repo),
+            })
+            .await
+            .unwrap();
+        drop(repo_tx);
+        GitScanner.scan(ctx).await.unwrap();
+
+        let mut f = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let ScanEvent::Finding { finding, .. } = ev {
+                f = Some(*finding);
+            }
+        }
+        let f = f.unwrap();
+        assert_eq!(f.severity, Severity::Attention);
+        assert_eq!(f.meta["has_upstream"], false);
+        assert!(f.detail.contains("no upstream"));
+    }
+
+    #[tokio::test]
     async fn no_pipe_returns_ok() {
         let (tx, _rx) = mpsc::channel(4);
         let ctx = ScanCtx {
@@ -663,7 +713,7 @@ mod tests {
             .on(
                 "git",
                 &["-C", repo, "status", "--porcelain=v2", "--branch"],
-                "# branch.head main\n# branch.ab +0 -0\n",
+                "# branch.head main\n# branch.upstream origin/main\n# branch.ab +0 -0\n",
             )
             .on(
                 "git",

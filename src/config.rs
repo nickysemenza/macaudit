@@ -24,12 +24,14 @@ pub struct Paths {
 
 impl Paths {
     /// Resolve paths, honoring `$MACAUDIT_HOME` (test seam) then `$HOME`.
-    pub fn resolve() -> Self {
+    /// Errors when neither is set — falling back to `/` would make the default
+    /// scan walk the entire filesystem.
+    pub fn resolve() -> anyhow::Result<Self> {
         let home = std::env::var_os("MACAUDIT_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from("/"));
-        Self::from_home(home)
+            .ok_or_else(|| anyhow::anyhow!("neither $MACAUDIT_HOME nor $HOME is set"))?;
+        Ok(Self::from_home(home))
     }
 
     /// Build all derived paths from a home directory. Used by `resolve()` and
@@ -44,15 +46,21 @@ impl Paths {
         }
     }
 
-    /// Expand a leading `~` against this home. Absolute and relative paths pass
-    /// through unchanged (relative ones are joined onto home for safety in tests).
+    /// Expand a leading `~` against this home; absolute paths pass through;
+    /// relative paths are joined onto home (never the process cwd — config
+    /// values must not change meaning based on where macaudit was launched).
     pub fn expand(&self, p: &str) -> PathBuf {
         if let Some(rest) = p.strip_prefix("~/") {
             self.home.join(rest)
         } else if p == "~" {
             self.home.clone()
         } else {
-            PathBuf::from(p)
+            let pb = PathBuf::from(p);
+            if pb.is_absolute() {
+                pb
+            } else {
+                self.home.join(pb)
+            }
         }
     }
 

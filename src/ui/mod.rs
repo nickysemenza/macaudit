@@ -58,6 +58,10 @@ async fn run_loop(
     let mut scan_saved = false;
     // Generation for which correlation has already run (0 = never).
     let mut correlated_gen: u64 = 0;
+    // True while a spawned network-enrichment task hasn't reported back — the
+    // auto-snapshot waits for it so TUI snapshots match headless ones (which
+    // always enrich before returning). Bounded: enrichment has hard timeouts.
+    let mut enrich_pending = false;
     let gen = manager.start(&tx, &all);
     let mut full_scan_gen = gen;
     app.begin_scan(gen, &all);
@@ -92,6 +96,7 @@ async fn run_loop(
                 // Network enrichment landed: upsert (stale generations are
                 // dropped inside apply_enriched).
                 if let Some((gen, findings)) = maybe_enriched {
+                    enrich_pending = false;
                     let n = findings.len();
                     app.apply_enriched(gen, findings);
                     if n > 0 {
@@ -117,6 +122,7 @@ async fn run_loop(
             app.correlate_now();
 
             if let Some(fetcher) = manager.fetcher() {
+                enrich_pending = true;
                 let mut map = app.apps_brew_findings();
                 let paths = manager.paths();
                 let config = manager.config();
@@ -140,15 +146,29 @@ async fn run_loop(
         }
 
         // Auto-save a snapshot when a full scan completes (spec §8) — cheap, and
-        // makes `snapshot diff` useful without ceremony. Only full scans, once.
+        // makes `snapshot diff` useful without ceremony. Only full scans, once,
+        // never partial (a failed section would diff as wholly removed next
+        // time), and only after any in-flight enrichment has landed so TUI
+        // snapshots carry the same data headless ones do.
         if !scan_saved
+            && !enrich_pending
             && active_scan.len() == ScannerId::ALL.len()
             && app.scan_complete(&active_scan)
         {
             scan_saved = true;
-            match save_snapshot(&manager, &app) {
-                Ok(id) => app.push_activity(format!("saved snapshot #{id}")),
-                Err(e) => app.push_activity(format!("snapshot save failed: {e}")),
+            let failed = app.failed_sections(&active_scan);
+            if failed.is_empty() {
+                match save_snapshot(&manager, &app) {
+                    Ok(id) => app.push_activity(format!("saved snapshot #{id}")),
+                    Err(e) => app.push_activity(format!("snapshot save failed: {e}")),
+                }
+            } else {
+                let names: Vec<&str> = failed.iter().map(|id| id.slug()).collect();
+                app.push_activity(format!(
+                    "snapshot skipped: {} section(s) failed ({})",
+                    failed.len(),
+                    names.join(", ")
+                ));
             }
         }
 

@@ -231,6 +231,15 @@ impl AppState {
         self.sections_terminal(sections)
     }
 
+    /// Sections among `sections` whose latest scan FAILED.
+    pub fn failed_sections(&self, sections: &[ScannerId]) -> Vec<ScannerId> {
+        sections
+            .iter()
+            .copied()
+            .filter(|id| matches!(self.status_of(*id), SectionStatus::Failed { .. }))
+            .collect()
+    }
+
     /// Whether every listed section is Done or Failed.
     pub fn sections_terminal(&self, sections: &[ScannerId]) -> bool {
         sections.iter().all(|id| {
@@ -663,7 +672,12 @@ impl AppState {
             .values()
             .flat_map(|m| m.values())
             .filter(|f| self.marked.contains(&f.id))
-            .filter_map(|f| primary_remedy(f).map(|r| (f.id, r.clone())))
+            .flat_map(|f| {
+                execution_remedies(f)
+                    .into_iter()
+                    .map(|r| (f.id, r.clone()))
+                    .collect::<Vec<_>>()
+            })
             .collect();
         if items.is_empty() {
             return;
@@ -760,14 +774,27 @@ impl AppState {
     }
 }
 
-/// The remedy to plan when a finding is marked for batch execution: the
-/// destructive one (typically the delete/trash action) if there is one, else
-/// whatever remedy comes first (e.g. a Reveal-in-Finder-only finding).
-fn primary_remedy(f: &Finding) -> Option<&Remedy> {
-    f.remedies
+/// The remedies to plan when a finding is marked for batch execution:
+///
+/// - ALL destructive remedies, in emission order — multi-step workflows like
+///   launchd's "bootout, THEN trash the plist" execute as an ordered sequence
+///   (previously only the first ever ran and the trash was unreachable).
+/// - Else the first Shell remedy — an actionable command like
+///   `brew install --adopt` must not lose to an earlier Reveal-in-Finder.
+/// - Else the first remedy, if any (reveal/copy-only findings).
+fn execution_remedies(f: &Finding) -> Vec<&Remedy> {
+    let destructive: Vec<&Remedy> = f.remedies.iter().filter(|r| r.destructive).collect();
+    if !destructive.is_empty() {
+        return destructive;
+    }
+    if let Some(shell) = f
+        .remedies
         .iter()
-        .find(|r| r.destructive)
-        .or_else(|| f.remedies.first())
+        .find(|r| matches!(r.command, crate::model::RemedyCommand::Shell { .. }))
+    {
+        return vec![shell];
+    }
+    f.remedies.first().into_iter().collect()
 }
 
 fn matches_filter(f: &Finding, needle: &str) -> bool {
