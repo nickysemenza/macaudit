@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::model::{Finding, FindingKind, ScannerId, Severity};
+use crate::model::{Finding, FindingKind, Remedy, RemedyCommand, ScannerId, Severity};
 use crate::scan::{ScanCtx, Scanner};
 
 #[derive(Default)]
@@ -127,11 +127,24 @@ async fn scan_path(ctx: &ScanCtx) {
             "shadowed_by": shadowed_by,
         });
 
-        let finding = Finding::new(FindingKind::PathEntry, entry, entry.to_string())
+        let mut finding = Finding::new(FindingKind::PathEntry, entry, entry.to_string())
             .detail(detail)
             .path(entry)
             .severity(severity)
             .meta(meta);
+        // Dead PATH entry: we can't know which rc file added it (we only parse the
+        // resolved $PATH), so we don't auto-edit shell config. Copy the offending
+        // entry so the user can grep it out of their dotfiles themselves.
+        if !exists {
+            finding = finding.remedy(Remedy {
+                label: "Copy path to clipboard".to_string(),
+                command: RemedyCommand::CopyToClipboard {
+                    text: entry.to_string(),
+                },
+                reclaims_bytes: None,
+                destructive: false,
+            });
+        }
         ctx.emit(finding).await;
     }
 }
@@ -254,6 +267,16 @@ mod tests {
         let missing = by_entry("/does/not/exist");
         assert_eq!(missing.severity, Severity::Attention);
         assert_eq!(missing.meta["exists"], false);
+        // A dead PATH entry gets a copy-to-clipboard remedy (non-destructive);
+        // we never auto-edit shell rc files.
+        assert!(matches!(
+            missing.remedies.as_slice(),
+            [Remedy {
+                command: RemedyCommand::CopyToClipboard { text },
+                destructive: false,
+                ..
+            }] if text == "/does/not/exist"
+        ));
 
         let shadowed = by_entry("/opt/homebrew/bin");
         assert_eq!(shadowed.severity, Severity::Attention);
@@ -261,6 +284,8 @@ mod tests {
 
         let sys = by_entry("/usr/bin");
         assert_eq!(sys.severity, Severity::Info);
+        // An existing directory is not a dead entry → no remedy.
+        assert!(sys.remedies.is_empty());
 
         let startup = findings
             .iter()

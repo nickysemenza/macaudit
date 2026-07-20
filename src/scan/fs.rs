@@ -452,8 +452,10 @@ fn artifact_finding(
     })
 }
 
-/// A large loose file: sized inline (we already have its metadata), non
-/// destructive (we don't know it's safe to delete), reveal-in-Finder remedy.
+/// A large loose file: sized inline (we already have its metadata). Severity
+/// stays `Attention` rather than `Reclaimable` — a big file may well be wanted
+/// (a Photos library, a video) — but we offer a reversible Trash remedy so the
+/// user can act, plus reveal-in-Finder to inspect first.
 fn large_file_finding(path: &Path, size: u64) -> Finding {
     let key = path.to_string_lossy();
     let name = path
@@ -466,6 +468,14 @@ fn large_file_finding(path: &Path, size: u64) -> Finding {
         .size(size)
         .severity(Severity::Attention)
         .meta(json!({ "group": "Large files" }))
+        .remedy(Remedy {
+            label: "Move to Trash".into(),
+            command: RemedyCommand::Trash {
+                path: path.to_path_buf(),
+            },
+            reclaims_bytes: Some(size),
+            destructive: true,
+        })
         .remedy(Remedy {
             label: "Reveal in Finder".into(),
             command: RemedyCommand::RevealInFinder {
@@ -1205,5 +1215,25 @@ mod tests {
             "an expired cache entry must be re-du'd"
         );
         assert!(hit.meta.get("size_cached").is_none());
+    }
+
+    #[test]
+    fn large_file_offers_trash_then_reveal() {
+        let f = large_file_finding(Path::new("/Users/x/Movies/huge.mkv"), 5_000_000_000);
+        assert_eq!(f.kind, FindingKind::LargeFile);
+        // A big file may be wanted, so it's flagged for attention, not auto-reclaimable.
+        assert_eq!(f.severity, Severity::Attention);
+        // Primary remedy: a reversible Trash that reclaims the file's size.
+        assert!(matches!(
+            &f.remedies[0].command,
+            RemedyCommand::Trash { path } if path == Path::new("/Users/x/Movies/huge.mkv")
+        ));
+        assert!(f.remedies[0].destructive);
+        assert_eq!(f.remedies[0].reclaims_bytes, Some(5_000_000_000));
+        // Secondary: inspect before deleting.
+        assert!(matches!(
+            f.remedies[1].command,
+            RemedyCommand::RevealInFinder { .. }
+        ));
     }
 }

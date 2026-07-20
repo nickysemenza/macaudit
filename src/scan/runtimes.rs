@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::model::{Finding, FindingKind, ScannerId, Severity};
+use crate::model::{Finding, FindingKind, Remedy, RemedyCommand, ScannerId, Severity};
 use crate::scan::sizing::du_blocks;
 use crate::scan::{ScanCtx, Scanner};
 
@@ -187,6 +187,9 @@ async fn scan_versions_dir(
         let size = du_blocks(&path, &|| ctx.token.is_cancelled());
         let key = path.to_string_lossy().to_string();
 
+        // Severity stays Info: we can't tell which version is active for these
+        // managers, so we don't *suggest* deletion — but we still offer a
+        // reversible Trash so the user can act on a version they know is unused.
         let finding = Finding::new(
             FindingKind::RuntimeVersion,
             &key,
@@ -201,7 +204,13 @@ async fn scan_versions_dir(
             "runtime": runtime,
             "version": version,
             "size_bytes": size,
-        }));
+        }))
+        .remedy(Remedy {
+            label: "Move to Trash".to_string(),
+            command: RemedyCommand::Trash { path: path.clone() },
+            reclaims_bytes: Some(size),
+            destructive: true,
+        });
         ctx.emit(finding).await;
     }
 }
@@ -295,8 +304,11 @@ async fn scan_rustup(ctx: &ScanCtx, runtime_managers: &mut HashMap<String, HashS
         // there's more than one toolchain installed (a lone toolchain is fine
         // even if `rustup toolchain list` output couldn't be parsed).
         let stale = multiple && is_default == Some(false);
+        // Reclaimable only when we positively know this isn't the active default
+        // (see `stale`), so `rustup toolchain uninstall` never targets the
+        // toolchain currently in use.
         let severity = if stale {
-            Severity::Attention
+            Severity::Reclaimable
         } else {
             Severity::Info
         };
@@ -308,7 +320,7 @@ async fn scan_rustup(ctx: &ScanCtx, runtime_managers: &mut HashMap<String, HashS
             format!("{name} — {size} bytes on disk")
         };
 
-        let finding = Finding::new(
+        let mut finding = Finding::new(
             FindingKind::RuntimeVersion,
             &key,
             format!("rustup rust {name}"),
@@ -324,6 +336,21 @@ async fn scan_rustup(ctx: &ScanCtx, runtime_managers: &mut HashMap<String, HashS
             "size_bytes": size,
             "is_default": is_default,
         }));
+        if stale {
+            finding = finding.remedy(Remedy {
+                label: "Uninstall toolchain".to_string(),
+                command: RemedyCommand::Shell {
+                    program: "rustup".to_string(),
+                    args: vec![
+                        "toolchain".to_string(),
+                        "uninstall".to_string(),
+                        name.clone(),
+                    ],
+                },
+                reclaims_bytes: Some(size),
+                destructive: true,
+            });
+        }
         ctx.emit(finding).await;
     }
 }
@@ -390,6 +417,16 @@ mod tests {
         for f in &nvm_versions {
             assert_eq!(f.severity, Severity::Info);
             assert!(f.size_bytes.unwrap() > 0);
+            // A reversible Trash remedy on the version dir — we can't confirm
+            // which is active, so severity stays Info (offered, not suggested).
+            assert!(matches!(
+                f.remedies.as_slice(),
+                [Remedy {
+                    command: RemedyCommand::Trash { .. },
+                    destructive: true,
+                    ..
+                }]
+            ));
         }
 
         let conflict = findings
@@ -445,13 +482,26 @@ mod tests {
             .find(|f| f.meta["version"] == "stable-aarch64-apple-darwin")
             .unwrap();
         assert_eq!(default_tc.severity, Severity::Info);
+        // The active default toolchain must never be offered an uninstall.
+        assert!(default_tc.remedies.is_empty());
 
         let stale_tc = findings
             .iter()
             .find(|f| f.meta["version"] == "1.70.0-aarch64-apple-darwin")
             .unwrap();
-        assert_eq!(stale_tc.severity, Severity::Attention);
+        assert_eq!(stale_tc.severity, Severity::Reclaimable);
         assert_eq!(stale_tc.meta["is_default"], false);
+        // Stale non-default toolchain gets a scan-derived `rustup toolchain
+        // uninstall <name>` remedy.
+        assert!(matches!(
+            stale_tc.remedies.as_slice(),
+            [Remedy {
+                command: RemedyCommand::Shell { program, args },
+                destructive: true,
+                ..
+            }] if program == "rustup"
+                && args == &["toolchain", "uninstall", "1.70.0-aarch64-apple-darwin"]
+        ));
     }
 
     #[tokio::test]

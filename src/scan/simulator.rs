@@ -171,10 +171,19 @@ impl Scanner for SimulatorScanner {
                 if let Some(bytes) = size_bytes {
                     finding = finding.size(bytes);
                 }
-                if !available {
-                    // Targeted per-device delete (not the global `delete
-                    // unavailable`, which would act far beyond this finding).
-                    finding = finding.severity(Severity::Reclaimable).remedy(Remedy {
+                // Offer a targeted per-device delete (never the global `delete
+                // unavailable`, which would act far beyond this finding) whenever
+                // the device is safely deletable: unavailable, or available but
+                // shut down (a duplicate device across old runtimes). A *booted*
+                // device is in use, so it gets no remedy. Unavailable devices are
+                // pure cruft → Reclaimable; a shut-down-but-available device may
+                // still be wanted → stays Attention (actionable, not suggested).
+                let deletable = !available || state == "Shutdown";
+                if deletable {
+                    if !available {
+                        finding = finding.severity(Severity::Reclaimable);
+                    }
+                    finding = finding.remedy(Remedy {
                         label: "Delete this simulator device".to_string(),
                         command: RemedyCommand::Shell {
                             program: "xcrun".to_string(),
@@ -362,7 +371,17 @@ mod tests {
             .unwrap();
         assert_eq!(device.title, "iPhone 15 — iOS 17.0");
         assert_eq!(device.size_bytes, Some(4_294_967_296));
+        // Available but Shutdown: a deletable duplicate. Severity stays Info
+        // (may still be wanted) but it now carries a targeted per-udid delete.
         assert_eq!(device.severity, Severity::Info);
+        assert_eq!(
+            device.remedies[0].command,
+            RemedyCommand::Shell {
+                program: "xcrun".into(),
+                args: vec!["simctl".into(), "delete".into(), "AAAA-1111".into()],
+            }
+        );
+        assert!(device.remedies[0].destructive);
 
         let unavailable_device = findings
             .iter()
@@ -378,6 +397,47 @@ mod tests {
                 args: vec!["simctl".into(), "delete".into(), "BBBB-2222".into()],
             }
         );
+    }
+
+    #[tokio::test]
+    async fn booted_device_gets_no_delete_remedy() {
+        // A booted device is in use — it must never be offered a delete, even
+        // though it's available.
+        const BOOTED: &str = r#"{
+  "devices": {
+    "com.apple.CoreSimulator.SimRuntime.iOS-17-0": [
+      {
+        "dataPathSize": 2147483648,
+        "udid": "CCCC-3333",
+        "isAvailable": true,
+        "state": "Booted",
+        "name": "iPhone 15 Pro"
+      }
+    ]
+  }
+}"#;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        let mock = MockCommandRunner::new()
+            .on("xcrun", &["simctl", "list", "devices", "-j"], BOOTED)
+            .on(
+                "xcrun",
+                &["simctl", "list", "runtimes", "-j"],
+                r#"{"runtimes":[]}"#,
+            );
+        let ctx = ctx_with(mock, tx);
+        SimulatorScanner.scan(ctx).await.unwrap();
+
+        let mut findings = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let ScanEvent::Finding { finding, .. } = ev {
+                findings.push(*finding);
+            }
+        }
+        let device = findings
+            .iter()
+            .find(|f| f.meta["udid"] == "CCCC-3333")
+            .unwrap();
+        assert!(device.remedies.is_empty());
     }
 
     #[tokio::test]
