@@ -21,7 +21,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream};
+use crossterm::execute;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -36,7 +37,13 @@ use crate::ui::app::{AppState, RescanRequest};
 /// keypresses to rescans and scan events to the reducer.
 pub async fn run(manager: Arc<ScannerManager>) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
+    // Capture mouse so the sidebar (and any future hit-testable widget) is
+    // clickable. Best-effort: a terminal that rejects it just leaves the TUI
+    // keyboard-only. Disabled again before restore so the shell's own mouse
+    // behavior (text selection, scroll) returns intact.
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
     let result = run_loop(&mut terminal, manager).await;
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -79,6 +86,9 @@ async fn run_loop(
                         if let Some(action) = keys::map(key) {
                             app.handle(action);
                         }
+                    }
+                    Some(Ok(Event::Mouse(me))) => {
+                        app.handle_mouse(me);
                     }
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return Err(e.into()),

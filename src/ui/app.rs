@@ -13,9 +13,11 @@
 //! is the `?` keybindings overlay, where only `?`/`esc`/`q`/`enter` (plus
 //! ctrl-c, which always quits) do anything.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::Frame;
 
@@ -129,6 +131,11 @@ pub struct AppState {
     /// Set when the confirm dialog is accepted; the loop consumes and clears
     /// it, executing (or, pre-Phase-2, just logging) each action.
     pub pending_execute: Option<Vec<PlannedAction>>,
+
+    /// The sidebar's on-screen rectangle from the last `draw`, stashed so mouse
+    /// clicks can be hit-tested to a section row. Interior-mutable because
+    /// `draw` takes `&self`. Zero until the first frame is rendered.
+    sidebar_area: Cell<Rect>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,6 +172,7 @@ impl Default for AppState {
             should_quit: false,
             pending_rescan: None,
             pending_execute: None,
+            sidebar_area: Cell::new(Rect::ZERO),
         }
     }
 }
@@ -597,16 +605,55 @@ impl AppState {
     }
 
     fn next_section(&mut self) {
-        self.selected_section = (self.selected_section + 1) % ScannerId::ALL.len();
+        self.select_section((self.selected_section + 1) % ScannerId::ALL.len());
+    }
+
+    fn prev_section(&mut self) {
+        self.select_section(
+            (self.selected_section + ScannerId::ALL.len() - 1) % ScannerId::ALL.len(),
+        );
+    }
+
+    /// Switch to the section at `index` (a `REGISTRY`/`ScannerId::ALL` position),
+    /// resetting the row cursor and detail scroll — the single path used by
+    /// keyboard section-switching and by sidebar clicks. Out-of-range indices
+    /// are ignored.
+    fn select_section(&mut self, index: usize) {
+        if index >= ScannerId::ALL.len() {
+            return;
+        }
+        self.selected_section = index;
         self.selected_row = 0;
         self.detail_scroll = 0;
     }
 
-    fn prev_section(&mut self) {
-        self.selected_section =
-            (self.selected_section + ScannerId::ALL.len() - 1) % ScannerId::ALL.len();
-        self.selected_row = 0;
-        self.detail_scroll = 0;
+    /// Route a mouse event: a left-click inside the sidebar selects the section
+    /// on that row. Only acts in Normal mode (a modal — confirm/help/filter —
+    /// swallows clicks) and ignores scroll/motion/other buttons.
+    pub fn handle_mouse(&mut self, me: MouseEvent) {
+        if self.mode != Mode::Normal {
+            return;
+        }
+        if !matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+        // Sidebar content sits inside a 1-cell border: row 0 is the top border,
+        // so section `i` renders at inner_y + i.
+        let area = self.sidebar_area.get();
+        let inner_x = area.x + 1;
+        let inner_y = area.y + 1;
+        let inner_right = area.x + area.width.saturating_sub(1);
+        let inner_bottom = area.y + area.height.saturating_sub(1);
+        if me.column < inner_x || me.column >= inner_right {
+            return;
+        }
+        if me.row < inner_y || me.row >= inner_bottom {
+            return;
+        }
+        let idx = (me.row - inner_y) as usize;
+        if idx < registry::REGISTRY.len() {
+            self.select_section(idx);
+        }
     }
 
     /// Left: in tree view, collapse the group under the cursor; otherwise
@@ -697,6 +744,8 @@ impl AppState {
             .split(frame.area());
 
         sidebar::draw(self, frame, cols[0]);
+        // Remember where the sidebar landed so mouse clicks can hit-test it.
+        self.sidebar_area.set(cols[0]);
 
         let activity_h = activity::height_for(&self.activity);
         let mut vconstraints = vec![Constraint::Min(3)];
@@ -1036,6 +1085,52 @@ mod tests {
         );
         app.handle(Action::BackTab);
         assert_eq!(app.selected_section_index(), start);
+    }
+
+    fn left_click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn sidebar_click_selects_section_row() {
+        let mut app = AppState::default();
+        // Simulate a rendered sidebar at the top-left, 24 wide, tall enough for
+        // every section (content starts at row 1, inside the top border).
+        app.sidebar_area.set(Rect::new(0, 0, 24, 20));
+
+        // Click the 4th section row (index 3): inner_y (1) + 3 = row 4.
+        app.handle_mouse(left_click(5, 4));
+        assert_eq!(app.selected_section_index(), 3);
+
+        // Clicking the top border (row 0) selects nothing new.
+        app.handle_mouse(left_click(5, 0));
+        assert_eq!(app.selected_section_index(), 3);
+
+        // A click to the right of the sidebar (in the main panel) is ignored.
+        app.handle_mouse(left_click(40, 2));
+        assert_eq!(app.selected_section_index(), 3);
+
+        // A row below the last section is ignored (no phantom selection).
+        app.handle_mouse(left_click(5, 1 + ScannerId::ALL.len() as u16));
+        assert_eq!(app.selected_section_index(), 3);
+
+        // Clicking back on the first row selects section 0.
+        app.handle_mouse(left_click(5, 1));
+        assert_eq!(app.selected_section_index(), 0);
+    }
+
+    #[test]
+    fn sidebar_click_ignored_in_modal_mode() {
+        let mut app = AppState::default();
+        app.sidebar_area.set(Rect::new(0, 0, 24, 20));
+        app.mode = Mode::Help;
+        app.handle_mouse(left_click(5, 4));
+        assert_eq!(app.selected_section_index(), 0); // unchanged while modal
     }
 
     #[test]
