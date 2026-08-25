@@ -13,29 +13,71 @@
 //! honest per-tree number.)
 
 use std::path::Path;
+use std::time::{Duration, Instant};
+
+/// Result from a deliberately bounded directory measurement. `complete` is
+/// false when a scan was cancelled, exceeded its entry cap, or hit its shared
+/// time budget; callers must surface that fact rather than presenting it as an
+/// exact total.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BoundedSize {
+    pub bytes: u64,
+    pub entries: u64,
+    pub complete: bool,
+}
 
 /// Sum the on-disk size (in bytes) of everything under `root`, following no
 /// symlinks, counting hard-linked files once. Best-effort: unreadable entries
 /// are skipped. Checks `cancelled` periodically so a long walk stops promptly
 /// on rescan.
 pub fn du_blocks(root: &Path, cancelled: &dyn Fn() -> bool) -> u64 {
+    du_blocks_bounded(
+        root,
+        u64::MAX,
+        Instant::now() + Duration::from_secs(365 * 24 * 60 * 60),
+        cancelled,
+    )
+    .bytes
+}
+
+/// As `du_blocks`, but with both an entry cap and a deadline. This is used for
+/// user-facing disk allocation categories, never as a hidden full-home scan.
+pub fn du_blocks_bounded(
+    root: &Path,
+    max_entries: u64,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> BoundedSize {
     #[cfg(unix)]
     let mut seen_links: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
 
     let mut total: u64 = 0;
+    let mut entries_seen = 0u64;
     let mut stack = vec![root.to_path_buf()];
     let mut counter: u32 = 0;
 
     while let Some(dir) = stack.pop() {
         counter = counter.wrapping_add(1);
-        if counter.is_multiple_of(256) && cancelled() {
-            break;
+        if counter.is_multiple_of(256) && (cancelled() || Instant::now() >= deadline) {
+            return BoundedSize {
+                bytes: total,
+                entries: entries_seen,
+                complete: false,
+            };
         }
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
             Err(_) => continue,
         };
         for entry in entries.flatten() {
+            entries_seen = entries_seen.saturating_add(1);
+            if entries_seen > max_entries || cancelled() || Instant::now() >= deadline {
+                return BoundedSize {
+                    bytes: total,
+                    entries: entries_seen,
+                    complete: false,
+                };
+            }
             let meta = match entry.metadata() {
                 Ok(m) => m,
                 Err(_) => continue,
@@ -59,7 +101,11 @@ pub fn du_blocks(root: &Path, cancelled: &dyn Fn() -> bool) -> u64 {
             }
         }
     }
-    total
+    BoundedSize {
+        bytes: total,
+        entries: entries_seen,
+        complete: true,
+    }
 }
 
 /// On-disk bytes for a single file's metadata (blocks * 512 on Unix).
@@ -151,5 +197,21 @@ mod tests {
         // Cancelled from the start ⇒ returns 0-ish without traversing much.
         let size = du_blocks(dir.path(), &|| true);
         assert_eq!(size, 0);
+    }
+
+    #[test]
+    fn bounded_du_reports_incomplete_at_entry_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in 0..10 {
+            std::fs::write(dir.path().join(format!("{n}.bin")), vec![0u8; 4096]).unwrap();
+        }
+        let result = du_blocks_bounded(
+            dir.path(),
+            3,
+            Instant::now() + Duration::from_secs(1),
+            &|| false,
+        );
+        assert!(!result.complete);
+        assert!(result.entries > 3);
     }
 }

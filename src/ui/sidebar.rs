@@ -50,7 +50,7 @@ pub fn draw(app: &AppState, frame: &mut Frame, area: Rect) {
             // "Δ since last snapshot" badge: growth red, shrink green.
             let mut spans = vec![
                 Span::raw(format!("{glyph} ")),
-                Span::raw(format!("{:<10}", meta.title)),
+                Span::raw(format!("{:<15}", meta.title)),
                 Span::styled(suffix, Style::default().fg(Color::DarkGray)),
             ];
             if let Some(delta) = app.section_reclaimable_delta(meta.id) {

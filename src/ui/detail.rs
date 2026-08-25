@@ -59,6 +59,12 @@ fn render_finding(f: &Finding, delete_mode: DeleteMode) -> Vec<Line<'static>> {
             )));
         }
     }
+    if let Some(provenance) = &f.provenance {
+        lines.push(Line::from(format!("source: {provenance}")));
+    }
+    if let Some(coverage) = &f.coverage {
+        lines.push(Line::from(format!("coverage: {coverage}")));
+    }
 
     if !f.meta.is_null() {
         lines.push(Line::from(""));

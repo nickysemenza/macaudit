@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use ignore::{WalkBuilder, WalkState};
@@ -23,7 +23,7 @@ use serde_json::json;
 
 use crate::model::{Finding, FindingKind, Remedy, RemedyCommand, ScanEvent, ScannerId, Severity};
 use crate::scan::pipe::{RepoDiscovery, RepoSender};
-use crate::scan::sizing::{du_blocks, on_disk_bytes};
+use crate::scan::sizing::{du_blocks, du_blocks_bounded, on_disk_bytes};
 use crate::scan::{ScanCtx, Scanner};
 use crate::size_cache::{self, CachedSize, SizeCache};
 
@@ -259,7 +259,103 @@ impl Scanner for FsScanner {
         let token3 = token.clone();
         tokio::task::spawn_blocking(move || size_fixed_paths(&paths2, &tx3, gen, &token3)).await?;
 
+        // A small, explicitly bounded accounting pass complements artifact
+        // discovery. It never walks all of $HOME and labels partial numbers.
+        let paths3 = paths.clone();
+        let tx4 = tx.clone();
+        let token4 = token.clone();
+        tokio::task::spawn_blocking(move || size_disk_categories(&paths3, &tx4, gen, &token4))
+            .await?;
+
         Ok(())
+    }
+}
+
+struct DiskCategory {
+    title: &'static str,
+    rel: &'static str,
+}
+
+const DISK_CATEGORIES: &[DiskCategory] = &[
+    DiskCategory {
+        title: "Development",
+        rel: "~/dev",
+    },
+    DiskCategory {
+        title: "Agent worktrees",
+        rel: "~/.codex/worktrees",
+    },
+    DiskCategory {
+        title: "Developer caches",
+        rel: "~/.cache",
+    },
+    DiskCategory {
+        title: "App caches",
+        rel: "~/Library/Caches",
+    },
+    DiskCategory {
+        title: "Application Support",
+        rel: "~/Library/Application Support",
+    },
+    DiskCategory {
+        title: "iCloud Drive",
+        rel: "~/Library/Mobile Documents",
+    },
+    DiskCategory {
+        title: "Documents",
+        rel: "~/Documents",
+    },
+    DiskCategory {
+        title: "Pictures",
+        rel: "~/Pictures",
+    },
+    DiskCategory {
+        title: "Apple developer data",
+        rel: "~/Library/Developer",
+    },
+];
+
+/// Measure a deliberately narrow, non-overlapping set of roots with one shared
+/// five-second budget. Missing/unreadable roots are omitted; unfinished roots
+/// are still emitted with a coverage warning so their partial number is never
+/// mistaken for a whole-disk answer.
+fn size_disk_categories(
+    paths: &crate::config::Paths,
+    tx: &tokio::sync::mpsc::Sender<ScanEvent>,
+    gen: u64,
+    token: &tokio_util::sync::CancellationToken,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    for category in DISK_CATEGORIES {
+        if token.is_cancelled() {
+            return;
+        }
+        let root = paths.expand(category.rel);
+        if !root.is_dir() {
+            continue;
+        }
+        let result = du_blocks_bounded(&root, 25_000, deadline, &|| token.is_cancelled());
+        let coverage = if result.complete {
+            format!("Measured {} entries in the selected root.", result.entries)
+        } else {
+            format!(
+                "Partial: measured {} entries before the shared 5s / 25,000-entry budget ended.",
+                result.entries
+            )
+        };
+        let f = Finding::new(FindingKind::DiskCategory, category.rel, category.title)
+            .path(root)
+            .size(result.bytes)
+            .detail(format!("{} on disk", humansize::format_size(result.bytes, humansize::BINARY)))
+            .severity(if result.complete { Severity::Info } else { Severity::Attention })
+            .provenance("bounded local directory walk; symlinks skipped, hard links deduplicated per category")
+            .coverage(coverage.clone())
+            .meta(json!({ "group": "Disk allocation", "category": category.title, "entries": result.entries, "complete": result.complete, "coverage": coverage }));
+        let _ = tx.blocking_send(ScanEvent::Finding {
+            scanner: ScannerId::Fs,
+            gen,
+            finding: Box::new(f),
+        });
     }
 }
 

@@ -7,8 +7,9 @@ dev-environment sprawl, with safe, explicit remediation.
 
 ## Features
 
-- **12 scanner sections**: Apps, Brew, Disk, Daemons, Shell, Runtimes,
-  Docker, Ports, Git, Simulators, Keys, Snapshots — see the
+- **Resource Health overview + 12 audit sections**: a manual point-in-time
+  CPU/memory/swap/disk/process summary, plus Apps, Brew, Disk, Daemons, Shell,
+  Runtimes, Docker, Ports, Git, Simulators, Keys, and Snapshots — see the
   [sections tour](#sections-tour) below.
 - **Streaming, parallel scans.** Scanners run concurrently as async tasks
   (or in a blocking pool for the filesystem walk) and stream findings into
@@ -89,8 +90,8 @@ Global flags (apply to every subcommand and the TUI):
 | `space` | Mark / unmark row |
 | `enter` | Toggle detail pane (else expand/collapse tree group) |
 | `x` | Execute marked remedies (confirm dialog) |
-| `r` | Rescan current section |
-| `R` | Rescan all sections |
+| `r` | Refresh the current point-in-time section |
+| `R` | Refresh all sections and save durable history |
 | `/` | Filter by substring |
 | `s` | Cycle sort (size / name / severity) |
 | `h` | Toggle System apps visibility |
@@ -135,13 +136,14 @@ github_cache_ttl_hours = 72      # how long a cached GitHub release result stays
 
 | Section | What it finds |
 |---|---|
+| Resource Health | Manual CPU load, memory pressure/compression, swap, APFS root capacity, and current high-CPU/RAM processes. It is a point-in-time view, not a background monitor; live observations never enter snapshot diffs. |
 | Apps | Installed applications, classified System / User / cask-managed / App Store / Unmanaged, with arch (Intel/Rosetta) and code-signing info. |
 | Brew | Installed formulae and casks, dependency tree, outdated packages, casks correlated to installed `.app`s. |
-| Disk | Build artifacts (`node_modules`, `target`, `.venv`, etc.), package-manager caches, and large loose files found by a parallel filesystem walk. |
+| Disk | Build artifacts (`node_modules`, `target`, `.venv`, etc.), package-manager caches, and large loose files found by a parallel filesystem walk, plus bounded top-level allocation categories with explicit coverage labels. |
 | Daemons | LaunchAgents/LaunchDaemons, flagging orphaned entries whose binary no longer exists. |
 | Shell | `$PATH` duplicates and dead entries, plus shell startup time. |
 | Runtimes | Language version managers (nvm/fnm/volta/mise/asdf/pyenv/rustup) and their installed toolchain versions. |
-| Docker | Reclaimable space per category (images, containers, volumes, build cache) via `docker system df`, when the daemon is reachable. |
+| Docker | Reclaimable space per category (images, containers, volumes, build cache) via `docker system df`, plus active container CPU/RAM samples via one-shot `docker stats`; active samples are not stored in history. |
 | Ports | Listening TCP ports with the owning process and PID. |
 | Git | Local repos with uncommitted work, unpushed commits (including branches with no upstream), stashes, and working-tree sizes; package-manager checkouts are filtered out. |
 | Simulators | iOS Simulator devices and runtimes, with targeted delete remedies for unavailable ones. |

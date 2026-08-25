@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 
-use crate::model::{Finding, FindingId};
+use crate::model::{Finding, FindingId, SnapshotPolicy};
 
 /// Metadata about a stored snapshot.
 #[derive(Clone, Debug, PartialEq)]
@@ -115,7 +115,10 @@ impl SnapshotStore {
                 "INSERT INTO findings (snapshot_id, finding_id, kind, title, size_bytes, severity, json)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
-            for f in findings.values() {
+            for f in findings
+                .values()
+                .filter(|f| f.snapshot_policy == SnapshotPolicy::Durable)
+            {
                 let json = serde_json::to_string(f)?;
                 stmt.execute(rusqlite::params![
                     snap_id,
@@ -225,6 +228,19 @@ mod tests {
 
     fn map_of(items: Vec<Finding>) -> BTreeMap<FindingId, Finding> {
         items.into_iter().map(|f| (f.id, f)).collect()
+    }
+
+    #[test]
+    fn ephemeral_findings_are_not_saved() {
+        let mut store = SnapshotStore::open_in_memory().unwrap();
+        let durable = f("/p/durable", "durable", Some(10));
+        let ephemeral = Finding::new(FindingKind::SystemMetric, "load", "CPU load").ephemeral();
+        store
+            .save("mac", &map_of(vec![durable, ephemeral]))
+            .unwrap();
+        let saved = store.latest_findings().unwrap().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].title, "durable");
     }
 
     #[test]

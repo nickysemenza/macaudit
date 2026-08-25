@@ -41,8 +41,12 @@ impl Scanner for TmSnapshotsScanner {
 
             let title = format!("Local snapshot {}", humanize_date(&date));
             let finding = Finding::new(FindingKind::LocalSnapshot, &name, title)
-                .detail(format!("Time Machine local snapshot {name}"))
+                .detail(format!(
+                    "Time Machine local snapshot {name}; macOS manages its purgeable space and does not report a reliable per-snapshot reclaimable size."
+                ))
                 .severity(Severity::Reclaimable)
+                .provenance("tmutil listlocalsnapshots /")
+                .coverage("Presence is measured; reclaimable bytes are intentionally not estimated.")
                 .meta(serde_json::json!({ "name": name, "date": date }))
                 .remedy(Remedy {
                     label: "Delete local snapshot".to_string(),

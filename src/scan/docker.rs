@@ -5,6 +5,8 @@
 
 use async_trait::async_trait;
 
+use std::collections::HashMap;
+
 use crate::model::{Finding, FindingKind, Remedy, RemedyCommand, ScannerId, Severity};
 use crate::scan::{ScanCtx, Scanner};
 
@@ -123,6 +125,66 @@ impl Scanner for DockerScanner {
             ctx.emit(finding).await;
         }
 
+        // Storage use alone does not explain an active dev stack. Sample
+        // container state and current CPU/RAM once; these observations are
+        // deliberately ephemeral and never become noisy snapshot diffs.
+        let containers = match ctx
+            .runner
+            .run(
+                "docker",
+                &["ps", "--format", "{{.ID}}\t{{.Names}}\t{{.Status}}"],
+                &ctx.token,
+            )
+            .await
+        {
+            Ok(o) if o.success() => parse_containers(&o.stdout_str()),
+            _ => return Ok(()),
+        };
+        let stats: HashMap<String, ContainerStats> = match ctx
+            .runner
+            .run(
+                "docker",
+                &[
+                    "stats",
+                    "--no-stream",
+                    "--format",
+                    "{{.ID}}\t{{.CPUPerc}}\t{{.MemUsage}}",
+                ],
+                &ctx.token,
+            )
+            .await
+        {
+            Ok(o) if o.success() => parse_stats(&o.stdout_str()),
+            _ => HashMap::new(),
+        };
+        for container in containers {
+            let stat = stats.get(&container.id);
+            let cpu = stat.map(|s| s.cpu_percent).unwrap_or(0.0);
+            let memory = stat.and_then(|s| s.memory_bytes);
+            let severity = if cpu >= 100.0 || memory.unwrap_or(0) >= 2 * 1024 * 1024 * 1024 {
+                Severity::Warning
+            } else if cpu >= 50.0 || memory.unwrap_or(0) >= 1024 * 1024 * 1024 {
+                Severity::Attention
+            } else {
+                Severity::Info
+            };
+            ctx.emit(
+                Finding::new(
+                    FindingKind::DockerObject,
+                    &format!("container:{}", container.id),
+                    format!("{} — active container", container.name),
+                )
+                .detail(match memory {
+                    Some(memory) => format!("{} · {:.1}% CPU · {} RAM", container.status, cpu, format_size(memory)),
+                    None => format!("{} · {:.1}% CPU", container.status, cpu),
+                })
+                .severity(severity)
+                .ephemeral()
+                .provenance("docker ps; docker stats --no-stream")
+                .meta(serde_json::json!({ "type": "active_container", "id": container.id, "name": container.name, "status": container.status, "cpu_percent": cpu, "memory_bytes": memory })),
+            ).await;
+        }
+
         Ok(())
     }
 }
@@ -166,7 +228,8 @@ fn parse_human_size(s: &str) -> Option<u64> {
     let (num_part, unit_part) = s.split_at(split_at);
     let num: f64 = num_part.parse().ok()?;
     let unit = unit_part.trim();
-    let mult: f64 = match unit.to_ascii_lowercase().as_str() {
+    let normalized = unit.to_ascii_lowercase().replace("ib", "b");
+    let mult: f64 = match normalized.as_str() {
         "b" => 1.0,
         "kb" => 1e3,
         "mb" => 1e6,
@@ -175,6 +238,56 @@ fn parse_human_size(s: &str) -> Option<u64> {
         _ => return None,
     };
     Some((num * mult) as u64)
+}
+
+#[derive(Debug)]
+struct Container {
+    id: String,
+    name: String,
+    status: String,
+}
+
+#[derive(Debug)]
+struct ContainerStats {
+    cpu_percent: f64,
+    memory_bytes: Option<u64>,
+}
+
+fn parse_containers(input: &str) -> Vec<Container> {
+    input
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\t');
+            Some(Container {
+                id: parts.next()?.trim().to_string(),
+                name: parts.next()?.trim().to_string(),
+                status: parts.next()?.trim().to_string(),
+            })
+        })
+        .collect()
+}
+
+fn parse_stats(input: &str) -> HashMap<String, ContainerStats> {
+    input
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\t');
+            let id = parts.next()?.trim().to_string();
+            let cpu_percent = parts.next()?.trim().trim_end_matches('%').parse().ok()?;
+            let memory = parts.next()?.split('/').next()?.trim();
+            Some((
+                id,
+                ContainerStats {
+                    cpu_percent,
+                    memory_bytes: parse_human_size(memory),
+                },
+            ))
+        })
+        .collect()
+}
+
+fn format_size(bytes: u64) -> String {
+    humansize::format_size(bytes, humansize::BINARY)
 }
 
 #[cfg(test)]
@@ -311,5 +424,14 @@ mod tests {
         assert_eq!(parse_human_size("0B"), Some(0));
         assert_eq!(parse_human_size("45.2kB"), Some(45_200));
         assert_eq!(parse_human_size(""), None);
+    }
+
+    #[test]
+    fn parses_live_container_rows() {
+        let containers = parse_containers("abc\tcubby-db\tUp 2 minutes\n");
+        assert_eq!(containers[0].name, "cubby-db");
+        let stats = parse_stats("abc\t12.5%\t780MiB / 8GiB\n");
+        assert_eq!(stats["abc"].cpu_percent, 12.5);
+        assert!(stats["abc"].memory_bytes.unwrap() > 700 * 1024 * 1024);
     }
 }

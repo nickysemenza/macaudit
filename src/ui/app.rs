@@ -27,7 +27,7 @@ use crate::registry::{self, ViewKind};
 use crate::remedy::{PlannedAction, RemedyEngine};
 use crate::ui::keys::Action;
 use crate::ui::tree::TreeRow;
-use crate::ui::{activity, confirm, detail, help, sidebar, statusbar, table, tree};
+use crate::ui::{activity, confirm, detail, help, overview, sidebar, statusbar, table, tree};
 
 /// Per-section scan status shown in the sidebar.
 #[derive(Clone, Debug, PartialEq)]
@@ -406,6 +406,16 @@ impl AppState {
                     .sum()
             })
             .unwrap_or(0)
+    }
+
+    /// Read-only source data for the Resource Health overview. This is kept in
+    /// the reducer so the renderer cannot accidentally duplicate selection or
+    /// filtering policy.
+    pub(crate) fn overview_findings(&self, id: ScannerId) -> Vec<&Finding> {
+        self.findings
+            .get(&id)
+            .map(|m| m.values().collect())
+            .unwrap_or_default()
     }
 
     pub(crate) fn marked_total(&self) -> (usize, u64) {
@@ -795,6 +805,7 @@ impl AppState {
         let id = self.selected_section_id();
         let title = registry::section(id).title;
         match registry::section(id).view {
+            ViewKind::Overview => overview::draw(self, frame, area),
             ViewKind::Table => {
                 let rows = self.visible_findings();
                 let is_scanning = matches!(self.status_of(id), SectionStatus::Scanning { .. });
@@ -904,6 +915,9 @@ mod tests {
         for id in ScannerId::ALL {
             app.expected_gen.insert(*id, gen);
         }
+        // Most reducer fixtures below emit App findings; keep those tests about
+        // the tree behavior rather than the Resource Health default selection.
+        app.select_section(1);
         app
     }
 

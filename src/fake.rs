@@ -22,6 +22,7 @@ impl FakeScanner {
 
     fn kind_for(id: ScannerId) -> FindingKind {
         match id {
+            ScannerId::System => FindingKind::SystemMetric,
             ScannerId::Apps => FindingKind::App,
             ScannerId::Brew => FindingKind::BrewFormula,
             ScannerId::Fs => FindingKind::BuildArtifact,

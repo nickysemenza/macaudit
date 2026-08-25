@@ -53,6 +53,7 @@ impl std::fmt::Display for FindingId {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum ScannerId {
+    System,
     Apps,
     Brew,
     Fs,
@@ -70,6 +71,7 @@ pub enum ScannerId {
 impl ScannerId {
     /// Every variant, in display order. Keep in sync with the enum.
     pub const ALL: &'static [ScannerId] = &[
+        ScannerId::System,
         ScannerId::Apps,
         ScannerId::Brew,
         ScannerId::Fs,
@@ -87,6 +89,7 @@ impl ScannerId {
     /// Lowercase slug used for `--section` parsing and serde.
     pub fn slug(self) -> &'static str {
         match self {
+            ScannerId::System => "system",
             ScannerId::Apps => "apps",
             ScannerId::Brew => "brew",
             ScannerId::Fs => "fs",
@@ -106,6 +109,7 @@ impl ScannerId {
     pub fn parse_slug(s: &str) -> Option<ScannerId> {
         let s = s.trim().to_ascii_lowercase();
         Some(match s.as_str() {
+            "system" | "health" | "resource_health" => ScannerId::System,
             "apps" | "app" => ScannerId::Apps,
             "brew" | "homebrew" => ScannerId::Brew,
             "fs" | "disk" => ScannerId::Fs,
@@ -127,6 +131,12 @@ impl ScannerId {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum FindingKind {
+    /// Point-in-time host metric such as CPU load or memory pressure.
+    SystemMetric,
+    /// A process consuming CPU or resident memory at scan time.
+    ProcessResource,
+    /// A bounded, durable disk-allocation category (for example `~/dev`).
+    DiskCategory,
     App,
     BrewFormula,
     BrewCask,
@@ -153,6 +163,8 @@ impl FindingKind {
     /// originating `ScannerId`).
     pub fn scanner(self) -> ScannerId {
         match self {
+            FindingKind::SystemMetric | FindingKind::ProcessResource => ScannerId::System,
+            FindingKind::DiskCategory => ScannerId::Fs,
             FindingKind::App => ScannerId::Apps,
             FindingKind::BrewFormula | FindingKind::BrewCask => ScannerId::Brew,
             FindingKind::BuildArtifact
@@ -174,6 +186,9 @@ impl FindingKind {
     /// A stable string tag for id hashing (independent of enum layout).
     pub fn tag(self) -> &'static str {
         match self {
+            FindingKind::SystemMetric => "system_metric",
+            FindingKind::ProcessResource => "process_resource",
+            FindingKind::DiskCategory => "disk_category",
             FindingKind::App => "app",
             FindingKind::BrewFormula => "brew_formula",
             FindingKind::BrewCask => "brew_cask",
@@ -192,6 +207,17 @@ impl FindingKind {
             FindingKind::LargeFile => "large_file",
         }
     }
+}
+
+/// Whether a finding belongs in durable snapshot history. Live resource data
+/// changes constantly and would make diffs noisy, so scanners mark it
+/// `Ephemeral`; all existing findings default to `Durable` for compatibility.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotPolicy {
+    #[default]
+    Durable,
+    Ephemeral,
 }
 
 /// Severity, ordered from least to most attention-demanding. `Reclaimable`
@@ -289,6 +315,15 @@ pub struct Finding {
     pub severity: Severity,
     #[serde(default)]
     pub remedies: Vec<Remedy>,
+    /// Whether this result participates in saved snapshot history.
+    #[serde(default)]
+    pub snapshot_policy: SnapshotPolicy,
+    /// How this value was collected (command or bounded local walk).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<String>,
+    /// Scope/completeness note for estimates, especially bounded disk sizing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<String>,
     /// Scanner-specific extras (version, arch, cask name, …).
     #[serde(default)]
     pub meta: serde_json::Value,
@@ -307,6 +342,9 @@ impl Finding {
             last_used: None,
             severity: Severity::Info,
             remedies: Vec::new(),
+            snapshot_policy: SnapshotPolicy::Durable,
+            provenance: None,
+            coverage: None,
             meta: serde_json::Value::Null,
         }
     }
@@ -337,6 +375,18 @@ impl Finding {
     }
     pub fn meta(mut self, m: serde_json::Value) -> Self {
         self.meta = m;
+        self
+    }
+    pub fn ephemeral(mut self) -> Self {
+        self.snapshot_policy = SnapshotPolicy::Ephemeral;
+        self
+    }
+    pub fn provenance(mut self, value: impl Into<String>) -> Self {
+        self.provenance = Some(value.into());
+        self
+    }
+    pub fn coverage(mut self, value: impl Into<String>) -> Self {
+        self.coverage = Some(value.into());
         self
     }
 }
@@ -452,6 +502,20 @@ mod tests {
         let json = serde_json::to_string(&f).unwrap();
         let back: Finding = serde_json::from_str(&json).unwrap();
         assert_eq!(f, back);
+    }
+
+    #[test]
+    fn old_finding_json_defaults_to_durable_history() {
+        let f = Finding::new(FindingKind::App, "/Applications/Foo.app", "Foo");
+        let mut json = serde_json::to_value(f).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("snapshot_policy");
+        object.remove("provenance");
+        object.remove("coverage");
+        let restored: Finding = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.snapshot_policy, SnapshotPolicy::Durable);
+        assert!(restored.provenance.is_none());
+        assert!(restored.coverage.is_none());
     }
 
     #[test]

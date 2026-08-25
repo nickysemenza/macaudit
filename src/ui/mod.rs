@@ -12,6 +12,7 @@ mod activity;
 mod confirm;
 mod detail;
 mod help;
+mod overview;
 mod sidebar;
 mod statusbar;
 mod table;

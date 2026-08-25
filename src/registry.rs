@@ -15,12 +15,15 @@ use crate::scan::runtimes::RuntimesScanner;
 use crate::scan::shell_env::ShellEnvScanner;
 use crate::scan::simulator::SimulatorScanner;
 use crate::scan::ssh_keys::SshKeysScanner;
+use crate::scan::system::SystemScanner;
 use crate::scan::tm_snapshots::TmSnapshotsScanner;
 use crate::scan::Scanner;
 
 /// How a section's findings are primarily presented.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ViewKind {
+    /// Purpose-built summary screen for point-in-time resource health.
+    Overview,
     /// Collapsible tree (Apps, Brew dependency trees).
     Tree,
     /// Sortable flat table (Disk, Ports, everything else).
@@ -39,6 +42,12 @@ pub struct SectionMeta {
 
 /// The canonical section list, in sidebar order.
 pub const REGISTRY: &[SectionMeta] = &[
+    SectionMeta {
+        id: ScannerId::System,
+        title: "Resource Health",
+        view: ViewKind::Overview,
+        build: || Box::new(SystemScanner),
+    },
     SectionMeta {
         id: ScannerId::Apps,
         title: "Apps",
