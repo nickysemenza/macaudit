@@ -408,6 +408,31 @@ impl RemedyCommand {
     }
 }
 
+/// The group a finding belongs to: `meta.group` VERBATIM when a scanner sets
+/// it (scanners choose display-ready labels — "node_modules" must not become
+/// "Node Modules"), else the finding's kind tag prettified.
+pub fn group_key(f: &Finding) -> String {
+    f.meta
+        .get("group")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| group_label(f.kind.tag()))
+}
+
+/// Human label for a kind-tag fallback key: underscores → spaces, title-cased.
+pub fn group_label(key: &str) -> String {
+    key.split('_')
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Minimal shell quoting for *display* (not execution — execution passes argv
 /// arrays, never a shell string).
 pub fn shell_quote(s: &str) -> String {
@@ -576,6 +601,11 @@ impl ScanEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_label_title_cases_underscored_key() {
+        assert_eq!(group_label("brew_formula"), "Brew Formula");
+    }
 
     #[test]
     fn finding_id_is_stable_across_construction() {

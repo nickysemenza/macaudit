@@ -19,4 +19,5 @@ pub mod runner;
 pub mod scan;
 pub mod size_cache;
 pub mod snapshot;
+#[cfg(feature = "tui")]
 pub mod ui;

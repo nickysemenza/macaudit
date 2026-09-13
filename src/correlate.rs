@@ -20,7 +20,16 @@
 
 use std::collections::BTreeMap;
 
-use crate::model::{Finding, FindingId, FindingKind, Severity};
+use crate::model::{Finding, FindingId, FindingKind, ScannerId, Severity};
+
+/// Sections whose findings take part in cross-scanner correlation (cask ↔
+/// app, cask binary ↔ tool, tool interpreter ↔ formula/runtime).
+pub const CORRELATED_SECTIONS: &[ScannerId] = &[
+    ScannerId::Apps,
+    ScannerId::Brew,
+    ScannerId::Tools,
+    ScannerId::Runtimes,
+];
 
 /// Enrich findings in place using information across scanners.
 pub fn correlate(findings: &mut BTreeMap<FindingId, Finding>) {

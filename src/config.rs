@@ -101,6 +101,92 @@ impl Paths {
     pub fn history_db(&self) -> PathBuf {
         self.state_dir.join("history.db")
     }
+
+    /// Adopt the login shell's PATH into this process, returning the entries
+    /// that were added. A GUI app launched from Finder inherits launchd's
+    /// minimal PATH (`/usr/bin:/bin:/usr/sbin:/sbin`), so `brew`, `docker`,
+    /// `rustup`… would silently resolve to nothing and whole sections would
+    /// come back empty. Runs `$SHELL -lc 'echo $PATH'` under a bound (the same
+    /// disclosure the Shell scanner makes: this executes the shell's startup
+    /// files); when that fails, falls back to the well-known tool prefixes.
+    /// Entries are appended, never prepended — the process's own PATH keeps
+    /// precedence.
+    pub fn adopt_login_shell_path(&self) -> Vec<PathBuf> {
+        let probed = Self::env_shell().and_then(|sh| login_shell_path(&sh, LOGIN_SHELL_TIMEOUT));
+        let extra = probed.unwrap_or_else(|| {
+            vec![
+                PathBuf::from("/opt/homebrew/bin"),
+                PathBuf::from("/usr/local/bin"),
+                self.home.join(".cargo/bin"),
+            ]
+        });
+        let current = Self::process_path();
+        let added: Vec<PathBuf> = merge_path(&current, &extra);
+        if !added.is_empty() {
+            let mut all = current;
+            all.extend(added.iter().cloned());
+            if let Ok(joined) = std::env::join_paths(&all) {
+                std::env::set_var("PATH", joined);
+            }
+        }
+        added
+    }
+}
+
+const LOGIN_SHELL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The entries of `extra` that `current` lacks, in order, without duplicates.
+fn merge_path(current: &[PathBuf], extra: &[PathBuf]) -> Vec<PathBuf> {
+    let mut added: Vec<PathBuf> = Vec::new();
+    for p in extra {
+        if !current.contains(p) && !added.contains(p) {
+            added.push(p.clone());
+        }
+    }
+    added
+}
+
+/// Ask a login shell for its PATH, bounded by `timeout`. `None` when the
+/// shell is unknown to `path_probe_args`, fails to spawn, exits non-zero,
+/// prints nothing, or overruns the deadline (it is killed).
+fn login_shell_path(shell: &Path, timeout: std::time::Duration) -> Option<Vec<PathBuf>> {
+    use crate::scan::global_tools::shellpath::{path_probe_args, split_path};
+    use std::process::{Command, Stdio};
+
+    let name = shell.file_name()?.to_str()?;
+    let args = path_probe_args(name)?;
+    let mut child = Command::new(shell)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                break;
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut out = String::new();
+    use std::io::Read;
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    let line = out.lines().last()?.trim();
+    let entries = split_path(line);
+    (!entries.is_empty()).then_some(entries)
 }
 
 /// User configuration, loaded from `config.toml`. All fields optional with
@@ -327,5 +413,61 @@ mod tests {
         let c: Config = toml::from_str(text).unwrap();
         assert_eq!(c.behavior.delete_mode, DeleteMode::Rm);
         assert_eq!(c.behavior.stale_after_days, 90); // default preserved
+    }
+
+    /// A stub "zsh" that prints a fixed PATH regardless of its arguments.
+    fn stub_shell(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let sh = dir.join("zsh");
+        std::fs::write(&sh, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&sh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        sh
+    }
+
+    #[test]
+    fn login_shell_path_reads_last_line_of_probe_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = stub_shell(dir.path(), "echo noise\necho /opt/homebrew/bin:/usr/bin:");
+        let got = login_shell_path(&sh, std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from("/opt/homebrew/bin"),
+                PathBuf::from("/usr/bin")
+            ]
+        );
+    }
+
+    #[test]
+    fn login_shell_path_none_on_failure_unknown_shell_or_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let failing = stub_shell(dir.path(), "exit 3");
+        assert!(login_shell_path(&failing, std::time::Duration::from_secs(5)).is_none());
+
+        let unknown = dir.path().join("nushell");
+        std::fs::copy(&failing, &unknown).unwrap();
+        assert!(login_shell_path(&unknown, std::time::Duration::from_secs(5)).is_none());
+
+        let slow = stub_shell(dir.path(), "sleep 5; echo /late");
+        let t = std::time::Instant::now();
+        assert!(login_shell_path(&slow, std::time::Duration::from_millis(100)).is_none());
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(3),
+            "must kill the probe"
+        );
+    }
+
+    #[test]
+    fn merge_path_appends_only_missing_entries() {
+        let cur = vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")];
+        let extra = vec![
+            PathBuf::from("/bin"),
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/opt/homebrew/bin"),
+        ];
+        assert_eq!(
+            merge_path(&cur, &extra),
+            vec![PathBuf::from("/opt/homebrew/bin")]
+        );
     }
 }

@@ -11,30 +11,7 @@ use std::collections::BTreeMap;
 use crate::model::{Finding, Severity};
 use crate::ui::rows::RenderRow;
 
-/// The group a finding belongs to: `meta.group` VERBATIM when a scanner sets
-/// it (scanners choose display-ready labels — "node_modules" must not become
-/// "Node Modules"), else the finding's kind tag prettified.
-pub fn group_key(f: &Finding) -> String {
-    f.meta
-        .get("group")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| group_label(f.kind.tag()))
-}
-
-/// Human label for a kind-tag fallback key: underscores → spaces, title-cased.
-pub fn group_label(key: &str) -> String {
-    key.split('_')
-        .map(|w| {
-            let mut chars = w.chars();
-            match chars.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
+pub use crate::model::group_key;
 
 /// Build the flattened row list from a set of findings, respecting which
 /// groups are currently collapsed. Groups are ordered by total bytes (biggest
@@ -175,10 +152,5 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn group_label_title_cases_underscored_key() {
-        assert_eq!(group_label("brew_formula"), "Brew Formula");
     }
 }
