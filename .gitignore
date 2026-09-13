@@ -1,2 +1,11 @@
 /target
 /.claude/
+
+# SwiftUI app: generated bindings and build products (scripts/build-ffi.sh)
+/build/
+/swift/MacAuditKit/MacAuditFFI.xcframework/
+/swift/MacAuditKit/Sources/MacAuditKit/Generated/*.swift
+/apps/MacAudit/*.xcodeproj/
+.swiftpm/
+.build/
+*.xcuserdatad/

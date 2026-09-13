@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 
-use crate::model::{Finding, FindingId, SnapshotPolicy};
+use crate::model::{Finding, FindingId, FindingKind, ScannerId, SnapshotPolicy};
 
 /// Metadata about a stored snapshot.
 #[derive(Clone, Debug, PartialEq)]
@@ -18,6 +18,18 @@ pub struct SnapshotMeta {
     pub machine: String,
     pub finding_count: i64,
     pub total_bytes: i64,
+}
+
+/// One section's totals within one snapshot (see `section_history`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SectionTotals {
+    pub snapshot_id: i64,
+    pub created_at: i64,
+    pub section: ScannerId,
+    pub finding_count: i64,
+    pub total_bytes: i64,
+    /// Bytes of findings stored with `Reclaimable` severity.
+    pub reclaimable_bytes: i64,
 }
 
 /// Difference between two snapshots.
@@ -213,6 +225,58 @@ impl SnapshotStore {
         Ok(rows)
     }
 
+    /// Per-section totals for every snapshot, oldest first — the history
+    /// chart's input. Aggregated in SQL over the `kind`/`size_bytes`/`severity`
+    /// columns, so no finding JSON is decoded; kinds fold into their section.
+    pub fn section_history(&self) -> anyhow::Result<Vec<SectionTotals>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.created_at, f.kind, COUNT(*),
+                    COALESCE(SUM(f.size_bytes), 0),
+                    COALESCE(SUM(CASE WHEN f.severity = 'reclaimable' THEN f.size_bytes END), 0)
+             FROM snapshots s
+             JOIN findings f ON f.snapshot_id = s.id
+             GROUP BY s.id, f.kind
+             ORDER BY s.created_at, s.id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+        let mut out: Vec<SectionTotals> = Vec::new();
+        for row in rows {
+            let (id, created_at, kind, count, total, reclaimable) = row?;
+            let Some(section) = FindingKind::from_tag(&kind).map(|k| k.scanner()) else {
+                continue;
+            };
+            match out
+                .iter_mut()
+                .find(|t| t.snapshot_id == id && t.section == section)
+            {
+                Some(t) => {
+                    t.finding_count += count;
+                    t.total_bytes += total;
+                    t.reclaimable_bytes += reclaimable;
+                }
+                None => out.push(SectionTotals {
+                    snapshot_id: id,
+                    created_at,
+                    section,
+                    finding_count: count,
+                    total_bytes: total,
+                    reclaimable_bytes: reclaimable,
+                }),
+            }
+        }
+        out.sort_by_key(|t| (t.created_at, t.snapshot_id, t.section));
+        Ok(out)
+    }
+
     /// The most recent snapshot's id, if any.
     pub fn latest_id(&self) -> anyhow::Result<Option<i64>> {
         Ok(self.list()?.first().map(|m| m.id))
@@ -282,6 +346,40 @@ mod tests {
 
     fn map_of(items: Vec<Finding>) -> BTreeMap<FindingId, Finding> {
         items.into_iter().map(|f| (f.id, f)).collect()
+    }
+
+    #[test]
+    fn section_history_folds_kinds_into_sections_per_snapshot() {
+        let mut store = SnapshotStore::open_in_memory().unwrap();
+        let artifact = f("/p/a", "a", Some(10));
+        let cache = Finding::new(FindingKind::CacheDir, "/c", "c")
+            .size(5)
+            .severity(Severity::Info);
+        let formula = Finding::new(FindingKind::BrewFormula, "x", "x")
+            .size(7)
+            .severity(Severity::Reclaimable);
+        store
+            .save("mac", &map_of(vec![artifact.clone(), cache, formula]))
+            .unwrap();
+        store.save("mac", &map_of(vec![artifact])).unwrap();
+
+        let h = store.section_history().unwrap();
+        assert_eq!(h.len(), 3);
+        // Within a snapshot, sections come in `ScannerId` order (Brew < Fs).
+        let brew1 = &h[0];
+        let fs1 = &h[1];
+        assert_eq!((fs1.section, fs1.finding_count), (ScannerId::Fs, 2));
+        assert_eq!((fs1.total_bytes, fs1.reclaimable_bytes), (15, 10));
+        assert_eq!(
+            (brew1.section, brew1.total_bytes, brew1.reclaimable_bytes),
+            (ScannerId::Brew, 7, 7)
+        );
+        let fs2 = &h[2];
+        assert!(fs2.snapshot_id > fs1.snapshot_id);
+        assert_eq!(
+            (fs2.section, fs2.finding_count, fs2.total_bytes),
+            (ScannerId::Fs, 1, 10)
+        );
     }
 
     #[test]

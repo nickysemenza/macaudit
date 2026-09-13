@@ -11,14 +11,7 @@ use crate::config::DeleteMode;
 use crate::model::{Finding, FindingId, ScanEvent, ScannerId, Severity};
 use crate::ui::app::{AppState, SectionStatus};
 
-/// Sections whose findings take part in cross-scanner correlation (cask ↔
-/// app, cask binary ↔ tool, tool interpreter ↔ formula/runtime).
-pub const CORRELATED_SECTIONS: &[ScannerId] = &[
-    ScannerId::Apps,
-    ScannerId::Brew,
-    ScannerId::Tools,
-    ScannerId::Runtimes,
-];
+pub use crate::correlate::CORRELATED_SECTIONS;
 
 impl AppState {
     pub(crate) fn delete_mode(&self) -> DeleteMode {

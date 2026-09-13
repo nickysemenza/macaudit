@@ -1,0 +1,13 @@
+[package]
+name = "uniffi-bindgen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Binding generator for macaudit-ffi (uniffi's CLI, pinned to the same uniffi version as the library)"
+
+[[bin]]
+name = "uniffi-bindgen-swift"
+path = "src/bin/uniffi-bindgen-swift.rs"
+
+[dependencies]
+uniffi = { version = "0.32", features = ["cli"] }

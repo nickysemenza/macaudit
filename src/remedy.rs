@@ -12,7 +12,7 @@ use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::DeleteMode;
-use crate::model::{FindingId, Remedy, RemedyCommand};
+use crate::model::{Finding, FindingId, Remedy, RemedyCommand};
 use crate::runner::CommandRunner;
 
 /// A single, fully-resolved action ready to show and (optionally) run.
@@ -76,6 +76,37 @@ impl ClipboardOps for RealClipboard {
         }
         Ok(())
     }
+}
+
+/// The remedies to plan when a finding is marked for batch execution:
+///
+/// - An explicit choice (`e`) wins: exactly that remedy.
+/// - Else ALL primary (non-alternative) destructive remedies, in emission
+///   order — multi-step workflows like launchd's "bootout, THEN trash the
+///   plist" execute as an ordered sequence.
+/// - Else the first primary Shell remedy — an actionable command like
+///   `brew install --adopt` must not lose to an earlier Reveal-in-Finder.
+/// - Else the first primary remedy, if any (reveal/copy-only findings).
+///
+/// Alternatives (launcher-only removal, `--version` probes) never run
+/// unless chosen.
+pub fn execution_remedies(f: &Finding, choice: Option<usize>) -> Vec<&Remedy> {
+    if let Some(r) = choice.and_then(|i| f.remedies.get(i)) {
+        return vec![r];
+    }
+    let primary: Vec<&Remedy> = f.remedies.iter().filter(|r| !r.alternative).collect();
+    let destructive: Vec<&Remedy> = primary.iter().copied().filter(|r| r.destructive).collect();
+    if !destructive.is_empty() {
+        return destructive;
+    }
+    if let Some(shell) = primary
+        .iter()
+        .copied()
+        .find(|r| matches!(r.command, RemedyCommand::Shell { .. }))
+    {
+        return vec![shell];
+    }
+    primary.first().copied().into_iter().collect()
 }
 
 pub struct RemedyEngine {

@@ -1,0 +1,3 @@
+[bindings.swift]
+ffi_module_name = "MacAuditFFI"
+generate_immutable_records = true

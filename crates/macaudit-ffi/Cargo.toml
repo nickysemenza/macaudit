@@ -1,0 +1,22 @@
+[package]
+name = "macaudit-ffi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "UniFFI surface over the macaudit engine for the SwiftUI app"
+
+[lib]
+name = "macaudit_ffi"
+crate-type = ["staticlib", "lib"]
+
+[dependencies]
+macaudit = { path = "../..", default-features = false }
+uniffi = { version = "0.32" }
+tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "time"] }
+tokio-util = "0.7.18"
+serde_json = "1.0.150"
+thiserror = "2"
+anyhow = "1.0.103"
+
+[dev-dependencies]
+tempfile = "3.27"

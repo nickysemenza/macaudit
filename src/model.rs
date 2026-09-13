@@ -198,6 +198,37 @@ impl FindingKind {
         }
     }
 
+    /// Every kind, for tag lookups and exhaustive tests.
+    pub const ALL: &'static [FindingKind] = &[
+        FindingKind::SystemMetric,
+        FindingKind::ProcessResource,
+        FindingKind::DiskCategory,
+        FindingKind::App,
+        FindingKind::BrewFormula,
+        FindingKind::BrewCask,
+        FindingKind::GlobalTool,
+        FindingKind::CommandResolution,
+        FindingKind::ToolCoverage,
+        FindingKind::BuildArtifact,
+        FindingKind::CacheDir,
+        FindingKind::LaunchdItem,
+        FindingKind::PathEntry,
+        FindingKind::RuntimeVersion,
+        FindingKind::DockerObject,
+        FindingKind::PortListener,
+        FindingKind::GitRepo,
+        FindingKind::Simulator,
+        FindingKind::SshKey,
+        FindingKind::IosBackup,
+        FindingKind::LocalSnapshot,
+        FindingKind::LargeFile,
+    ];
+
+    /// Inverse of `tag()` — how the snapshot store's `kind` column maps back.
+    pub fn from_tag(tag: &str) -> Option<FindingKind> {
+        FindingKind::ALL.iter().copied().find(|k| k.tag() == tag)
+    }
+
     /// A stable string tag for id hashing (independent of enum layout).
     pub fn tag(self) -> &'static str {
         match self {
@@ -408,6 +439,31 @@ impl RemedyCommand {
     }
 }
 
+/// The group a finding belongs to: `meta.group` VERBATIM when a scanner sets
+/// it (scanners choose display-ready labels — "node_modules" must not become
+/// "Node Modules"), else the finding's kind tag prettified.
+pub fn group_key(f: &Finding) -> String {
+    f.meta
+        .get("group")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| group_label(f.kind.tag()))
+}
+
+/// Human label for a kind-tag fallback key: underscores → spaces, title-cased.
+pub fn group_label(key: &str) -> String {
+    key.split('_')
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Minimal shell quoting for *display* (not execution — execution passes argv
 /// arrays, never a shell string).
 pub fn shell_quote(s: &str) -> String {
@@ -576,6 +632,19 @@ impl ScanEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_kind_round_trips_through_its_tag() {
+        for k in FindingKind::ALL {
+            assert_eq!(FindingKind::from_tag(k.tag()), Some(*k));
+        }
+        assert_eq!(FindingKind::from_tag("nope"), None);
+    }
+
+    #[test]
+    fn group_label_title_cases_underscored_key() {
+        assert_eq!(group_label("brew_formula"), "Brew Formula");
+    }
 
     #[test]
     fn finding_id_is_stable_across_construction() {
