@@ -24,6 +24,8 @@ pub(crate) fn finding_with_remedy(gen: u64, key: &str) -> ScanEvent {
             command: RemedyCommand::Trash { path: key.into() },
             reclaims_bytes: Some(100),
             destructive: true,
+            alternative: false,
+            guard: None,
         });
     ScanEvent::Finding {
         scanner: ScannerId::Apps,

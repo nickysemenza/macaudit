@@ -34,6 +34,11 @@ pub enum Command {
     Scan(ScanArgs),
     /// Print the destructive remedy commands a clean would run.
     Clean(CleanArgs),
+    /// Global developer tools: list installations across managers, or verify them.
+    Tools(ToolsArgs),
+    /// Homebrew dependency questions: why is X installed / what does X need.
+    #[command(subcommand)]
+    Brew(BrewCmd),
     /// Manage snapshot history.
     #[command(subcommand)]
     Snapshot(SnapshotCmd),
@@ -62,6 +67,69 @@ pub struct CleanArgs {
     /// Restrict to sections, comma-separated. Default: all.
     #[arg(long, value_delimiter = ',')]
     pub section: Vec<String>,
+
+    /// Only these findings (identity keys or titles, comma-separated), e.g.
+    /// `npm:/opt/homebrew/lib/node_modules:eslint` or `wget`. Without it,
+    /// Brew/Tools rows are listed only when evidence suggests removal.
+    #[arg(long, value_delimiter = ',')]
+    pub select: Vec<String>,
+
+    /// Emit `{actions, refused, impact, reclaimable_bytes}` as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ToolsArgs {
+    #[command(subcommand)]
+    pub cmd: Option<ToolsCmd>,
+
+    /// Emit the `global_tool` findings as JSON.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Only these managers (npm, pnpm, cargo, pipx, uv, pip, bun).
+    #[arg(long, value_delimiter = ',')]
+    pub manager: Vec<String>,
+
+    /// Only these classifications (broken, duplicate, shadowed,
+    /// project_alternative, required, orphan, review).
+    #[arg(long, value_delimiter = ',')]
+    pub class: Vec<String>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ToolsCmd {
+    /// Run bounded `--version` probes on every tool launcher (explicit,
+    /// never part of a scan).
+    Verify {
+        #[arg(long)]
+        json: bool,
+        /// Maximum number of probes.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BrewCmd {
+    /// Why is this formula/cask installed — what needs it, up to the
+    /// explicitly installed roots.
+    Why {
+        name: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value_t = 8)]
+        max_depth: u16,
+    },
+    /// What does this formula/cask need (direct, then transitive).
+    Deps {
+        name: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value_t = 8)]
+        max_depth: u16,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -71,7 +139,13 @@ pub enum SnapshotCmd {
     /// List stored snapshots.
     List,
     /// Diff two snapshots by id (defaults to the two most recent).
-    Diff { a: Option<i64>, b: Option<i64> },
+    Diff {
+        a: Option<i64>,
+        b: Option<i64>,
+        /// Emit `{a, b, added, removed, grown, changed}` as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

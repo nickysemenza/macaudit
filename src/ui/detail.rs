@@ -30,6 +30,7 @@ pub fn draw(
     section: ScannerId,
     delete_mode: DeleteMode,
     scroll: u16,
+    chosen_remedy: Option<usize>,
 ) {
     let block = Block::default().borders(Borders::LEFT).title(" Detail ");
     let text: Vec<Line> = match selected {
@@ -38,7 +39,13 @@ pub fn draw(
             Style::default().fg(Color::DarkGray),
         ))],
         Some(f) => render(
-            &build(f, section, delete_mode, std::time::SystemTime::now()),
+            &build_with_choice(
+                f,
+                section,
+                delete_mode,
+                std::time::SystemTime::now(),
+                chosen_remedy,
+            ),
             block.inner(area).width,
         ),
     };
@@ -53,11 +60,24 @@ pub fn draw(
 
 /// The detail fields for `f`: generic facts, the section's typed meta rows,
 /// any leftover meta keys, then the remedies.
+#[cfg(test)]
 pub fn build(
     f: &Finding,
     section: ScannerId,
     delete_mode: DeleteMode,
     now: std::time::SystemTime,
+) -> Vec<Field> {
+    build_with_choice(f, section, delete_mode, now, None)
+}
+
+/// `build`, marking the remedy the user chose with `e` (▶) and labelling
+/// alternatives that never run unless chosen.
+pub fn build_with_choice(
+    f: &Finding,
+    section: ScannerId,
+    delete_mode: DeleteMode,
+    now: std::time::SystemTime,
+    chosen: Option<usize>,
 ) -> Vec<Field> {
     let mut fields = vec![Field::Header(""), Field::Text(f.title.clone())];
     if !f.detail.is_empty() && f.detail != f.title {
@@ -106,13 +126,33 @@ pub fn build(
         // would actually run — under `--rm`, a Trash remedy displays as
         // `rm -rf …`.
         let engine = RemedyEngine::new(delete_mode);
-        for r in &f.remedies {
+        let primary_runs: Vec<bool> = {
+            let chosen_runs = crate::ui::marking::execution_remedies(f, chosen);
+            f.remedies
+                .iter()
+                .map(|r| chosen_runs.iter().any(|c| std::ptr::eq(*c, r)))
+                .collect()
+        };
+        for (i, r) in f.remedies.iter().enumerate() {
             let action = engine.plan_one(f.id, r);
+            let marker = if primary_runs[i] { "▶" } else { " " };
+            let alt = if r.alternative {
+                " (alternative — e to choose)"
+            } else {
+                ""
+            };
             fields.push(Field::Command {
-                label: r.label.clone(),
+                label: format!("{marker} {}. {}{alt}", i + 1, r.label),
                 rendered: action.rendered,
                 destructive: r.destructive,
             });
+        }
+        if let Some(g) = f.remedies.iter().find_map(|r| r.guard.as_ref()) {
+            let _ = g;
+            fields.push(Field::Text(
+                "Guarded: every target is re-checked against a fresh scan right before it runs."
+                    .into(),
+            ));
         }
     }
     fields
@@ -229,6 +269,8 @@ mod tests {
                 command: RemedyCommand::Trash { path: long.into() },
                 reclaims_bytes: Some(12345678),
                 destructive: true,
+                alternative: false,
+                guard: None,
             });
         let fields = build(&f, ScannerId::Fs, DeleteMode::Rm, SystemTime::now());
         let text = text_of(&render(&fields, 60));

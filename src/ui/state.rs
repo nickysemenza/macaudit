@@ -11,7 +11,20 @@ use crate::config::DeleteMode;
 use crate::model::{Finding, FindingId, ScanEvent, ScannerId, Severity};
 use crate::ui::app::{AppState, SectionStatus};
 
+/// Sections whose findings take part in cross-scanner correlation (cask ↔
+/// app, cask binary ↔ tool, tool interpreter ↔ formula/runtime).
+pub const CORRELATED_SECTIONS: &[ScannerId] = &[
+    ScannerId::Apps,
+    ScannerId::Brew,
+    ScannerId::Tools,
+    ScannerId::Runtimes,
+];
+
 impl AppState {
+    pub(crate) fn delete_mode(&self) -> DeleteMode {
+        self.delete_mode
+    }
+
     /// Set the delete mode used when planning remedies (wired from `Config` by
     /// the run loop, honoring `--rm`).
     pub fn set_delete_mode(&mut self, mode: DeleteMode) {
@@ -84,12 +97,12 @@ impl AppState {
         })
     }
 
-    /// A merged snapshot of the Apps + Brew section maps — the input to both
+    /// A merged snapshot of the correlated section maps — the input to both
     /// sync correlation and the async network-enrichment task.
     pub fn apps_brew_findings(&self) -> BTreeMap<FindingId, Finding> {
         let mut merged: BTreeMap<FindingId, Finding> = BTreeMap::new();
-        for id in [ScannerId::Apps, ScannerId::Brew] {
-            if let Some(map) = self.findings.get(&id) {
+        for id in CORRELATED_SECTIONS {
+            if let Some(map) = self.findings.get(id) {
                 for (fid, f) in map {
                     merged.insert(*fid, f.clone());
                 }
@@ -110,6 +123,7 @@ impl AppState {
             return;
         }
         crate::correlate::correlate(&mut merged);
+        self.brew_version += 1;
         for (fid, f) in merged {
             self.findings
                 .entry(f.kind.scanner())
@@ -152,6 +166,9 @@ impl AppState {
         match ev {
             ScanEvent::Started { scanner, .. } => {
                 self.findings.entry(scanner).or_default().clear();
+                if scanner == ScannerId::Brew {
+                    self.brew_version += 1;
+                }
                 self.status.insert(
                     scanner,
                     SectionStatus::Scanning {
@@ -174,6 +191,9 @@ impl AppState {
             ScanEvent::Finding {
                 scanner, finding, ..
             } => {
+                if scanner == ScannerId::Brew {
+                    self.brew_version += 1;
+                }
                 self.findings
                     .entry(scanner)
                     .or_default()
@@ -184,10 +204,52 @@ impl AppState {
             } => {
                 self.status
                     .insert(scanner, SectionStatus::Done { duration });
+                if scanner == ScannerId::Brew {
+                    self.brew_version += 1;
+                }
+                self.drop_stale_marks(scanner);
             }
             ScanEvent::Failed { scanner, error, .. } => {
                 self.status.insert(scanner, SectionStatus::Failed { error });
+                self.drop_stale_marks(scanner);
             }
+        }
+    }
+
+    /// After a section re-scans, marks (and remedy choices) whose findings no
+    /// longer exist are dropped and announced, and an open confirm dialog is
+    /// rebuilt so it cannot reference a vanished target.
+    fn drop_stale_marks(&mut self, scanner: ScannerId) {
+        if self.marked.is_empty() {
+            return;
+        }
+        let present: std::collections::HashSet<FindingId> = self
+            .findings
+            .values()
+            .flat_map(|m| m.keys().copied())
+            .collect();
+        let stale: Vec<FindingId> = self
+            .marked
+            .iter()
+            .filter(|id| !present.contains(id))
+            .copied()
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        for id in &stale {
+            self.marked.remove(id);
+            self.remedy_choice.remove(id);
+        }
+        self.push_activity(format!(
+            "dropped {} stale mark(s) after rescanning {}",
+            stale.len(),
+            scanner.slug()
+        ));
+        if self.mode == crate::ui::app::Mode::Confirm {
+            self.confirm = None;
+            self.mode = crate::ui::app::Mode::Normal;
+            self.open_confirm();
         }
     }
 

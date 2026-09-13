@@ -31,6 +31,19 @@ pub enum RenderRow<'a> {
         f: &'a Finding,
         depth: u8,
     },
+    /// A node of the Brew dependency explorer (see `ui::deps`). `f` is
+    /// `None` for a dependency that is not installed or a placeholder.
+    Node {
+        f: Option<&'a Finding>,
+        name: String,
+        version: Option<String>,
+        depth: u8,
+        expanded: bool,
+        has_children: bool,
+        relation: crate::brewgraph::Relation,
+        cycle: bool,
+        path_key: String,
+    },
 }
 
 /// Everything the renderer needs besides the frame.
@@ -212,6 +225,68 @@ fn render_row<'a, M: Fn(FindingId) -> bool>(
                         Style::default().add_modifier(Modifier::BOLD),
                     ))
                     .alignment(col.align),
+                ));
+            }
+            Row::new(cells)
+        }
+        RenderRow::Node {
+            f,
+            name,
+            version,
+            depth,
+            expanded,
+            has_children,
+            relation,
+            cycle,
+            ..
+        } => {
+            let marked = f.map(|f| (view.is_marked)(f.id)).unwrap_or(false);
+            let gutter = if marked {
+                Span::styled(theme::MARK, Style::default().fg(Color::Cyan))
+            } else {
+                Span::raw(" ")
+            };
+            let glyph = if !*has_children {
+                " "
+            } else if *expanded {
+                theme::EXPANDED
+            } else {
+                theme::COLLAPSED
+            };
+            let suffix = crate::ui::deps::relation_suffix(*relation, *cycle);
+            let mut cells = vec![Cell::from(gutter)];
+            for (i, col) in columns.iter().enumerate() {
+                let width = rects[i + 1].width as usize;
+                let (text, style) = if col.primary {
+                    let indent = "  ".repeat(*depth as usize);
+                    let label = if suffix.is_empty() {
+                        format!("{indent}{glyph} {name}")
+                    } else {
+                        format!("{indent}{glyph} {name}  ({suffix})")
+                    };
+                    let style = match f {
+                        Some(f) => Style::default().fg(theme::severity_color(f.severity)),
+                        None => Style::default().fg(Color::DarkGray),
+                    };
+                    (label, style)
+                } else if let Some(f) = f {
+                    let cell = (col.cell)(f, &view.ctx);
+                    (cell.text, cell.style)
+                } else if col.id == ColumnId::Version {
+                    (
+                        version.clone().unwrap_or_else(|| "unknown".into()),
+                        Style::default().fg(Color::DarkGray),
+                    )
+                } else {
+                    (String::new(), Style::default())
+                };
+                let text = if col.middle_ellipsis {
+                    fmt::truncate_middle(&text, width)
+                } else {
+                    fmt::truncate_end(&text, width)
+                };
+                cells.push(Cell::from(
+                    Line::from(Span::styled(text, style)).alignment(col.align),
                 ));
             }
             Row::new(cells)

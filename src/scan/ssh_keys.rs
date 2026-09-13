@@ -156,6 +156,8 @@ async fn emit_for_pubkey(ctx: &ScanCtx, pub_path: &Path, config_text: &str) {
             },
             reclaims_bytes: None,
             destructive: false,
+            alternative: false,
+            guard: None,
         })
         .meta(json!({
             "type": info.key_type,

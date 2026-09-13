@@ -56,6 +56,7 @@ pub enum ScannerId {
     System,
     Apps,
     Brew,
+    Tools,
     Fs,
     Launchd,
     ShellEnv,
@@ -74,6 +75,7 @@ impl ScannerId {
         ScannerId::System,
         ScannerId::Apps,
         ScannerId::Brew,
+        ScannerId::Tools,
         ScannerId::Fs,
         ScannerId::Launchd,
         ScannerId::ShellEnv,
@@ -92,6 +94,7 @@ impl ScannerId {
             ScannerId::System => "system",
             ScannerId::Apps => "apps",
             ScannerId::Brew => "brew",
+            ScannerId::Tools => "tools",
             ScannerId::Fs => "fs",
             ScannerId::Launchd => "launchd",
             ScannerId::ShellEnv => "shell_env",
@@ -112,6 +115,7 @@ impl ScannerId {
             "system" | "health" | "resource_health" => ScannerId::System,
             "apps" | "app" => ScannerId::Apps,
             "brew" | "homebrew" => ScannerId::Brew,
+            "tools" | "global_tools" | "globals" | "dev_tools" => ScannerId::Tools,
             "fs" | "disk" => ScannerId::Fs,
             "launchd" | "daemons" => ScannerId::Launchd,
             "shell_env" | "shell" | "shellenv" | "env" => ScannerId::ShellEnv,
@@ -140,6 +144,14 @@ pub enum FindingKind {
     App,
     BrewFormula,
     BrewCask,
+    /// One installation of a globally installed developer tool (npm/pnpm/
+    /// cargo/pipx/uv/pip/bun), keyed by manager + installation root + name.
+    GlobalTool,
+    /// Which executable a command name resolves to in the user's login shell
+    /// versus MacAudit's own process, with every candidate on `$PATH`.
+    CommandResolution,
+    /// Coverage/completeness report for the Global Tools scan (one finding).
+    ToolCoverage,
     BuildArtifact,
     CacheDir,
     LaunchdItem,
@@ -167,6 +179,9 @@ impl FindingKind {
             FindingKind::DiskCategory => ScannerId::Fs,
             FindingKind::App => ScannerId::Apps,
             FindingKind::BrewFormula | FindingKind::BrewCask => ScannerId::Brew,
+            FindingKind::GlobalTool
+            | FindingKind::CommandResolution
+            | FindingKind::ToolCoverage => ScannerId::Tools,
             FindingKind::BuildArtifact
             | FindingKind::CacheDir
             | FindingKind::IosBackup
@@ -192,6 +207,9 @@ impl FindingKind {
             FindingKind::App => "app",
             FindingKind::BrewFormula => "brew_formula",
             FindingKind::BrewCask => "brew_cask",
+            FindingKind::GlobalTool => "global_tool",
+            FindingKind::CommandResolution => "command_resolution",
+            FindingKind::ToolCoverage => "tool_coverage",
             FindingKind::BuildArtifact => "build_artifact",
             FindingKind::CacheDir => "cache_dir",
             FindingKind::LaunchdItem => "launchd_item",
@@ -241,6 +259,96 @@ pub struct Remedy {
     pub command: RemedyCommand,
     pub reclaims_bytes: Option<u64>,
     pub destructive: bool,
+    /// An alternative to the finding's primary remedy (a launcher-only
+    /// removal, a health probe). Never auto-selected for batch execution; the
+    /// user picks it explicitly in the detail pane.
+    #[serde(default)]
+    pub alternative: bool,
+    /// What must still be true at execution time for this remedy to be safe.
+    /// Evaluated by the cleanup preflight; `None` means "no ownership
+    /// guard" (the pre-existing Disk/launchd remedies).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<Guard>,
+}
+
+impl Remedy {
+    /// A primary remedy with no guard. Builder methods add the rest.
+    pub fn new(label: impl Into<String>, command: RemedyCommand) -> Self {
+        Remedy {
+            label: label.into(),
+            command,
+            reclaims_bytes: None,
+            destructive: false,
+            alternative: false,
+            guard: None,
+        }
+    }
+
+    pub fn destructive(mut self) -> Self {
+        self.destructive = true;
+        self
+    }
+
+    pub fn alternative(mut self) -> Self {
+        self.alternative = true;
+        self
+    }
+
+    pub fn reclaims(mut self, bytes: Option<u64>) -> Self {
+        self.reclaims_bytes = bytes;
+        self
+    }
+
+    pub fn guard(mut self, guard: Guard) -> Self {
+        self.guard = Some(guard);
+        self
+    }
+}
+
+/// Ownership/identity facts a destructive remedy depends on. The cleanup
+/// preflight re-checks them against a fresh scan right before execution and
+/// refuses the action when they no longer hold, so a stale selection can never
+/// remove something other than what the user reviewed.
+#[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Guard {
+    /// A Homebrew formula: still installed at this version, and (when
+    /// required) nothing outside the batch still depends on it.
+    BrewFormula {
+        full_name: String,
+        expected_version: Option<String>,
+        require_no_retained_dependents: bool,
+    },
+    /// A Homebrew cask: still installed at this version.
+    BrewCask {
+        token: String,
+        expected_version: Option<String>,
+    },
+    /// A manager-owned installation: still present at the same root/version,
+    /// and the manager program used to remove it still exists.
+    ToolInstall {
+        manager: String,
+        identity_key: String,
+        root: PathBuf,
+        expected_version: Option<String>,
+        program_must_exist: Option<PathBuf>,
+    },
+    /// A launcher (symlink/shim) owned by one installation: still points where
+    /// it did when scanned (or is still dangling, when that is the reason it
+    /// is being removed).
+    Launcher {
+        path: PathBuf,
+        expected_target: Option<PathBuf>,
+        expect_dangling: bool,
+        owner_key: String,
+    },
+    /// A pip-installed package in a specific site-packages: still present,
+    /// still `INSTALLER: pip`, not Homebrew-owned, interpreter still exists.
+    PipPackage {
+        site: PathBuf,
+        name: String,
+        interpreter: PathBuf,
+    },
 }
 
 /// The concrete thing a remedy does. Every path/arg comes from the scan itself.
@@ -255,6 +363,13 @@ pub enum RemedyCommand {
     RevealInFinder { path: PathBuf },
     /// Put text on the clipboard (for things we won't run ourselves, e.g. `kill <pid>`).
     CopyToClipboard { text: String },
+    /// A bounded, non-destructive health probe (`<tool> --version`), run only
+    /// when the user explicitly asks; killed after `timeout_secs`.
+    Probe {
+        program: String,
+        args: Vec<String>,
+        timeout_secs: u64,
+    },
 }
 
 impl RemedyCommand {
@@ -277,6 +392,18 @@ impl RemedyCommand {
                 format!("open -R {}", shell_quote(&path.display().to_string()))
             }
             RemedyCommand::CopyToClipboard { text } => format!("pbcopy <<< {}", shell_quote(text)),
+            RemedyCommand::Probe {
+                program,
+                args,
+                timeout_secs,
+            } => {
+                let mut s = format!("timeout {timeout_secs} {}", shell_quote(program));
+                for a in args {
+                    s.push(' ');
+                    s.push_str(&shell_quote(a));
+                }
+                s
+            }
         }
     }
 }
@@ -498,6 +625,8 @@ mod tests {
                 },
                 reclaims_bytes: None,
                 destructive: false,
+                alternative: false,
+                guard: None,
             });
         let json = serde_json::to_string(&f).unwrap();
         let back: Finding = serde_json::from_str(&json).unwrap();
@@ -516,6 +645,53 @@ mod tests {
         assert_eq!(restored.snapshot_policy, SnapshotPolicy::Durable);
         assert!(restored.provenance.is_none());
         assert!(restored.coverage.is_none());
+    }
+
+    #[test]
+    fn old_remedy_json_without_guard_or_alternative_loads() {
+        // Snapshots written before the cleanup work carry remedies with only
+        // the four original fields; they must keep deserialising as primary,
+        // unguarded remedies.
+        let json = serde_json::json!({
+            "label": "Move to Trash",
+            "command": { "type": "trash", "path": "/tmp/x" },
+            "reclaims_bytes": 12,
+            "destructive": true
+        });
+        let r: Remedy = serde_json::from_value(json).unwrap();
+        assert!(!r.alternative);
+        assert!(r.guard.is_none());
+        // And a guard round-trips with its tag.
+        let g = Remedy::new(
+            "Uninstall",
+            RemedyCommand::Shell {
+                program: "pipx".into(),
+                args: vec!["uninstall".into(), "x".into()],
+            },
+        )
+        .destructive()
+        .guard(Guard::ToolInstall {
+            manager: "pipx".into(),
+            identity_key: "pipx:/v:x".into(),
+            root: PathBuf::from("/v"),
+            expected_version: Some("1.0".into()),
+            program_must_exist: None,
+        });
+        let v = serde_json::to_value(&g).unwrap();
+        assert_eq!(v["guard"]["kind"], "tool_install");
+        let back: Remedy = serde_json::from_value(v).unwrap();
+        assert_eq!(back, g);
+    }
+
+    #[test]
+    fn probe_renders_with_timeout_prefix() {
+        let c = RemedyCommand::Probe {
+            program: "/usr/local/bin/eslint".into(),
+            args: vec!["--version".into()],
+            timeout_secs: 5,
+        };
+        assert_eq!(c.rendered(), "timeout 5 /usr/local/bin/eslint --version");
+        assert_eq!(serde_json::to_value(&c).unwrap()["type"], "probe");
     }
 
     #[test]

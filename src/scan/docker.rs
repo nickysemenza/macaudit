@@ -118,6 +118,8 @@ impl Scanner for DockerScanner {
                         },
                         reclaims_bytes: reclaimable_bytes,
                         destructive: true,
+                        alternative: false,
+                        guard: None,
                     });
                 }
             }

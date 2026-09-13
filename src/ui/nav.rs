@@ -36,6 +36,10 @@ impl AppState {
             Action::Char('K') => self.scroll_detail(-3),
             Action::ScrollDetail(d) => self.scroll_detail(d),
             Action::Char('x') => self.open_confirm(),
+            Action::Char('v') => self.open_preview(),
+            Action::Char('c') => self.open_report(),
+            Action::Char('e') => self.cycle_remedy_choice(),
+            Action::Char('d') => self.toggle_deps_direction(),
             Action::Char('r') => {
                 self.pending_rescan = Some(RescanRequest::Section(self.selected_section_id()));
             }
@@ -159,9 +163,50 @@ impl AppState {
             })
     }
 
+    /// `d` (Brew only): flip the explorer between "what does X need" and
+    /// "why is X installed". Expansion is per direction, so the tree starts
+    /// collapsed again.
+    fn toggle_deps_direction(&mut self) {
+        if self.selected_section_id() != ScannerId::Brew {
+            return;
+        }
+        self.deps_direction = match self.deps_direction {
+            crate::brewgraph::Direction::Forward => crate::brewgraph::Direction::Reverse,
+            crate::brewgraph::Direction::Reverse => crate::brewgraph::Direction::Forward,
+        };
+        self.selected_row = 0;
+        self.viewport.row_offset = 0;
+        self.detail_scroll = 0;
+    }
+
+    /// The explorer node under the cursor, if it can be expanded.
+    fn node_at_cursor(&self) -> Option<(String, bool)> {
+        match self.rows().get(self.selected_row) {
+            Some(RenderRow::Node {
+                has_children: true,
+                path_key,
+                expanded,
+                ..
+            }) => Some((path_key.clone(), *expanded)),
+            _ => None,
+        }
+    }
+
+    fn toggle_node(&mut self, path_key: String) {
+        if !self.expanded_nodes.remove(&path_key) {
+            self.expanded_nodes.insert(path_key);
+        }
+    }
+
     /// `z`: toggle the group under the cursor. On a leaf, this folds its
     /// parent and moves the cursor onto the header so `z` again re-opens it.
+    /// On an expandable explorer node, the node itself folds.
     fn fold_at_cursor(&mut self) {
+        if let Some((key, _)) = self.node_at_cursor() {
+            self.toggle_node(key);
+            self.detail_scroll = 0;
+            return;
+        }
         if let Some((header_row, key)) = self.group_at_cursor() {
             self.toggle_group(key);
             self.selected_row = header_row;
@@ -183,6 +228,10 @@ impl AppState {
             if let Some(RenderRow::Group { key, .. }) = self.rows().get(self.selected_row) {
                 let key = key.clone();
                 self.toggle_group(key);
+                return;
+            }
+            if let Some((key, _)) = self.node_at_cursor() {
+                self.toggle_node(key);
                 return;
             }
         }

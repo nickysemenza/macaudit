@@ -210,6 +210,8 @@ async fn scan_versions_dir(
             command: RemedyCommand::Trash { path: path.clone() },
             reclaims_bytes: Some(size),
             destructive: true,
+            alternative: false,
+            guard: None,
         });
         ctx.emit(finding).await;
     }
@@ -349,6 +351,8 @@ async fn scan_rustup(ctx: &ScanCtx, runtime_managers: &mut HashMap<String, HashS
                 },
                 reclaims_bytes: Some(size),
                 destructive: true,
+                alternative: false,
+                guard: None,
             });
         }
         ctx.emit(finding).await;

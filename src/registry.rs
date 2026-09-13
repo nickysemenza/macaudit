@@ -9,6 +9,7 @@ use crate::scan::brew::BrewScanner;
 use crate::scan::docker::DockerScanner;
 use crate::scan::fs::FsScanner;
 use crate::scan::git::GitScanner;
+use crate::scan::global_tools::ToolsScanner;
 use crate::scan::launchd::LaunchdScanner;
 use crate::scan::ports::PortsScanner;
 use crate::scan::runtimes::RuntimesScanner;
@@ -66,6 +67,13 @@ pub const REGISTRY: &[SectionMeta] = &[
         build: || Box::new(BrewScanner),
     },
     SectionMeta {
+        id: ScannerId::Tools,
+        title: "Global Tools",
+        short_title: "Tools",
+        view: ViewKind::Tree,
+        build: || Box::new(ToolsScanner),
+    },
+    SectionMeta {
         id: ScannerId::Fs,
         title: "Disk",
         short_title: "Disk",
@@ -85,7 +93,7 @@ pub const REGISTRY: &[SectionMeta] = &[
         id: ScannerId::ShellEnv,
         title: "Shell",
         short_title: "Shell",
-        view: ViewKind::Table,
+        view: ViewKind::Tree,
         build: || Box::new(ShellEnvScanner),
     },
     SectionMeta {

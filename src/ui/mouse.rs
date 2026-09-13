@@ -24,7 +24,10 @@ impl AppState {
     pub(super) fn handle_mouse_at(&mut self, me: MouseEvent, now: Instant) {
         // Modals own the screen; the filter box only changes what typing
         // means, so pointing still works there.
-        if matches!(self.mode, Mode::Confirm | Mode::Help) {
+        if matches!(
+            self.mode,
+            Mode::Confirm | Mode::Help | Mode::Preview | Mode::Cleanup | Mode::Report
+        ) {
             return;
         }
         let Some(hit) = self.viewport.hit(me.column, me.row) else {
@@ -248,7 +251,7 @@ mod tests {
         use crate::ui::present::{ColumnId, SortDir, SortSpec};
 
         let mut app = app_with_gen(1);
-        app.handle(Action::Char('0')); // Git
+        app.handle(Action::JumpSection(10)); // Git (index 10 after Tools)
         for (name, branch) in [("a", "zeta"), ("b", "alpha")] {
             let f = Finding::new(FindingKind::GitRepo, name, name)
                 .meta(serde_json::json!({ "branch": branch }));
@@ -289,8 +292,8 @@ mod tests {
     fn overview_source_row_click_jumps_to_section() {
         let mut app = AppState::default();
         render(&mut app, 150, 40);
-        let (x, y) = app.viewport.position_of(Hit::OverviewSection(3)).unwrap();
+        let (x, y) = app.viewport.position_of(Hit::OverviewSection(4)).unwrap();
         app.handle_mouse(left_click(x, y));
-        assert_eq!(app.selected_section_index(), 3); // Disk
+        assert_eq!(app.selected_section_index(), 4); // Disk
     }
 }

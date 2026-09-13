@@ -7,10 +7,28 @@ dev-environment sprawl, with safe, explicit remediation.
 
 ## Features
 
-- **Resource Health overview + 12 audit sections**: a manual point-in-time
-  CPU/memory/swap/disk/process summary, plus Apps, Brew, Disk, Daemons, Shell,
-  Runtimes, Docker, Ports, Git, Simulators, Keys, and Snapshots — see the
-  [sections tour](#sections-tour) below.
+- **Resource Health overview + 13 audit sections**: a manual point-in-time
+  CPU/memory/swap/disk/process summary, plus Apps, Brew, Global Tools, Disk,
+  Daemons, Shell, Runtimes, Docker, Ports, Git, Simulators, Keys, and
+  Snapshots — see the [sections tour](#sections-tour) below.
+- **Developer-tool audit.** Every global installation across npm, pnpm
+  (current *and* legacy layouts), cargo, pipx, uv, pip site-packages and bun,
+  with the manager that owns it, the launchers it exports, which copy your
+  *login shell* actually runs (fish/zsh/bash) versus what MacAudit's own
+  process sees, whether a project already pins its own copy, and an
+  evidence-ranked classification (broken / duplicate / shadowed /
+  project-alternative / required / orphan / review). See
+  [Global tools](#global-tools) below.
+- **Homebrew dependency explorer.** A real tree over Homebrew's install
+  receipts: what a formula needs, why it is installed (up to the packages
+  you asked for), origin from Homebrew's own `installed_on_request` flag,
+  and a batch removal preview that separates packages still needed by
+  something you keep, predicted orphans, and Homebrew-confirmed
+  `autoremove` candidates.
+- **Ownership-aware cleanup.** Marked removals are re-checked against a
+  fresh scan right before they run, executed dependents-first with
+  manager-native commands, verified afterwards, and written to a JSON audit
+  report. See [Cleanup workflow](#cleanup-workflow).
 - **Streaming, parallel scans.** Scanners run concurrently as async tasks
   (or in a blocking pool for the filesystem walk) and stream findings into
   the UI as they're discovered — nothing waits for the slowest scanner.
@@ -29,11 +47,19 @@ packages touched, no settings changed. Honest fine print on what a scan
 *does* do:
 
 - **Read-only inspection commands are executed** (`system_profiler`, `brew`,
-  `git status`, `lsof`, …). Two worth knowing about: `brew` is always run
-  with `HOMEBREW_NO_AUTO_UPDATE=1` so it can't trigger Homebrew's
-  auto-update, and the Shell section starts an interactive `zsh` to read
-  your real login `$PATH` and measure startup time — which, by definition,
-  executes your own shell configuration files.
+  `git status`, `lsof`, …). Worth knowing about: `brew` is always run with
+  `HOMEBREW_NO_AUTO_UPDATE=1` so it can't trigger Homebrew's auto-update
+  (`brew autoremove --dry-run` is read-only), and the Shell and Global Tools
+  sections start your *login shell* (fish, zsh or bash, found via directory
+  services) to read its real `$PATH` and measure startup time — which, by
+  definition, executes your own shell configuration files. No rc file is
+  ever read or displayed. The Global Tools scan otherwise reads manager
+  metadata from disk only (optionally `npm prefix -g`): it never executes
+  the tools it finds and never imports Python modules.
+- **Health probes are explicit and bounded.** `--version` checks run only
+  when you ask (`macaudit tools verify`, or the `Verify` alternative remedy
+  on a tool), and after a cleanup for retained tools related to the batch —
+  each capped by count and timeout, and always shown as a command.
 - **macaudit writes its own state**: size caches and the catalog cache
   (`~/Library/Caches/macaudit`), and snapshot history
   (`~/.local/state/macaudit`). Never anything outside its own directories.
@@ -44,6 +70,15 @@ packages touched, no settings changed. Honest fine print on what a scan
 - **Deletions default to Trash**, not `rm -rf`. Pass `--rm` if you want real
   deletion instead; that choice is explicit, global, and visible in every
   rendered command.
+- **Cleanups are guarded, not just previewed.** Every destructive tool or
+  Homebrew remedy carries an ownership guard that is re-evaluated against a
+  fresh scan after you confirm and before anything runs (one `brew info`
+  for all Homebrew targets, a fresh manager probe for tools, `readlink` for
+  launchers, the dist-info for pip packages). A target that changed, moved,
+  is now needed by something you keep, or now belongs to another installation
+  is refused and reported, never run. `Esc` stops a running batch between
+  actions; an in-flight command is never killed. No rollback is offered —
+  versions are recorded in the report for manual reinstall guidance only.
 - **Network access is on by default, narrow, and easy to disable.** The only
   endpoints ever contacted are `formulae.brew.sh` (Homebrew cask catalog)
   and `api.github.com` (release checks), both cached to disk so repeated
@@ -65,9 +100,16 @@ macaudit                              # launch the TUI (default)
 macaudit scan --json                  # machine-readable scan, for scripts
 macaudit scan --section apps,disk     # restrict to specific sections
 macaudit clean --dry-run              # print remedy commands, run nothing
+macaudit clean --dry-run --select wget,npm:/opt/homebrew/lib/node_modules:eslint
+                                      # preview specific findings (+ preflight, Homebrew impact); --json for scripts
+macaudit tools                        # every global tool installation, its manager, class and commands
+macaudit tools --class broken,duplicate,shadowed --json
+macaudit tools verify                 # explicit, bounded `--version` probes of every tool launcher
+macaudit brew why python@3.14         # why is it installed — who needs it, up to the roots you asked for
+macaudit brew deps wget               # what does it need (direct, then transitive)
 macaudit snapshot save                # scan and store a snapshot
 macaudit snapshot list                # list stored snapshots
-macaudit snapshot diff [A B]          # diff two snapshots (defaults: latest two)
+macaudit snapshot diff [A B] [--json] # diff two snapshots (defaults: latest two)
 macaudit config path                  # print the config file path
 macaudit config edit                  # open the config file in $EDITOR
 ```
@@ -92,11 +134,15 @@ keys always switch sections, and row-movement keys always move rows.
 | `j`/`k`, `↑`/`↓` | Move selection |
 | `PgUp` / `PgDn` (`ctrl-u` / `ctrl-d`) | Page selection |
 | `space` | Mark / unmark row |
-| `enter` | Open detail (on a group header: fold/unfold) |
-| `z` | Fold / unfold the group under the cursor |
+| `enter` | Open detail (on a group header or dependency node: fold/unfold) |
+| `z` | Fold / unfold the group or dependency node under the cursor |
+| `d` | Brew: flip the explorer between *needs* and *needed by* |
 | `p` | Show / hide detail pane |
 | `J` / `K`, wheel | Scroll detail pane |
-| `x` | Execute marked remedies (confirm dialog) |
+| `e` | Cycle which remedy the row will run (e.g. launcher-only removal, `--version` probe) and mark it |
+| `v` | Preview the marked batch: refusals, Homebrew impact, what stays, follow-ups |
+| `x` | Execute marked remedies (confirm dialog; every target is re-checked before running) |
+| `c` | Reopen the last cleanup report |
 | `r` | Refresh current section's point-in-time sample |
 | `R` | Refresh all sections and save durable history |
 | `/` | Filter by substring (`esc` clears) |
@@ -122,8 +168,8 @@ last snapshot) at 100+ columns, title-only from 70-99, and hidden below 70
 | Overview source row | Jump to that section | — | — |
 | Detail pane | — | — | Scroll |
 
-Mouse works while the `/` filter box is open; the Confirm and Help modals
-swallow it.
+Mouse works while the `/` filter box is open; the Confirm, Help, Preview,
+Cleanup and Report overlays swallow it.
 
 ## Configuration
 
@@ -156,6 +202,25 @@ offline = false                  # disable all network access (overridden by --o
 catalog_max_age_days = 7         # refresh the Homebrew cask catalog at most this often
 github_max_checks_per_scan = 10  # max GitHub release lookups per scan
 github_cache_ttl_hours = 72      # how long a cached GitHub release result stays fresh
+
+[tools]
+shell_history_evidence = false   # opt in: per-command counts + last-used dates only, never raw history
+project_roots = []               # repos to correlate against; empty -> [scan] roots -> $HOME
+project_max_depth = 6            # how deep below a root to look for manifests
+project_time_budget_secs = 10    # correlation stops (and says so) past this
+verify_after_cleanup = true      # bounded --version probes of retained tools related to a batch
+verify_limit = 25
+verify_timeout_secs = 5
+write_cleanup_reports = true     # JSON audit trail under ~/.local/state/macaudit/cleanup-reports/
+extra_npm_prefixes = []          # besides Homebrew, /usr/local, ~/.npm-global and version-manager nodes
+pnpm_home = "~/Library/pnpm"
+cargo_home = "~/.cargo"
+pipx_home = "~/.local/pipx"
+uv_tool_dir = "~/.local/share/uv/tools"
+bun_home = "~/.bun"
+python_sites = []                # extra site-packages dirs to inventory
+include_apple_python = true      # /Library/Python sites: inventory only, never remedies
+# homebrew_prefix = "/opt/homebrew"   # override the Cellar prefix (default: $HOMEBREW_PREFIX, /opt/homebrew, /usr/local)
 ```
 
 ## Sections tour
@@ -164,10 +229,11 @@ github_cache_ttl_hours = 72      # how long a cached GitHub release result stays
 |---|---|
 | Resource Health | Manual CPU load, memory pressure/compression, swap, and current high-CPU/RAM processes. Root Disk explicitly distinguishes raw APFS free space from macOS available capacity, which includes purgeable space. It names the count of local Time Machine snapshots, but does not invent a byte size for them: macOS does not report a reliable per-snapshot or aggregate total. It is a point-in-time view, not a background monitor; live observations never enter snapshot diffs. |
 | Apps | Installed applications, classified System / User / cask-managed / App Store / Unmanaged, with arch (Intel/Rosetta) and code-signing info. |
-| Brew | Installed formulae and casks, dependency tree, outdated packages, casks correlated to installed `.app`s. |
-| Disk | Build artifacts (`node_modules`, `target`, `.venv`, etc.), package-manager caches, and large loose files found by a parallel filesystem walk, plus bounded top-level allocation categories with explicit coverage labels. |
+| Brew | Installed formulae and casks as an origin-grouped dependency explorer (explicitly installed / installed as dependency / unknown origin / autoremove candidates / casks) built from `brew info --json=v2 --installed` install receipts; `d` flips between *needs* and *needed by*, direct and transitive rows are distinguished, cask `depends_on` and `binary` artifacts are included. Origin comes from Homebrew's `installed_on_request` flag — a leaf is never assumed to be user-requested or unneeded; `brew autoremove --dry-run` provides the confirmed-orphan signal. Uninstall remedies exist only for packages nothing installed still needs (never `--ignore-dependencies`); outdated packages keep `brew upgrade`. |
+| Global Tools | Every installation by npm, pnpm (hashed `global/v<N>` and legacy `global/<N>` layouts), cargo, pipx, uv, pip (Homebrew, Apple and user site-packages) and bun, keyed by manager + install root + package so two copies stay distinct and stable across snapshots. Per installation: version (or `unknown`), interpreter/runtime and whether it still exists, exported commands, launchers and their targets, resolution in your login shell vs this process, ownership, project evidence, and a classification. Includes one row per command name (shell vs process resolution with every PATH candidate and its owner) and a coverage row per manager. |
+| Disk | Build artifacts (`node_modules`, `target`, `.venv`, etc.), package-manager caches, and large loose files found by a parallel filesystem walk, plus bounded top-level allocation categories with explicit coverage labels. A `target` dir is recognised by its sibling `Cargo.toml` *or* by cargo's own `.rustc_info.json`/`CACHEDIR.TAG` inside it (relocated target dirs, workspace members); its primary remedy is `cargo clean --manifest-path …` with Trash as the alternative. Artifacts inside a linked git worktree name the main repository they belong to. A pnpm-linked `node_modules` reports how much of its size is hard-linked from the pnpm store (reclaimed only by `pnpm store prune`) and estimates the real reclaim; APFS clones are not detectable and can make it smaller still. |
 | Daemons | LaunchAgents/LaunchDaemons, flagging orphaned entries whose binary no longer exists. |
-| Shell | `$PATH` duplicates and dead entries, plus shell startup time. |
+| Shell | Your login shell's `$PATH` (fish/zsh/bash): duplicates, dead entries, system dirs shadowing Homebrew, which entries MacAudit's own process cannot see (agents and apps launch with a different environment), and shell startup time. |
 | Runtimes | Language version managers (nvm/fnm/volta/mise/asdf/pyenv/rustup) and their installed toolchain versions. |
 | Docker | Reclaimable space per category (images, containers, volumes, build cache) via `docker system df`, plus active container CPU/RAM samples via one-shot `docker stats`; active samples are not stored in history. |
 | Ports | Listening TCP ports with the owning process and PID. |
@@ -175,6 +241,99 @@ github_cache_ttl_hours = 72      # how long a cached GitHub release result stays
 | Simulators | iOS Simulator devices and runtimes, with targeted delete remedies for unavailable ones. |
 | Keys | SSH keys in `~/.ssh`, flagging old or weak ones. |
 | Snapshots | Time Machine local disk snapshots, which silently consume disk space. |
+
+## Global tools
+
+What the section answers, and how honestly:
+
+- **Classification is evidence-ranked, and "review" is the default.** A tool
+  is *broken* when a launcher dangles, its interpreter is gone, or a declared
+  binary is missing; *required* when something depends on it (a Homebrew
+  formula owns the files, another package `Requires-Dist` it); *duplicate*
+  when another installation or a cask binary provides the same command;
+  *shadowed* when another copy wins resolution in your login shell;
+  *project alternative* only when a repository under your roots has the tool
+  **installed** locally (`node_modules/.bin`, `.venv/bin`, a pinned
+  bootstrap download) — a manifest line alone is listed as evidence, not an
+  alternative; *orphan* only when the manager itself confirms it. Being
+  global, old, absent from shell history, or unreferenced by any repo is
+  never treated as unnecessary.
+- **Ownership is read from metadata, never guessed from `pip list`.** In
+  Homebrew's site-packages, files symlinked into the Cellar (or `INSTALLER:
+  brew`) belong to a formula and are protected; Homebrew's own pip/
+  setuptools/wheel bootstrap is protected; `INSTALLER: pip` with real files
+  is a manual install and gets a per-package
+  `python3.X -m pip uninstall -y --break-system-packages <name>` — the
+  externally-managed override is shown on that exact action, never applied
+  silently, and there is no "uninstall everything" remedy. Apple's
+  `/Library/Python` is inventory-only; project virtual environments are
+  never inventoried.
+- **pnpm layouts are handled separately.** The current `global/v<N>` layout
+  uses `pnpm remove -g`; a legacy `global/<N>` layout is removed only with a
+  pnpm of the same major found under `~/Library/pnpm/.tools` (with explicit
+  `--global-dir`, `--store-dir` and `--virtual-store-dir` from its
+  `.modules.yaml`); otherwise only its launchers are offered. pnpm homes and
+  stores are never removal targets, and the `pnpm` package itself is
+  protected.
+- **Launchers are owned.** A launcher is removed only when it resolves into
+  the installation being removed; a same-named launcher owned by another
+  tool (uv's `~/.local/bin/mcp-proxy` next to a pipx copy, a cask's
+  `/opt/homebrew/bin/codex` next to npm's) is listed as preserved. A missing
+  uv entrypoint is reported with the note that `uv tool upgrade` may
+  recreate it — not as broken.
+- **Shell history is opt-in and aggregated.** With
+  `shell_history_evidence = true`, only per-command invocation counts and
+  the most recent timestamp are recorded, for command names the scan already
+  knows; raw lines, arguments and anything secret-shaped never leave the
+  parser, and a match is supporting evidence only.
+
+## Cleanup workflow
+
+1. **Discover** — the Global Tools and Brew sections (or `macaudit tools`,
+   `macaudit brew why <x>`).
+2. **Inspect** — the detail pane: classification reasons, per-command
+   resolution, launchers, project evidence, interpreter ownership, and for
+   Homebrew the requested roots that keep a dependency plus its single-package
+   removal preview.
+3. **Mark** — `space` on any row, including dependency nodes in the
+   explorer (a shared dependency marked under one parent is marked
+   everywhere); `e` picks an alternative remedy such as launcher-only
+   removal.
+4. **Preview** — `v` shows the batch: exact commands in execution order,
+   refusals with reasons, Homebrew impact (still-needed packages stay,
+   predicted orphans, brew-confirmed orphans, unknown-origin candidates),
+   preserved launchers, follow-ups.
+5. **Confirm** — `x` opens the same model as a confirm dialog.
+6. **Execute** — after `y`, every target is re-checked against fresh data,
+   then the batch runs dependents-first (Homebrew, then manager-native
+   uninstalls, then launcher-only removals, then `brew autoremove` last).
+   `Esc` stops after the current action.
+7. **Verify** — the touched sections rescan, `brew autoremove --dry-run` is
+   re-run so newly unneeded dependencies are offered from fresh data,
+   retained tools related to the batch get bounded `--version` probes
+   (run before *and* after, so a failure that already existed is reported as
+   pre-existing, not as a regression), and the report (`c`) lists what ran,
+   failed, was cancelled or refused, plus the verification table. The same
+   report is written to `~/.local/state/macaudit/cleanup-reports/<ts>.json`.
+
+Marks whose findings vanish on a rescan are dropped and announced; an open
+confirm dialog is rebuilt so it can never reference a stale target.
+
+### Known limitations
+
+- Legacy pnpm layouts are removable natively only when a same-major pnpm
+  exists locally; other pnpm layouts than `global/<N>` / `global/v<N>` are
+  not understood.
+- Current Homebrew does not report `installed_as_dependency`; origin relies
+  on `installed_on_request` alone and is `unknown` when that flag is absent.
+- Python `Requires-Dist` markers other than `extra ==` are not evaluated
+  (they are listed as unevaluated). Apple and application-bundled Pythons
+  are inventory-only.
+- Login shells other than fish, zsh and bash fall back to the process PATH
+  (the coverage row says so).
+- Snapshots written by this version carry new finding kinds and remedy
+  fields; older MacAudit binaries cannot read them (older snapshots still
+  load here).
 
 ## License
 

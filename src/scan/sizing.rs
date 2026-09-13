@@ -108,6 +108,80 @@ pub fn du_blocks_bounded(
     }
 }
 
+/// `du_blocks` plus how many of those bytes belong to files that are also
+/// hard-linked from *outside* `root` (their `st_nlink` exceeds the links
+/// seen inside the walk). Deleting `root` reclaims at most
+/// `bytes - externally_linked`. APFS reflink clones are indistinguishable
+/// from copies here and are *not* detected.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SharedSize {
+    pub bytes: u64,
+    pub externally_linked: u64,
+}
+
+pub fn du_blocks_shared(root: &Path, cancelled: &dyn Fn() -> bool) -> SharedSize {
+    #[cfg(unix)]
+    {
+        use std::collections::HashMap;
+        use std::os::unix::fs::MetadataExt;
+        // (dev, ino) → (nlink on disk, links seen in this walk, bytes)
+        let mut linked: HashMap<(u64, u64), (u64, u64, u64)> = HashMap::new();
+        let mut total = 0u64;
+        let mut stack = vec![root.to_path_buf()];
+        let mut counter = 0u32;
+        while let Some(dir) = stack.pop() {
+            counter = counter.wrapping_add(1);
+            if counter.is_multiple_of(256) && cancelled() {
+                break;
+            }
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(meta) = entry.metadata() else {
+                    continue;
+                };
+                if meta.is_symlink() {
+                    continue;
+                }
+                if meta.is_dir() {
+                    stack.push(entry.path());
+                    continue;
+                }
+                let bytes = on_disk_bytes(&meta);
+                if meta.nlink() > 1 {
+                    let e =
+                        linked
+                            .entry((meta.dev(), meta.ino()))
+                            .or_insert((meta.nlink(), 0, bytes));
+                    if e.1 == 0 {
+                        total = total.saturating_add(bytes);
+                    }
+                    e.1 += 1;
+                } else {
+                    total = total.saturating_add(bytes);
+                }
+            }
+        }
+        let externally_linked = linked
+            .values()
+            .filter(|(nlink, seen, _)| seen < nlink)
+            .map(|(_, _, b)| *b)
+            .sum();
+        SharedSize {
+            bytes: total,
+            externally_linked,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        SharedSize {
+            bytes: du_blocks(root, cancelled),
+            externally_linked: 0,
+        }
+    }
+}
+
 /// On-disk bytes for a single file's metadata (blocks * 512 on Unix).
 #[cfg(unix)]
 pub fn on_disk_bytes(meta: &std::fs::Metadata) -> u64 {
@@ -213,5 +287,33 @@ mod tests {
         );
         assert!(!result.complete);
         assert!(result.entries > 3);
+    }
+
+    #[test]
+    fn shared_size_counts_external_hard_links_but_not_internal_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("store");
+        let nm = tmp.path().join("node_modules/.pnpm/pkg");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&nm).unwrap();
+        // 4 KiB file linked from the store (external) …
+        let ext = store.join("big");
+        std::fs::write(&ext, vec![b'x'; 4096]).unwrap();
+        std::fs::hard_link(&ext, nm.join("big")).unwrap();
+        // … a file hard-linked twice *inside* the tree (internal only) …
+        let inner = nm.join("a");
+        std::fs::write(&inner, vec![b'y'; 4096]).unwrap();
+        std::fs::hard_link(&inner, nm.join("b")).unwrap();
+        // … and a plain file.
+        std::fs::write(nm.join("plain"), vec![b'z'; 4096]).unwrap();
+        let s = du_blocks_shared(&tmp.path().join("node_modules"), &|| false);
+        let ext_bytes = on_disk_bytes(&std::fs::metadata(&ext).unwrap());
+        assert_eq!(s.externally_linked, ext_bytes);
+        // Internal double link counted once; total = big + a + plain.
+        assert_eq!(s.bytes, ext_bytes * 3);
+        assert_eq!(
+            s.bytes,
+            du_blocks(&tmp.path().join("node_modules"), &|| false)
+        );
     }
 }

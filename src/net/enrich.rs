@@ -103,6 +103,8 @@ pub async fn enrich(
             },
             reclaims_bytes: None,
             destructive: false,
+            alternative: false,
+            guard: None,
         };
         let rendered = remedy.command.rendered();
         if !f.remedies.iter().any(|r| r.command.rendered() == rendered) {
@@ -273,6 +275,8 @@ mod tests {
             },
             reclaims_bytes: None,
             destructive: false,
+            alternative: false,
+            guard: None,
         });
         let id = app.id;
         insert(&mut map, app);

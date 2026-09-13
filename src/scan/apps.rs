@@ -290,6 +290,8 @@ impl Scanner for AppsScanner {
                 },
                 reclaims_bytes: None,
                 destructive: false,
+                alternative: false,
+                guard: None,
             });
 
             if rosetta_flag {

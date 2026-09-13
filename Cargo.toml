@@ -37,6 +37,10 @@ async-trait = "0.1.89"
 crossbeam-channel = "0.5"
 
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "gzip", "http2"] }
+regex = "1.13.1"
+which = "8.0.6"
+node-semver = "2.2.0"
+semver = "1.0.28"
 
 [dev-dependencies]
 insta = "1"

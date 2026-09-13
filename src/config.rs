@@ -69,6 +69,29 @@ impl Paths {
         vec![self.home.clone()]
     }
 
+    /// The `$PATH` of *this* process, split into entries. Kept here so the
+    /// environment is read in exactly one module; scanners compare it against
+    /// the user's login-shell PATH rather than assuming they match.
+    pub fn process_path() -> Vec<PathBuf> {
+        std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).collect())
+            .unwrap_or_default()
+    }
+
+    /// The login shell advertised to this process (`$SHELL`), if any. Only a
+    /// fallback — the directory-services record is authoritative.
+    pub fn env_shell() -> Option<PathBuf> {
+        std::env::var_os("SHELL").map(PathBuf::from)
+    }
+
+    /// The account name derived from the home directory (`/Users/<name>`).
+    pub fn user_name(&self) -> Option<String> {
+        self.home
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+    }
+
     /// Path to the config file.
     pub fn config_file(&self) -> PathBuf {
         self.config_dir.join("config.toml")
@@ -90,6 +113,71 @@ pub struct Config {
     pub artifacts: ArtifactsConfig,
     pub behavior: BehaviorConfig,
     pub network: NetworkConfig,
+    pub tools: ToolsConfig,
+}
+
+/// Global developer-tool audit (`[tools]`). Every path is tilde-expanded at
+/// use; every knob defaults to the layout the managers use on macOS.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolsConfig {
+    /// Opt in to aggregated shell-history evidence (counts and last-used
+    /// dates per command only — raw history lines are never stored or shown).
+    pub shell_history_evidence: bool,
+    /// Repository roots to correlate against. Empty ⇒ `scan.roots` ⇒ `[home]`.
+    pub project_roots: Vec<String>,
+    /// How deep below a root to look for project manifests.
+    pub project_max_depth: usize,
+    /// Time budget for project correlation; exceeding it marks coverage truncated.
+    pub project_time_budget_secs: u64,
+    /// After a cleanup, run bounded `--version` probes on retained tools related
+    /// to the batch (duplicates, shadow peers, dependents).
+    pub verify_after_cleanup: bool,
+    /// Maximum number of probes per cleanup.
+    pub verify_limit: usize,
+    /// Per-probe timeout.
+    pub verify_timeout_secs: u64,
+    /// Persist a JSON audit report of every cleanup under
+    /// `<state_dir>/cleanup-reports/`.
+    pub write_cleanup_reports: bool,
+    /// Additional npm global prefixes to inspect (besides the well-known ones).
+    pub extra_npm_prefixes: Vec<String>,
+    pub pnpm_home: String,
+    pub cargo_home: String,
+    pub pipx_home: String,
+    pub uv_tool_dir: String,
+    pub bun_home: String,
+    /// Additional Python site-packages directories to inventory.
+    pub python_sites: Vec<String>,
+    /// Inventory Apple's `/Library/Python` sites (never offers remedies there).
+    pub include_apple_python: bool,
+    /// Override the Homebrew prefix (default: `$HOMEBREW_PREFIX`, then
+    /// `/opt/homebrew`, then `/usr/local`, whichever has a `Cellar/`).
+    pub homebrew_prefix: Option<String>,
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        ToolsConfig {
+            shell_history_evidence: false,
+            project_roots: Vec::new(),
+            project_max_depth: 6,
+            project_time_budget_secs: 10,
+            verify_after_cleanup: true,
+            verify_limit: 25,
+            verify_timeout_secs: 5,
+            write_cleanup_reports: true,
+            extra_npm_prefixes: Vec::new(),
+            pnpm_home: "~/Library/pnpm".to_string(),
+            cargo_home: "~/.cargo".to_string(),
+            pipx_home: "~/.local/pipx".to_string(),
+            uv_tool_dir: "~/.local/share/uv/tools".to_string(),
+            bun_home: "~/.bun".to_string(),
+            python_sites: Vec::new(),
+            include_apple_python: true,
+            homebrew_prefix: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

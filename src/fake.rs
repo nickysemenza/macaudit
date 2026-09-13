@@ -10,13 +10,13 @@
 //! so this doubles as a seed for the UI ↔ scanner contract: if a real scanner
 //! changes its `meta` shape, this file should change with it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::model::{Finding, FindingKind, Remedy, RemedyCommand, ScannerId, Severity};
+use crate::model::{Finding, FindingKind, Guard, Remedy, RemedyCommand, ScannerId, Severity};
 use crate::scan::{ScanCtx, Scanner};
 
 const MIB: u64 = 1024 * 1024;
@@ -38,6 +38,8 @@ fn reveal(path: &str) -> Remedy {
         },
         reclaims_bytes: None,
         destructive: false,
+        alternative: false,
+        guard: None,
     }
 }
 
@@ -49,6 +51,8 @@ fn trash(path: &str, reclaims_bytes: Option<u64>) -> Remedy {
         },
         reclaims_bytes,
         destructive: true,
+        alternative: false,
+        guard: None,
     }
 }
 
@@ -70,6 +74,7 @@ pub fn fixtures(id: ScannerId) -> Vec<Finding> {
         ScannerId::Simulator => simulator_fixtures(),
         ScannerId::SshKeys => ssh_keys_fixtures(),
         ScannerId::TmSnapshots => tm_snapshots_fixtures(),
+        ScannerId::Tools => tools_fixtures(),
     }
 }
 
@@ -301,102 +306,487 @@ fn apps_fixtures() -> Vec<Finding> {
     ]
 }
 
-/// Mirrors `src/scan/brew.rs`: BrewFormula meta name/version/is_leaf/
-/// dependencies/dependents/outdated/current_version, detail
-/// `"leaf — {ver}"` / `"dependency — {ver}"`; BrewCask meta token/name/
-/// version/app_paths/outdated/current_version, detail `"cask — {ver}"`.
+/// Mirrors `src/scan/brew.rs`: BrewFormula meta name/full_name/version/
+/// install_reason (requested|dependency|unknown, from installed_on_request)/
+/// is_leaf/dependencies/dependents (+ `_transitive`)/autoremove_candidate/
+/// removal_preview/group, detail `"{reason} — {ver}[ · leaf]"`; BrewCask meta
+/// token/version/app_paths/binaries/depends_on/cask_dependents/group=Casks;
+/// plus the `__autoremove__` summary row.
 fn brew_fixtures() -> Vec<Finding> {
+    struct F<'a> {
+        name: &'a str,
+        version: &'a str,
+        reason: &'a str,
+        deps: &'a [&'a str],
+        deps_t: &'a [&'a str],
+        used_by: &'a [&'a str],
+        used_by_t: &'a [&'a str],
+        auto: bool,
+    }
+    fn formula(f: F<'_>) -> Finding {
+        let F {
+            name,
+            version,
+            reason,
+            deps,
+            deps_t,
+            used_by,
+            used_by_t,
+            auto,
+        } = f;
+        let leaf = used_by.is_empty() && used_by_t.is_empty();
+        let group = if auto {
+            "Autoremove candidates"
+        } else {
+            match reason {
+                "requested" => "Explicitly installed",
+                "dependency" => "Installed as dependency",
+                _ => "Unknown origin",
+            }
+        };
+        let mut detail = format!("{reason} — {version}");
+        if leaf {
+            detail.push_str(" · leaf");
+        }
+        if auto {
+            detail.push_str(" · brew autoremove candidate");
+        }
+        let on_request = match reason {
+            "requested" => json!(true),
+            "dependency" => json!(false),
+            _ => json!(null),
+        };
+        let mut f = Finding::new(FindingKind::BrewFormula, name, name)
+            .detail(detail)
+            .path(PathBuf::from(format!("/opt/homebrew/Cellar/{name}")))
+            .severity(if auto { Severity::Reclaimable } else { Severity::Info })
+            .provenance("brew info --json=v2 --installed (install receipt runtime_dependencies); brew autoremove --dry-run")
+            .meta(json!({
+                "name": name, "full_name": name, "tap": "homebrew/core", "aliases": [],
+                "version": version, "install_reason": reason, "installed_on_request": on_request,
+                "installed_as_dependency": null, "is_leaf": leaf, "pinned": false,
+                "outdated": false, "current_version": null,
+                "dependencies": deps, "dependents": used_by,
+                "dependencies_transitive": deps_t, "dependents_transitive": used_by_t,
+                "cask_dependents": [], "dependency_source": "installed_runtime",
+                "why_installed": { "reason": reason, "requested_roots": used_by_t.iter().chain(used_by.iter()).collect::<Vec<_>>(), "paths": [] },
+                "autoremove_candidate": auto,
+                "removal_preview": { "removable": leaf, "blocked_by": used_by, "would_orphan": [], "confirmed_orphans": [], "uncertain_orphans": [] },
+                "graph_caveats": [], "completeness": "full", "group": group,
+            }));
+        if leaf {
+            f = f.remedy(
+                Remedy::new(
+                    "Uninstall formula",
+                    RemedyCommand::Shell {
+                        program: "brew".to_string(),
+                        args: vec!["uninstall".to_string(), name.to_string()],
+                    },
+                )
+                .destructive()
+                .guard(Guard::BrewFormula {
+                    full_name: name.to_string(),
+                    expected_version: Some(version.to_string()),
+                    require_no_retained_dependents: true,
+                }),
+            );
+        }
+        f
+    }
+    fn cask(
+        token: &str,
+        version: &str,
+        app: &str,
+        binary: Option<&str>,
+        formula_deps: &[&str],
+    ) -> Finding {
+        let binaries = match binary {
+            Some(b) => {
+                json!([{ "source": format!("bin/{b}"), "target": format!("/opt/homebrew/bin/{b}") }])
+            }
+            None => json!([]),
+        };
+        Finding::new(FindingKind::BrewCask, token, token)
+            .detail(format!("cask — {version}"))
+            .severity(Severity::Info)
+            .provenance("brew info --json=v2 --installed")
+            .meta(json!({
+                "token": token, "name": token, "version": version,
+                "app_paths": [format!("/Applications/{app}")], "binaries": binaries,
+                "depends_on": { "formula": formula_deps, "cask": [] }, "cask_dependents": [],
+                "outdated": false, "current_version": null, "completeness": "full", "group": "Casks",
+            }))
+            .remedy(
+                Remedy::new(
+                    "Uninstall cask",
+                    RemedyCommand::Shell {
+                        program: "brew".to_string(),
+                        args: vec!["uninstall".to_string(), "--cask".to_string(), token.to_string()],
+                    },
+                )
+                .destructive()
+                .guard(Guard::BrewCask { token: token.to_string(), expected_version: Some(version.to_string()) }),
+            )
+    }
+    let mut wget = formula(F {
+        name: "wget",
+        version: "1.21.4",
+        reason: "requested",
+        deps: &["libidn2", "openssl@3"],
+        deps_t: &["libunistring"],
+        used_by: &[],
+        used_by_t: &[],
+        auto: false,
+    })
+    .severity(Severity::Attention)
+    .detail("requested — 1.21.4 · leaf · 1.24.5 available");
+    if let Some(m) = wget.meta.as_object_mut() {
+        m.insert("outdated".into(), json!(true));
+        m.insert("current_version".into(), json!("1.24.5"));
+    }
+    wget.remedies.insert(
+        0,
+        Remedy::new(
+            "Upgrade to 1.24.5",
+            RemedyCommand::Shell {
+                program: "brew".to_string(),
+                args: vec!["upgrade".to_string(), "wget".to_string()],
+            },
+        ),
+    );
     vec![
-        Finding::new(FindingKind::BrewFormula, "ripgrep", "ripgrep")
-            .detail("leaf — 14.1.0")
-            .severity(Severity::Info)
-            .meta(json!({
-                "name": "ripgrep", "version": "14.1.0", "is_leaf": true,
-                "dependencies": [], "dependents": [], "outdated": false,
-                "current_version": null,
-            })),
-        Finding::new(FindingKind::BrewFormula, "jq", "jq")
-            .detail("leaf — 1.7.1")
-            .severity(Severity::Info)
-            .meta(json!({
-                "name": "jq", "version": "1.7.1", "is_leaf": true,
-                "dependencies": ["oniguruma"], "dependents": [], "outdated": false,
-                "current_version": null,
-            })),
-        Finding::new(FindingKind::BrewFormula, "openssl@3", "openssl@3")
-            .detail("dependency — 3.3.1")
-            .severity(Severity::Info)
-            .meta(json!({
-                "name": "openssl@3", "version": "3.3.1", "is_leaf": false,
-                "dependencies": [], "dependents": ["ripgrep", "python@3.12"],
-                "outdated": false, "current_version": null,
-            })),
-        Finding::new(FindingKind::BrewFormula, "python@3.12", "python@3.12")
-            .detail("dependency — 3.12.3")
-            .severity(Severity::Info)
-            .meta(json!({
-                "name": "python@3.12", "version": "3.12.3", "is_leaf": false,
-                "dependencies": ["openssl@3"], "dependents": ["pyenv-build-helper"],
-                "outdated": false, "current_version": null,
-            })),
-        Finding::new(FindingKind::BrewFormula, "wget", "wget")
-            .detail("leaf — 1.21.4")
-            .severity(Severity::Attention)
-            .meta(json!({
-                "name": "wget", "version": "1.21.4", "is_leaf": true,
-                "dependencies": ["openssl@3"], "dependents": [], "outdated": true,
-                "current_version": "1.24.5",
-            }))
-            .remedy(Remedy {
-                label: "Upgrade to 1.24.5".to_string(),
-                command: RemedyCommand::Shell {
-                    program: "brew".to_string(),
-                    args: vec!["upgrade".to_string(), "wget".to_string()],
-                },
-                reclaims_bytes: None,
-                destructive: false,
+        formula(F { name: "ripgrep", version: "14.1.0", reason: "requested", deps: &["pcre2"], deps_t: &[], used_by: &[], used_by_t: &[], auto: false }),
+        formula(F { name: "jq", version: "1.7.1", reason: "requested", deps: &["oniguruma"], deps_t: &[], used_by: &[], used_by_t: &[], auto: false }),
+        wget,
+        formula(F { name: "python@3.14", version: "3.14.7", reason: "requested", deps: &["openssl@3", "sqlite", "xz"], deps_t: &["ca-certificates"], used_by: &["pgcli", "pre-commit", "yt-dlp"], used_by_t: &[], auto: false }),
+        formula(F { name: "pgcli", version: "4.3.0", reason: "requested", deps: &["python@3.14"], deps_t: &["openssl@3", "sqlite", "xz", "ca-certificates"], used_by: &[], used_by_t: &[], auto: false }),
+        formula(F { name: "pre-commit", version: "4.3.0", reason: "requested", deps: &["python@3.14"], deps_t: &["openssl@3", "sqlite", "xz", "ca-certificates"], used_by: &[], used_by_t: &[], auto: false }),
+        formula(F { name: "yt-dlp", version: "2026.09.01", reason: "requested", deps: &["python@3.14"], deps_t: &["openssl@3", "sqlite", "xz", "ca-certificates"], used_by: &[], used_by_t: &[], auto: false }),
+        formula(F { name: "openssl@3", version: "3.6.3", reason: "dependency", deps: &["ca-certificates"], deps_t: &[], used_by: &["python@3.14", "wget"], used_by_t: &["pgcli", "pre-commit", "yt-dlp"], auto: false }),
+        formula(F { name: "libidn2", version: "2.3.7", reason: "dependency", deps: &["libunistring"], deps_t: &[], used_by: &["wget"], used_by_t: &[], auto: false }),
+        formula(F { name: "libunistring", version: "1.2", reason: "dependency", deps: &[], deps_t: &[], used_by: &["libidn2"], used_by_t: &["wget"], auto: false }),
+        formula(F { name: "pcre2", version: "10.43", reason: "dependency", deps: &[], deps_t: &[], used_by: &["ripgrep"], used_by_t: &[], auto: false }),
+        formula(F { name: "oniguruma", version: "6.9.9", reason: "dependency", deps: &[], deps_t: &[], used_by: &["jq"], used_by_t: &[], auto: false }),
+        formula(F { name: "libevent", version: "2.1.13", reason: "dependency", deps: &[], deps_t: &[], used_by: &[], used_by_t: &[], auto: true }),
+        formula(F { name: "oldlib", version: "0.1", reason: "unknown", deps: &[], deps_t: &[], used_by: &[], used_by_t: &[], auto: false }),
+        cask("docker", "4.29.0", "Docker.app", None, &[]),
+        cask("visual-studio-code", "1.89.1", "Visual Studio Code.app", Some("code"), &[]),
+        cask("pdftk-java", "3.3.3", "PDFtk.app", Some("pdftk"), &["openjdk"]),
+        Finding::new(FindingKind::BrewFormula, "__autoremove__", "Homebrew autoremove candidates")
+            .detail("1 formula(e) Homebrew reports as no longer needed: libevent")
+            .severity(Severity::Reclaimable)
+            .provenance("brew autoremove --dry-run")
+            .meta(json!({ "candidates": ["libevent"], "source": "brew autoremove --dry-run", "group": "Autoremove candidates" }))
+            .remedy(
+                Remedy::new(
+                    "Remove all unneeded dependencies",
+                    RemedyCommand::Shell { program: "brew".into(), args: vec!["autoremove".into()] },
+                )
+                .destructive(),
+            ),
+    ]
+}
+
+/// Mirrors `src/scan/global_tools`: GlobalTool meta manager/layout/name/
+/// version (null = unknown)/identity_key/root/commands/launchers/resolution/
+/// classifications/primary_classification/completeness/removal/group;
+/// CommandResolution meta command/user_shell/user_resolution/
+/// process_resolution/differs/candidates; one ToolCoverage `__coverage__`.
+/// Scenarios are the real ones from the 2026-09-13 cleanup: an npm codex
+/// shadowed by a cask binary, dangling pnpm launchers left in npm's bin, a
+/// legacy pnpm global dir, a pipx venv on a removed interpreter, a uv tool
+/// with a missing entrypoint, brew-owned vs pip-installed site packages.
+fn tools_fixtures() -> Vec<Finding> {
+    struct Spec<'a> {
+        manager: &'a str,
+        root: &'a str,
+        name: &'a str,
+        version: Option<&'a str>,
+        class: &'a str,
+        detail: &'a str,
+        severity: Severity,
+    }
+    fn tool(spec: Spec<'_>, extra: serde_json::Value) -> Finding {
+        let Spec {
+            manager,
+            root,
+            name,
+            version,
+            class,
+            detail,
+            severity,
+        } = spec;
+        let key = format!("{manager}:{root}:{name}");
+        let mut meta = json!({
+            "manager": manager,
+            "layout": null,
+            "name": name,
+            "version": version,
+            "identity_key": key,
+            "root": root,
+            "root_realpath": null,
+            "install_dir": format!("{root}/{name}"),
+            "runtime": null,
+            "commands": [{ "name": name, "declared_target": null }],
+            "launchers": [],
+            "foreign_launchers": [],
+            "resolution": { name: { "user_shell": null, "process": null, "status": "unknown", "shadowed_by": null, "candidates": [] } },
+            "classifications": [{ "kind": class }],
+            "primary_classification": class,
+            "evidence": [],
+            "project_refs": [],
+            "project_coverage": null,
+            "history": null,
+            "completeness": { "level": "full", "missing": [] },
+            "protected": null,
+            "removal": { "native": null, "launcher_only": [], "refusals": [], "follow_up": [] },
+            "manager_extra": {},
+            "group": format!("{manager} ({})", root.replace("/Users/nicky", "~")),
+        });
+        if let (Some(base), Some(over)) = (meta.as_object_mut(), extra.as_object()) {
+            for (k, v) in over {
+                base.insert(k.clone(), v.clone());
+            }
+        }
+        Finding::new(FindingKind::GlobalTool, &key, name)
+            .detail(detail)
+            .path(PathBuf::from(format!("{root}/{name}")))
+            .severity(severity)
+            .provenance("package metadata + launcher inspection")
+            .meta(meta)
+    }
+    let native = |program: &str, args: &[&str]| -> Remedy {
+        Remedy {
+            label: format!(
+                "Uninstall via {}",
+                Path::new(program)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(program)
+            ),
+            command: RemedyCommand::Shell {
+                program: program.to_string(),
+                args: args.iter().map(|a| a.to_string()).collect(),
+            },
+            reclaims_bytes: None,
+            destructive: true,
+            alternative: false,
+            guard: None,
+        }
+    };
+    vec![
+        tool(
+            Spec {
+                manager: "npm",
+                root: "/opt/homebrew/lib/node_modules",
+                name: "@openai/codex",
+                version: Some("0.118.0"),
+                class: "shadowed",
+                detail: "shadowed — /opt/homebrew/bin/codex is the cask binary, not this npm copy",
+                severity: Severity::Attention,
+            },
+            json!({
+                "commands": [{ "name": "codex", "declared_target": "bin/codex.js" }],
+                "launchers": [],
+                "foreign_launchers": [{ "path": "/opt/homebrew/bin/codex", "owner": { "kind": "homebrew_cask", "token": "codex" } }],
+                "resolution": { "codex": { "user_shell": "/opt/homebrew/bin/codex", "process": "/opt/homebrew/bin/codex", "status": "shadowed", "shadowed_by": "/opt/homebrew/bin/codex", "candidates": [["/opt/homebrew/bin/codex", { "kind": "homebrew_cask", "token": "codex" }]] } },
+                "classifications": [{ "kind": "duplicate", "peers": ["brew_cask:codex"] }, { "kind": "shadowed", "by": "/opt/homebrew/bin/codex", "owner": { "kind": "homebrew_cask", "token": "codex" } }],
+                "primary_classification": "shadowed",
+                "removal": { "native": { "program": "/opt/homebrew/bin/npm", "args": ["uninstall", "-g", "@openai/codex"] }, "launcher_only": [], "refusals": [], "follow_up": ["the cask binary /opt/homebrew/bin/codex stays"] },
             }),
-        Finding::new(FindingKind::BrewCask, "docker", "docker")
-            .detail("cask — 4.29.0")
-            .severity(Severity::Info)
-            .meta(json!({
-                "token": "docker", "name": "docker", "version": "4.29.0",
-                "app_paths": ["/Applications/Docker.app"], "outdated": false,
-                "current_version": null,
-            })),
-        Finding::new(
-            FindingKind::BrewCask,
-            "visual-studio-code",
-            "visual-studio-code",
         )
-        .detail("cask — 1.89.1")
-        .severity(Severity::Info)
-        .meta(json!({
-            "token": "visual-studio-code", "name": "visual-studio-code",
-            "version": "1.89.1", "app_paths": ["/Applications/Visual Studio Code.app"],
-            "outdated": false, "current_version": null,
-        })),
-        Finding::new(FindingKind::BrewCask, "rectangle", "rectangle")
-            .detail("cask — 0.77")
-            .severity(Severity::Attention)
-            .meta(json!({
-                "token": "rectangle", "name": "rectangle", "version": "0.77",
-                "app_paths": ["/Applications/Rectangle.app"], "outdated": true,
-                "current_version": "0.83",
-            }))
-            .remedy(Remedy {
-                label: "Upgrade to 0.83".to_string(),
-                command: RemedyCommand::Shell {
-                    program: "brew".to_string(),
-                    args: vec![
-                        "upgrade".to_string(),
-                        "--cask".to_string(),
-                        "rectangle".to_string(),
-                    ],
-                },
-                reclaims_bytes: None,
-                destructive: false,
+        .size(48 * 1024 * 1024)
+        .remedy(native("/opt/homebrew/bin/npm", &["uninstall", "-g", "@openai/codex"])),
+        tool(
+            Spec {
+                manager: "npm",
+                root: "/opt/homebrew/lib/node_modules",
+                name: "pnpm",
+                version: None,
+                class: "broken",
+                detail: "broken — launchers pn, pnpx, pnx dangle into a removed package",
+                severity: Severity::Attention,
+            },
+            json!({
+                "commands": [],
+                "launchers": [
+                    { "path": "/opt/homebrew/bin/pn", "kind": "symlink", "target": "../lib/node_modules/pnpm/pn", "target_exists": false, "owner": { "kind": "this_install" } },
+                    { "path": "/opt/homebrew/bin/pnpx", "kind": "symlink", "target": "../lib/node_modules/pnpm/pnpx", "target_exists": false, "owner": { "kind": "this_install" } },
+                    { "path": "/opt/homebrew/bin/pnx", "kind": "symlink", "target": "../lib/node_modules/pnpm/pnx", "target_exists": false, "owner": { "kind": "this_install" } }
+                ],
+                "classifications": [{ "kind": "broken", "reason": "3 launchers point at a package that is no longer installed" }],
+                "primary_classification": "broken",
+                "removal": { "native": null, "launcher_only": ["/opt/homebrew/bin/pn", "/opt/homebrew/bin/pnpx", "/opt/homebrew/bin/pnx"], "refusals": [], "follow_up": [] },
             }),
+        )
+        .remedy(Remedy {
+            label: "Remove dangling launcher pn".to_string(),
+            command: RemedyCommand::Trash { path: PathBuf::from("/opt/homebrew/bin/pn") },
+            reclaims_bytes: None,
+            destructive: true,
+            alternative: false,
+            guard: Some(Guard::Launcher { path: PathBuf::from("/opt/homebrew/bin/pn"), expected_target: Some(PathBuf::from("../lib/node_modules/pnpm/pn")), expect_dangling: true, owner_key: "npm:/opt/homebrew/lib/node_modules:pnpm".to_string() }),
+        }),
+        tool(
+            Spec {
+                manager: "pnpm",
+                root: "/Users/nicky/Library/pnpm/global/5",
+                name: "clawhub",
+                version: Some("0.7.0"),
+                class: "review",
+                detail: "legacy pnpm layout 5 (pnpm@10.30.0 store) — current `pnpm ls -g` does not list it",
+                severity: Severity::Info,
+            },
+            json!({
+                "layout": "legacy-5",
+                "commands": [{ "name": "clawhub", "declared_target": "dist/cli.js" }, { "name": "clawdhub", "declared_target": "dist/cli.js" }],
+                "launchers": [
+                    { "path": "/Users/nicky/Library/pnpm/clawhub", "kind": "sh_shim", "target": "/Users/nicky/Library/pnpm/global/5/node_modules/clawhub/dist/cli.js", "target_exists": true, "owner": { "kind": "this_install" } },
+                    { "path": "/Users/nicky/Library/pnpm/clawdhub", "kind": "sh_shim", "target": "/Users/nicky/Library/pnpm/global/5/node_modules/clawhub/dist/cli.js", "target_exists": true, "owner": { "kind": "this_install" } }
+                ],
+                "resolution": { "clawhub": { "user_shell": "/Users/nicky/Library/pnpm/clawhub", "process": null, "status": "active_in_shell", "shadowed_by": null, "candidates": [] }, "clawdhub": { "user_shell": "/Users/nicky/Library/pnpm/clawdhub", "process": null, "status": "active_in_shell", "shadowed_by": null, "candidates": [] } },
+                "classifications": [{ "kind": "review", "reason": "no project references; legacy layout not shown by the current pnpm" }],
+                "manager_extra": { "layout_version": 5, "package_manager": "pnpm@10.30.0", "store_dir": "/Users/nicky/Library/pnpm/store/v10", "virtual_store_dir": "/Users/nicky/Library/pnpm/global/5/.pnpm", "matching_local_pnpm": "/Users/nicky/Library/pnpm/.tools/@pnpm+macos-arm64/10.30.0/bin/pnpm" },
+                "removal": { "native": { "program": "/Users/nicky/Library/pnpm/.tools/@pnpm+macos-arm64/10.30.0/bin/pnpm", "args": ["remove", "-g", "clawhub", "--global-dir", "/Users/nicky/Library/pnpm/global/5", "--store-dir", "/Users/nicky/Library/pnpm/store/v10", "--virtual-store-dir", "/Users/nicky/Library/pnpm/global/5/.pnpm"] }, "launcher_only": ["/Users/nicky/Library/pnpm/clawhub", "/Users/nicky/Library/pnpm/clawdhub"], "refusals": [], "follow_up": ["never remove ~/Library/pnpm/global or the store wholesale"] },
+            }),
+        )
+        .size(21 * 1024 * 1024)
+        .remedy(native("/Users/nicky/Library/pnpm/.tools/@pnpm+macos-arm64/10.30.0/bin/pnpm", &["remove", "-g", "clawhub", "--global-dir", "/Users/nicky/Library/pnpm/global/5", "--store-dir", "/Users/nicky/Library/pnpm/store/v10", "--virtual-store-dir", "/Users/nicky/Library/pnpm/global/5/.pnpm"])),
+        tool(
+            Spec {
+                manager: "cargo",
+                root: "/Users/nicky/.cargo",
+                name: "wasm-pack",
+                version: Some("0.14.0"),
+                class: "duplicate",
+                detail: "duplicate — npm also installs wasm-pack 0.13.1, and that copy wins in the login shell",
+                severity: Severity::Attention,
+            },
+            json!({
+                "launchers": [{ "path": "/Users/nicky/.cargo/bin/wasm-pack", "kind": "regular_binary", "target": null, "target_exists": true, "owner": { "kind": "this_install" } }],
+                "resolution": { "wasm-pack": { "user_shell": "/opt/homebrew/bin/wasm-pack", "process": "/Users/nicky/.cargo/bin/wasm-pack", "status": "shadowed", "shadowed_by": "/opt/homebrew/bin/wasm-pack", "candidates": [["/opt/homebrew/bin/wasm-pack", { "kind": "other_tool", "manager": "npm", "identity_key": "npm:/opt/homebrew/lib/node_modules:wasm-pack" }], ["/Users/nicky/.cargo/bin/wasm-pack", { "kind": "this_install" }]] } },
+                "classifications": [{ "kind": "duplicate", "peers": ["npm:/opt/homebrew/lib/node_modules:wasm-pack"] }, { "kind": "shadowed", "by": "/opt/homebrew/bin/wasm-pack", "owner": { "kind": "other_tool", "manager": "npm", "identity_key": "npm:/opt/homebrew/lib/node_modules:wasm-pack" } }],
+                "primary_classification": "duplicate",
+                "removal": { "native": { "program": "cargo", "args": ["uninstall", "wasm-pack", "--root", "/Users/nicky/.cargo"] }, "launcher_only": [], "refusals": [], "follow_up": [] },
+                "manager_extra": { "source": "registry+https://github.com/rust-lang/crates.io-index", "target": "aarch64-apple-darwin", "profile": "release" },
+            }),
+        )
+        .size(12 * 1024 * 1024)
+        .remedy(native("cargo", &["uninstall", "wasm-pack", "--root", "/Users/nicky/.cargo"])),
+        tool(
+            Spec {
+                manager: "pipx",
+                root: "/Users/nicky/.local/pipx/venvs",
+                name: "rendercv",
+                version: Some("1.17.0"),
+                class: "broken",
+                detail: "broken — venv interpreter /opt/homebrew/opt/python@3.13/bin/python3.13 no longer exists",
+                severity: Severity::Attention,
+            },
+            json!({
+                "runtime": { "kind": "python", "path": "/opt/homebrew/opt/python@3.13/bin/python3.13", "version": "3.13.7", "exists": false, "source": "pipx_metadata.json source_interpreter" },
+                "launchers": [{ "path": "/Users/nicky/.local/bin/rendercv", "kind": "symlink", "target": "/Users/nicky/.local/pipx/venvs/rendercv/bin/rendercv", "target_exists": true, "owner": { "kind": "this_install" } }],
+                "classifications": [{ "kind": "broken", "reason": "interpreter missing" }],
+                "primary_classification": "broken",
+                "removal": { "native": { "program": "pipx", "args": ["uninstall", "rendercv"] }, "launcher_only": ["/Users/nicky/.local/bin/rendercv"], "refusals": [], "follow_up": [] },
+            }),
+        )
+        .size(180 * 1024 * 1024)
+        .remedy(native("pipx", &["uninstall", "rendercv"])),
+        tool(
+            Spec {
+                manager: "uv",
+                root: "/Users/nicky/.local/share/uv/tools",
+                name: "mcp-proxy",
+                version: Some("0.12.0"),
+                class: "review",
+                detail: "entrypoint mcp-reverse-proxy has no launcher (removed); `uv tool upgrade` may recreate it",
+                severity: Severity::Info,
+            },
+            json!({
+                "runtime": { "kind": "python", "path": "/opt/homebrew/opt/python@3.14/bin", "version": "3.14.6", "exists": true, "source": "pyvenv.cfg home" },
+                "commands": [{ "name": "mcp-proxy", "declared_target": "bin/mcp-proxy" }, { "name": "mcp-reverse-proxy", "declared_target": "bin/mcp-reverse-proxy" }],
+                "launchers": [{ "path": "/Users/nicky/.local/bin/mcp-proxy", "kind": "symlink", "target": "/Users/nicky/.local/share/uv/tools/mcp-proxy/bin/mcp-proxy", "target_exists": true, "owner": { "kind": "this_install" } }],
+                "resolution": { "mcp-proxy": { "user_shell": "/Users/nicky/.local/bin/mcp-proxy", "process": "/Users/nicky/.local/bin/mcp-proxy", "status": "active", "shadowed_by": null, "candidates": [] }, "mcp-reverse-proxy": { "user_shell": null, "process": null, "status": "not_on_path", "shadowed_by": null, "candidates": [] } },
+                "classifications": [{ "kind": "review", "reason": "works; one entrypoint launcher missing" }],
+                "manager_extra": { "requirements": ["mcp-proxy @ git+https://github.com/sparfenyuk/mcp-proxy"], "entrypoints_missing": ["mcp-reverse-proxy"] },
+                "removal": { "native": { "program": "uv", "args": ["tool", "uninstall", "mcp-proxy"] }, "launcher_only": ["/Users/nicky/.local/bin/mcp-proxy"], "refusals": [], "follow_up": ["a future `uv tool upgrade mcp-proxy` may recreate mcp-reverse-proxy"] },
+            }),
+        )
+        .size(64 * 1024 * 1024)
+        .remedy(native("uv", &["tool", "uninstall", "mcp-proxy"])),
+        tool(
+            Spec {
+                manager: "pip",
+                root: "/opt/homebrew/lib/python3.14/site-packages",
+                name: "requests",
+                version: Some("2.32.5"),
+                class: "review",
+                detail: "pip-installed into Homebrew's python@3.14 site (INSTALLER: pip, no Cellar files)",
+                severity: Severity::Info,
+            },
+            json!({
+                "layout": "homebrew-3.14",
+                "runtime": { "kind": "python", "path": "/opt/homebrew/bin/python3.14", "version": "3.14.7", "exists": true, "source": "site-packages path" },
+                "commands": [],
+                "resolution": {},
+                "classifications": [{ "kind": "review", "reason": "manually installed; nothing in this site requires it" }],
+                "manager_extra": { "installer": "pip", "requested": true, "homebrew_formula": null, "requires_dist": ["charset-normalizer", "idna", "urllib3", "certifi"], "required_by": [], "unevaluated_markers": [] },
+                "removal": { "native": { "program": "/opt/homebrew/bin/python3.14", "args": ["-m", "pip", "uninstall", "-y", "--break-system-packages", "requests"] }, "launcher_only": [], "refusals": [], "follow_up": ["charset-normalizer, idna, urllib3 become unrequired; certifi stays (Homebrew-owned)"] },
+            }),
+        )
+        .size(2 * 1024 * 1024)
+        .remedy(native("/opt/homebrew/bin/python3.14", &["-m", "pip", "uninstall", "-y", "--break-system-packages", "requests"])),
+        tool(
+            Spec {
+                manager: "pip",
+                root: "/opt/homebrew/lib/python3.14/site-packages",
+                name: "certifi",
+                version: Some("2026.7.22"),
+                class: "required",
+                detail: "Homebrew-owned (Cellar/certifi) — required by python@3.14 tooling; no remedy",
+                severity: Severity::Info,
+            },
+            json!({
+                "layout": "homebrew-3.14",
+                "commands": [],
+                "resolution": {},
+                "classifications": [{ "kind": "required", "by": ["brew_formula:certifi", "requests"] }],
+                "protected": "Homebrew formula certifi owns these files",
+                "manager_extra": { "installer": "brew", "requested": null, "homebrew_formula": "certifi", "requires_dist": [], "required_by": ["requests"], "unevaluated_markers": [] },
+            }),
+        ),
+        Finding::new(FindingKind::CommandResolution, "pnpm", "pnpm")
+            .detail("fish resolves ~/Library/pnpm/bin/pnpm; this process cannot resolve it (~/Library/pnpm/bin is not on its PATH)")
+            .path(PathBuf::from("/Users/nicky/Library/pnpm/bin/pnpm"))
+            .severity(Severity::Attention)
+            .provenance("fish -lc 'string join : $PATH' (starts the login shell, which runs its startup files)")
+            .meta(json!({
+                "command": "pnpm",
+                "user_shell": { "shell": "fish", "path": "/opt/homebrew/bin/fish" },
+                "user_resolution": "/Users/nicky/Library/pnpm/bin/pnpm",
+                "process_resolution": null,
+                "differs": true,
+                "candidates": [{ "path": "/Users/nicky/Library/pnpm/bin/pnpm", "target": null, "owner": { "kind": "pnpm_home" }, "installation": null }],
+                "group": "Command resolution",
+            })),
+        Finding::new(FindingKind::ToolCoverage, "__coverage__", "Global tools coverage")
+            .detail("npm ok · pnpm ok (2 layouts) · cargo ok · pipx ok · uv ok · pip ok (3 sites) · bun absent")
+            .severity(Severity::Info)
+            .provenance("filesystem metadata; login shell PATH via fish -lc")
+            .coverage("projects: 41 scanned under ~/dev (not truncated); shell history evidence disabled")
+            .meta(json!({
+                "managers": {
+                    "npm": { "status": "ok", "prefixes": ["/opt/homebrew", "/Users/nicky/Library/pnpm/nodejs/24.15.0"] },
+                    "pnpm": { "status": "ok", "layouts": ["v11", "legacy-5"] },
+                    "cargo": { "status": "ok" }, "pipx": { "status": "ok" }, "uv": { "status": "ok" },
+                    "pip": { "status": "ok", "sites": 3 }, "bun": { "status": "absent" }
+                },
+                "shell": { "login_shell": "/opt/homebrew/bin/fish", "source": "fish -lc 'string join : $PATH'", "disclosure": "Starting the login shell executes its startup configuration." },
+                "projects": { "roots": ["/Users/nicky/dev"], "scanned": 41, "truncated": false },
+                "history": { "enabled": false },
+                "group": "Coverage",
+            })),
     ]
 }
 
@@ -631,12 +1021,16 @@ fn launchd_fixtures() -> Vec<Finding> {
                     },
                     reclaims_bytes: None,
                     destructive: true,
+                    alternative: false,
+                    guard: None,
                 })
                 .remedy(Remedy {
                     label: "Move plist to Trash — do this after unloading".to_string(),
                     command: RemedyCommand::Trash { path: PathBuf::from(path) },
                     reclaims_bytes: None,
                     destructive: true,
+                    alternative: false,
+                    guard: None,
                 })
         },
         item(
@@ -684,9 +1078,13 @@ fn shell_env_fixtures() -> Vec<Finding> {
             .detail(detail)
             .path(path)
             .severity(severity)
+            .provenance("/opt/homebrew/bin/fish -lc 'string join : $PATH'")
             .meta(json!({
                 "entry": path, "index": index, "occurrences": occurrences,
                 "exists": exists, "shadowed_by": shadowed_by,
+                "shell": "fish", "from_login_shell": true,
+                "in_process_path": path != "/Users/dev/Library/pnpm/bin",
+                "group": "$PATH entries",
             }));
         if let Some(r) = remedy {
             f = f.remedy(r);
@@ -700,6 +1098,7 @@ fn shell_env_fixtures() -> Vec<Finding> {
         entry("/opt/homebrew/bin", 2, 1, true, None, None),
         entry("/opt/homebrew/sbin", 3, 1, true, None, None),
         entry("/usr/local/bin", 4, 2, true, None, None),
+        entry("/Users/dev/Library/pnpm/bin", 6, 1, true, None, None),
         entry(
             "/Users/dev/bin",
             5,
@@ -713,6 +1112,8 @@ fn shell_env_fixtures() -> Vec<Finding> {
                 },
                 reclaims_bytes: None,
                 destructive: false,
+                alternative: false,
+                guard: None,
             }),
         ),
         Finding::new(
@@ -720,12 +1121,28 @@ fn shell_env_fixtures() -> Vec<Finding> {
             "__shell_startup__",
             "Shell startup time",
         )
-        .detail("Median shell startup: 1450ms across 3 run(s)")
+        .detail("Median fish startup: 1450ms across 3 run(s)")
         .severity(Severity::Attention)
+        .provenance("/opt/homebrew/bin/fish -i -c exit ×3 (starts the login shell)")
         .meta(json!({
+            "shell": "fish",
             "median_ms": 1450.0,
             "runs_ms": [1390.0, 1450.0, 1510.0],
+            "group": "Startup",
         })),
+        Finding::new(FindingKind::PathEntry, "__path_diff__", "Login shell vs process PATH")
+            .detail("fish PATH has 1 entry this process lacks; this process has 1 the shell lacks")
+            .severity(Severity::Attention)
+            .provenance("/opt/homebrew/bin/fish -lc 'string join : $PATH' (Reading the login shell's PATH starts that shell (fish/zsh/bash -l), which executes its startup configuration.)")
+            .coverage("Tools launched by an agent or app inherit the process PATH, not the login shell's; command resolution can differ between the two.")
+            .meta(json!({
+                "login_shell": "/opt/homebrew/bin/fish", "shell": "fish",
+                "source": "/opt/homebrew/bin/fish -lc 'string join : $PATH'",
+                "only_in_shell": ["/Users/dev/Library/pnpm/bin"],
+                "only_in_process": ["/Users/dev/Library/pnpm"],
+                "shell_entries": 7, "process_entries": 7, "notes": [],
+                "group": "Comparison",
+            })),
     ]
 }
 
@@ -840,6 +1257,8 @@ fn docker_fixtures() -> Vec<Finding> {
             },
             reclaims_bytes: Some(1_800_000_000),
             destructive: true,
+            alternative: false,
+            guard: None,
         }),
         Finding::new(
             FindingKind::DockerObject,
@@ -865,6 +1284,8 @@ fn docker_fixtures() -> Vec<Finding> {
             },
             reclaims_bytes: Some(210_000_000),
             destructive: true,
+            alternative: false,
+            guard: None,
         }),
         Finding::new(
             FindingKind::DockerObject,
@@ -898,6 +1319,8 @@ fn docker_fixtures() -> Vec<Finding> {
             },
             reclaims_bytes: Some(2_600_000_000),
             destructive: true,
+            alternative: false,
+            guard: None,
         }),
         Finding::new(
             FindingKind::DockerObject,
@@ -949,6 +1372,8 @@ fn ports_fixtures() -> Vec<Finding> {
                     },
                     reclaims_bytes: None,
                     destructive: false,
+                    alternative: false,
+                    guard: None,
                 });
             if let Some(path) = path {
                 f = f.path(path).remedy(reveal(path));
@@ -1158,6 +1583,8 @@ fn simulator_fixtures() -> Vec<Finding> {
             },
             reclaims_bytes: None,
             destructive: true,
+            alternative: false,
+            guard: None,
         }),
         Finding::new(
             FindingKind::Simulator,
@@ -1197,6 +1624,8 @@ fn simulator_fixtures() -> Vec<Finding> {
             },
             reclaims_bytes: Some(5 * GIB),
             destructive: true,
+            alternative: false,
+            guard: None,
         }),
         Finding::new(
             FindingKind::Simulator,
@@ -1223,6 +1652,8 @@ fn simulator_fixtures() -> Vec<Finding> {
             },
             reclaims_bytes: Some(4 * GIB),
             destructive: true,
+            alternative: false,
+            guard: None,
         }),
         Finding::new(
             FindingKind::Simulator,
@@ -1249,6 +1680,8 @@ fn simulator_fixtures() -> Vec<Finding> {
             },
             reclaims_bytes: Some(3 * GIB + 500 * MIB),
             destructive: true,
+            alternative: false,
+            guard: None,
         }),
     ]
 }
@@ -1381,6 +1814,8 @@ fn tm_snapshots_fixtures() -> Vec<Finding> {
                 },
                 reclaims_bytes: None,
                 destructive: true,
+                alternative: false,
+                guard: None,
             })
         })
         .collect()

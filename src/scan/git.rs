@@ -389,6 +389,8 @@ fn build_finding(
             },
             reclaims_bytes: None,
             destructive: false,
+            alternative: false,
+            guard: None,
         });
     if let Some(lu) = last_used {
         f = f.last_used(lu);

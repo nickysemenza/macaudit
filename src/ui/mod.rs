@@ -10,7 +10,9 @@ pub mod keys;
 pub mod theme;
 
 mod activity;
+mod cleanup_view;
 mod confirm;
+mod deps;
 mod detail;
 mod help;
 mod layout;
@@ -41,9 +43,10 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
+use crate::cleanup::{self, ExecDeps, ExecEvent};
 use crate::engine::ScannerManager;
 use crate::model::{Finding, FindingKind, ScanEvent, ScannerId, Severity};
-use crate::remedy::{RealClipboard, RealTrash, RemedyEngine};
+use crate::remedy::{RealClipboard, RealTrash};
 use crate::snapshot::{self, SnapshotStore};
 use crate::ui::app::{AppState, RescanRequest};
 
@@ -69,6 +72,12 @@ async fn run_loop(
     let (tx, mut rx) = mpsc::channel::<ScanEvent>(1024);
     // Async network-enrichment results: (gen, enriched App findings).
     let (enrich_tx, mut enrich_rx) = mpsc::channel::<(u64, Vec<Finding>)>(4);
+    // Cleanup progress from the spawned batch task.
+    let (exec_tx, mut exec_rx) = mpsc::channel::<ExecEvent>(64);
+    // Stop token of the running batch (Esc cancels the remaining actions).
+    let mut cleanup_stop: Option<CancellationToken> = None;
+    // Sections to rescan once the running batch has executed.
+    let mut cleanup_affected: Vec<ScannerId> = Vec::new();
     let mut app = AppState::default();
     app.set_delete_mode(manager.delete_mode());
     app.set_baseline(load_baseline(&manager));
@@ -128,6 +137,27 @@ async fn run_loop(
                     }
                 }
             }
+            maybe_exec = exec_rx.recv() => {
+                if let Some(ev) = maybe_exec {
+                    let executed = matches!(ev, ExecEvent::Executed { .. });
+                    let finished = matches!(ev, ExecEvent::Finished(_));
+                    app.apply_exec(ev);
+                    if executed && !cleanup_affected.is_empty() {
+                        // Re-check the touched sections now that the batch
+                        // has run; stale marks/previews are dropped as the
+                        // new findings land.
+                        let affected = std::mem::take(&mut cleanup_affected);
+                        let gen = manager.start(&tx, &affected);
+                        app.begin_scan(gen, &affected);
+                        if affected.iter().any(|s| state::CORRELATED_SECTIONS.contains(s)) {
+                            full_scan_gen = gen;
+                        }
+                    }
+                    if finished {
+                        cleanup_stop = None;
+                    }
+                }
+            }
             _ = tick.tick() => {
                 app.tick = app.tick.wrapping_add(1);
             }
@@ -139,9 +169,7 @@ async fn run_loop(
         // path. Then kick the async network half (catalog matching + release
         // checks) in the background; results arrive on `enrich_rx`. Once per
         // generation.
-        if correlated_gen != full_scan_gen
-            && app.sections_terminal(&[ScannerId::Apps, ScannerId::Brew])
-        {
+        if correlated_gen != full_scan_gen && app.sections_terminal(state::CORRELATED_SECTIONS) {
             correlated_gen = full_scan_gen;
             app.correlate_now();
 
@@ -213,51 +241,40 @@ async fn run_loop(
                 full_scan_gen = gen;
             } else if sections
                 .iter()
-                .any(|s| matches!(s, ScannerId::Apps | ScannerId::Brew))
+                .any(|s| state::CORRELATED_SECTIONS.contains(s))
             {
                 // Rescanning Apps/Brew invalidates correlation for the new data.
                 full_scan_gen = gen;
             }
         }
 
-        // Service a confirmed batch of remedies: execute each (Trash via the
-        // trash crate, Shell/Reveal via the runner), stream results into the
-        // activity log, then targeted-rescan the affected sections so their
-        // findings re-check. Execution is awaited inline; remedies are fast
-        // (trash is instant) and user-initiated, so briefly pausing input is
-        // acceptable for v1.
-        if let Some(actions) = app.pending_execute.take() {
-            let engine = RemedyEngine::new(manager.delete_mode());
-            let runner = manager.runner();
-            let token = CancellationToken::new();
-            let mut affected: Vec<ScannerId> = Vec::new();
-            for a in &actions {
-                if let Some(sec) = app.section_of(a.finding_id) {
-                    if !affected.contains(&sec) {
-                        affected.push(sec);
-                    }
-                }
-                match engine
-                    .execute(a, runner.as_ref(), &RealTrash, &RealClipboard, &token)
-                    .await
-                {
-                    Ok(line) => app.push_activity(line),
-                    Err(e) => app.push_activity(format!("error: {} — {e}", a.rendered)),
-                }
-            }
-            if !affected.is_empty() {
-                let gen = manager.start(&tx, &affected);
-                app.begin_scan(gen, &affected);
-                // A targeted rescan is not a full snapshot; don't auto-save it.
-                // But rescanning Apps/Brew re-emits findings uncorrelated, so
-                // correlation (and enrichment) must re-fire once they finish —
-                // same rule as the `r`-key rescan path above.
-                if affected
-                    .iter()
-                    .any(|s| matches!(s, ScannerId::Apps | ScannerId::Brew))
-                {
-                    full_scan_gen = gen;
-                }
+        // Service a confirmed batch: spawn `cleanup::run_batch`, which
+        // re-checks every target, runs the exact commands in dependency
+        // order, verifies retained tools and writes the audit report. The
+        // loop keeps drawing (and can stop the batch between actions).
+        if let Some(req) = app.pending_execute.take() {
+            let stop = CancellationToken::new();
+            cleanup_stop = Some(stop.clone());
+            cleanup_affected = req.affected.clone();
+            let deps = ExecDeps {
+                runner: manager.runner(),
+                trash: Arc::new(RealTrash),
+                clipboard: Arc::new(RealClipboard),
+                paths: manager.paths(),
+                config: manager.config(),
+                delete_mode: manager.delete_mode(),
+            };
+            let current = app.all_findings();
+            let etx = exec_tx.clone();
+            tokio::spawn(async move {
+                cleanup::run_batch(req.actions, current, deps, etx, stop).await;
+            });
+        }
+        if app.pending_cancel_cleanup {
+            app.pending_cancel_cleanup = false;
+            if let Some(stop) = &cleanup_stop {
+                stop.cancel();
+                app.push_activity("cleanup: stopping after the current action".to_string());
             }
         }
 

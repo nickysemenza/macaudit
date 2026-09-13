@@ -1,17 +1,23 @@
-//! ShellEnvScanner — parses `$PATH` from a login shell looking for
-//! duplicates, entries pointing at nonexistent directories, and ordering
-//! surprises (system bin shadowing a brew/local bin); also measures shell
-//! startup latency.
+//! ShellEnvScanner — the user's *login shell* `$PATH` (fish, zsh or bash,
+//! found via directory services) looking for duplicates, entries pointing
+//! at nonexistent directories, and ordering surprises (system bin shadowing
+//! a brew/local bin); how that PATH differs from MacAudit's own process
+//! PATH (agents and apps often launch with a different environment); and
+//! shell startup latency.
+//!
+//! Reading the login shell's PATH starts that shell, which executes its
+//! startup configuration. No rc file is read or shown.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::json;
 
 use crate::model::{Finding, FindingKind, Remedy, RemedyCommand, ScannerId, Severity};
-use crate::scan::{ScanCtx, Scanner};
+use crate::scan::global_tools::shellpath::{self, ShellPath};
+use crate::scan::{run_with_timeout, ScanCtx, Scanner};
 
 #[derive(Default)]
 pub struct ShellEnvScanner;
@@ -28,6 +34,7 @@ const BREW_DIRS: &[&str] = &[
 ];
 
 const SLOW_STARTUP_THRESHOLD: Duration = Duration::from_millis(500);
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[async_trait]
 impl Scanner for ShellEnvScanner {
@@ -36,49 +43,41 @@ impl Scanner for ShellEnvScanner {
     }
 
     async fn scan(&self, ctx: ScanCtx) -> anyhow::Result<()> {
-        scan_path(&ctx).await;
-        scan_startup_time(&ctx).await;
+        let sp = shellpath::detect(&ctx).await;
+        scan_path(&ctx, &sp).await;
+        scan_startup_time(&ctx, &sp).await;
         Ok(())
     }
 }
 
-async fn scan_path(ctx: &ScanCtx) {
-    let out = match ctx
-        .runner
-        .run("zsh", &["-ilc", "echo $PATH"], &ctx.token)
-        .await
-    {
-        Ok(o) if o.success() => o,
-        _ => return,
+async fn scan_path(ctx: &ScanCtx, sp: &ShellPath) {
+    let (entries, source, from_shell): (Vec<PathBuf>, String, bool) = match &sp.shell_path {
+        Some(p) => (p.clone(), sp.source.clone(), true),
+        None => (sp.process_path.clone(), "process PATH".into(), false),
     };
-
-    // Interactive login shells may print MOTD/rc noise before the `echo`
-    // output; the PATH value is the last non-empty line.
-    let raw = out.stdout_str();
-    let Some(path_line) = raw.lines().rev().find(|l| !l.trim().is_empty()) else {
-        return;
-    };
-
-    let entries: Vec<&str> = path_line
-        .trim()
-        .split(':')
-        .filter(|s| !s.is_empty())
-        .collect();
     if entries.is_empty() {
         return;
     }
+    let shell_name = sp.shell_name().map(str::to_string);
+    let entries: Vec<String> = entries.iter().map(|p| p.display().to_string()).collect();
+    let process: HashSet<String> = sp
+        .process_path
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
 
     let mut counts: HashMap<&str, u32> = HashMap::new();
-    for &e in &entries {
-        *counts.entry(e).or_insert(0) += 1;
+    for e in &entries {
+        *counts.entry(e.as_str()).or_insert(0) += 1;
     }
     let mut first_index: HashMap<&str, usize> = HashMap::new();
-    for (i, &e) in entries.iter().enumerate() {
-        first_index.entry(e).or_insert(i);
+    for (i, e) in entries.iter().enumerate() {
+        first_index.entry(e.as_str()).or_insert(i);
     }
 
     let mut seen: HashSet<&str> = HashSet::new();
-    for (i, &entry) in entries.iter().enumerate() {
+    for (i, entry) in entries.iter().enumerate() {
+        let entry = entry.as_str();
         if !seen.insert(entry) {
             continue; // only report each distinct entry once, at its first occurrence
         }
@@ -125,40 +124,84 @@ async fn scan_path(ctx: &ScanCtx) {
             "occurrences": occurrences,
             "exists": exists,
             "shadowed_by": shadowed_by,
+            "shell": shell_name,
+            "from_login_shell": from_shell,
+            "in_process_path": process.contains(entry),
+            "group": "$PATH entries",
         });
 
         let mut finding = Finding::new(FindingKind::PathEntry, entry, entry.to_string())
             .detail(detail)
             .path(entry)
             .severity(severity)
+            .provenance(source.clone())
             .meta(meta);
         // Dead PATH entry: we can't know which rc file added it (we only parse the
         // resolved $PATH), so we don't auto-edit shell config. Copy the offending
         // entry so the user can grep it out of their dotfiles themselves.
         if !exists {
-            finding = finding.remedy(Remedy {
-                label: "Copy path to clipboard".to_string(),
-                command: RemedyCommand::CopyToClipboard {
+            finding = finding.remedy(Remedy::new(
+                "Copy path to clipboard",
+                RemedyCommand::CopyToClipboard {
                     text: entry.to_string(),
                 },
-                reclaims_bytes: None,
-                destructive: false,
-            });
+            ));
         }
         ctx.emit(finding).await;
     }
+
+    // Login shell vs this process.
+    if from_shell {
+        let (only_shell, only_process) = sp.diff();
+        let differs = !only_shell.is_empty() || !only_process.is_empty();
+        let name = shell_name.clone().unwrap_or_else(|| "login shell".into());
+        let detail = if differs {
+            format!(
+                "{name} PATH has {} entr{} this process lacks; this process has {} the shell lacks",
+                only_shell.len(),
+                if only_shell.len() == 1 { "y" } else { "ies" },
+                only_process.len()
+            )
+        } else {
+            format!("{name} PATH and this process PATH match")
+        };
+        ctx.emit(
+            Finding::new(FindingKind::PathEntry, "__path_diff__", "Login shell vs process PATH")
+                .detail(detail)
+                .severity(if differs { Severity::Attention } else { Severity::Info })
+                .provenance(format!("{} ({})", sp.source, shellpath::DISCLOSURE))
+                .coverage("Tools launched by an agent or app inherit the process PATH, not the login shell's; command resolution can differ between the two.")
+                .meta(json!({
+                    "login_shell": sp.login_shell,
+                    "shell": shell_name,
+                    "source": sp.source,
+                    "only_in_shell": only_shell,
+                    "only_in_process": only_process,
+                    "shell_entries": entries.len(),
+                    "process_entries": sp.process_path.len(),
+                    "notes": sp.notes,
+                    "group": "Comparison",
+                })),
+        )
+        .await;
+    }
 }
 
-async fn scan_startup_time(ctx: &ScanCtx) {
+async fn scan_startup_time(ctx: &ScanCtx, sp: &ShellPath) {
+    let Some(shell) = &sp.login_shell else {
+        return;
+    };
+    let name = sp.shell_name().unwrap_or("");
+    if shellpath::path_probe_args(name).is_none() {
+        return; // unsupported shell: never start something we don't understand
+    }
+    let program = shell.display().to_string();
     let mut timings = Vec::with_capacity(3);
     for _ in 0..3 {
         let start = Instant::now();
-        let res = ctx
-            .runner
-            .run("zsh", &["-i", "-c", "exit"], &ctx.token)
-            .await;
+        let res = run_with_timeout(ctx, &program, &["-i", "-c", "exit"], STARTUP_TIMEOUT).await;
         let elapsed = start.elapsed();
-        if res.is_ok() {
+        if res.is_some() {
             timings.push(elapsed);
         }
     }
@@ -174,14 +217,16 @@ async fn scan_startup_time(ctx: &ScanCtx) {
         Severity::Info
     };
     let detail = format!(
-        "Median shell startup: {:.0}ms across {} run(s)",
+        "Median {name} startup: {:.0}ms across {} run(s)",
         median.as_secs_f64() * 1000.0,
         timings.len()
     );
 
     let meta = json!({
+        "shell": name,
         "median_ms": median.as_secs_f64() * 1000.0,
         "runs_ms": timings.iter().map(|d| d.as_secs_f64() * 1000.0).collect::<Vec<_>>(),
+        "group": "Startup",
     });
 
     let finding = Finding::new(
@@ -191,6 +236,7 @@ async fn scan_startup_time(ctx: &ScanCtx) {
     )
     .detail(detail)
     .severity(severity)
+    .provenance(format!("{program} -i -c exit ×3 (starts the login shell)"))
     .meta(meta);
     ctx.emit(finding).await;
 }
@@ -242,16 +288,42 @@ mod tests {
         // `real` is duplicated.
         let path_value = format!("/usr/bin:{real}:/opt/homebrew/bin:/does/not/exist:{real}");
 
+        let user = tmp
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         let mock = crate::runner::MockCommandRunner::new()
-            .on("zsh", &["-ilc", "echo $PATH"], &format!("{path_value}\n"))
-            .on("zsh", &["-i", "-c", "exit"], "");
+            .on(
+                "dscl",
+                &[".", "-read", &format!("/Users/{user}"), "UserShell"],
+                "UserShell: /bin/zsh\n",
+            )
+            .on(
+                "/bin/zsh",
+                &["-ilc", "echo $PATH"],
+                &format!("{path_value}\n"),
+            )
+            .on("/bin/zsh", &["-i", "-c", "exit"], "");
         let (ctx, mut rx) = ctx_with(&tmp, mock);
 
         ShellEnvScanner.scan(ctx).await.unwrap();
         let findings = drain(&mut rx).await;
 
-        // 4 distinct PATH entries + 1 startup-time finding.
-        assert_eq!(findings.len(), 5);
+        // 4 distinct PATH entries + shell-vs-process comparison + startup time.
+        assert_eq!(findings.len(), 6);
+        let diff = findings
+            .iter()
+            .find(|f| f.title == "Login shell vs process PATH")
+            .unwrap();
+        assert_eq!(diff.meta["shell"], "zsh");
+        assert!(diff.meta["only_in_shell"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "/does/not/exist"));
 
         let by_entry = |e: &str| {
             findings
@@ -293,19 +365,84 @@ mod tests {
             .unwrap();
         assert_eq!(startup.severity, Severity::Info); // mock returns instantly
         assert!(startup.meta["median_ms"].is_number());
+        assert_eq!(startup.meta["shell"], "zsh");
+        assert_eq!(sys.meta["from_login_shell"], true);
     }
 
     #[tokio::test]
-    async fn no_path_output_emits_only_startup_finding() {
+    async fn fish_login_shell_uses_string_join() {
         let tmp = tempfile::tempdir().unwrap();
+        let user = tmp
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let pnpm_bin = tmp.path().join("Library/pnpm/bin");
+        std::fs::create_dir_all(&pnpm_bin).unwrap();
         let mock = crate::runner::MockCommandRunner::new()
-            .on_fail("zsh", &["-ilc", "echo $PATH"], 1, "boom")
-            .on("zsh", &["-i", "-c", "exit"], "");
+            .on(
+                "dscl",
+                &[".", "-read", &format!("/Users/{user}"), "UserShell"],
+                "UserShell: /opt/homebrew/bin/fish\n",
+            )
+            .on(
+                "/opt/homebrew/bin/fish",
+                &["-lc", "string join : $PATH"],
+                &format!("{}:/usr/bin\n", pnpm_bin.display()),
+            )
+            .on("/opt/homebrew/bin/fish", &["-i", "-c", "exit"], "");
+        let (ctx, mut rx) = ctx_with(&tmp, mock);
+        ShellEnvScanner.scan(ctx).await.unwrap();
+        let findings = drain(&mut rx).await;
+        let pnpm = findings
+            .iter()
+            .find(|f| f.title == pnpm_bin.display().to_string())
+            .unwrap();
+        assert_eq!(pnpm.meta["shell"], "fish");
+        assert_eq!(pnpm.meta["in_process_path"], false);
+        assert!(pnpm.provenance.as_deref().unwrap().contains("string join"));
+        let diff = findings
+            .iter()
+            .find(|f| f.title == "Login shell vs process PATH")
+            .unwrap();
+        assert_eq!(diff.severity, Severity::Attention);
+        assert_eq!(
+            diff.meta["only_in_shell"][0],
+            pnpm_bin.display().to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_path_failure_falls_back_to_process_path_and_notes_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let user = tmp
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let mock = crate::runner::MockCommandRunner::new()
+            .on(
+                "dscl",
+                &[".", "-read", &format!("/Users/{user}"), "UserShell"],
+                "UserShell: /bin/zsh\n",
+            )
+            .on_fail("/bin/zsh", &["-ilc", "echo $PATH"], 1, "boom")
+            .on("/bin/zsh", &["-i", "-c", "exit"], "");
         let (ctx, mut rx) = ctx_with(&tmp, mock);
 
         ShellEnvScanner.scan(ctx).await.unwrap();
         let findings = drain(&mut rx).await;
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].title, "Shell startup time");
+        assert!(findings.iter().any(|f| f.title == "Shell startup time"));
+        assert!(!findings
+            .iter()
+            .any(|f| f.title == "Login shell vs process PATH"));
+        for f in findings.iter().filter(|f| f.meta.get("entry").is_some()) {
+            assert_eq!(f.meta["from_login_shell"], false);
+            assert_eq!(f.provenance.as_deref(), Some("process PATH"));
+        }
     }
 }

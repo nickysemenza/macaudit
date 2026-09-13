@@ -15,6 +15,7 @@ pub mod brew;
 pub mod docker;
 pub mod fs;
 pub mod git;
+pub mod global_tools;
 pub mod launchd;
 pub mod ports;
 pub mod runtimes;
@@ -95,6 +96,21 @@ impl ScanCtx {
     /// Whether the current scan generation has been cancelled.
     pub fn cancelled(&self) -> bool {
         self.token.is_cancelled()
+    }
+}
+
+/// Run a command with a hard deadline. `None` when it could not be spawned,
+/// exited non-zero, or ran past `timeout` — callers treat every one of those
+/// as "this data source is unavailable" and degrade to partial results.
+pub async fn run_with_timeout(
+    ctx: &ScanCtx,
+    program: &str,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Option<crate::runner::CmdOutput> {
+    match tokio::time::timeout(timeout, ctx.runner.run(program, args, &ctx.token)).await {
+        Ok(Ok(out)) if out.success() => Some(out),
+        _ => None,
     }
 }
 
