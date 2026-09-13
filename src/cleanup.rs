@@ -127,7 +127,7 @@ fn order_actions(
         .enumerate()
         .map(|(i, a)| (phase(&a), position(&a), i, a))
         .collect();
-    v.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+    v.sort_by_key(|a| (a.0, a.1, a.2));
     v.into_iter().map(|(_, _, _, a)| a).collect()
 }
 

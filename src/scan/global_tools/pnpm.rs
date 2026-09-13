@@ -114,7 +114,7 @@ pub fn local_pnpm_binaries(home: &Path) -> Vec<(String, PathBuf)> {
             }
         }
     }
-    out.sort_by(|a, b| version_key(&b.0).cmp(&version_key(&a.0)));
+    out.sort_by_key(|a| std::cmp::Reverse(version_key(&a.0)));
     out
 }
 
