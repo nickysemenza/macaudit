@@ -12,3 +12,25 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+  app:
+    # The SwiftUI app: engine static library → UniFFI bindings → Swift
+    # package tests → xcodebuild. The root job's clippy covers only the root
+    # package in this workspace, so the FFI crates are linted here.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: brew install xcodegen
+      - run: cargo fmt --check -p macaudit-ffi -p uniffi-bindgen
+      - run: cargo clippy -p macaudit-ffi --all-targets -- -D warnings
+      - run: cargo test -p macaudit-ffi
+      - run: scripts/build-ffi.sh --debug
+      - run: swift test --package-path swift/MacAuditKit
+      - run: xcodegen generate --spec apps/MacAudit/project.yml
+      - run: >-
+          xcodebuild -project apps/MacAudit/MacAudit.xcodeproj -scheme MacAudit
+          -configuration Debug -destination 'platform=macOS'
+          -derivedDataPath build/DerivedData CODE_SIGNING_ALLOWED=NO build

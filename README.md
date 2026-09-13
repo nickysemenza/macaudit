@@ -93,6 +93,33 @@ Requires macOS and a stable Rust toolchain.
 cargo install --path .
 ```
 
+### MacAudit.app (SwiftUI)
+
+The same engine, as a native macOS app. The Rust engine is linked in-process
+through [UniFFI](https://mozilla.github.io/uniffi-rs/) (`crates/macaudit-ffi`);
+`swift/MacAuditKit` wraps the generated bindings and `apps/MacAudit` is the
+app. Requires Xcode 16+ and [xcodegen](https://github.com/yonaskolb/XcodeGen).
+
+```sh
+scripts/build-ffi.sh                      # engine .a → xcframework + Swift bindings (debug; --release, --universal)
+xcodegen generate --spec apps/MacAudit/project.yml
+open apps/MacAudit/MacAudit.xcodeproj     # or: xcodebuild -project … -scheme MacAudit build
+```
+
+Re-run `build-ffi.sh` after any Rust change: the generated Swift and the
+static library carry matching checksums and are always rebuilt together
+(both are gitignored). `MACAUDIT_FAKE=1` in the scheme's environment (or the
+"Use fake data" toggle in Settings on debug builds) runs the app on the
+synthetic `--fake` findings; `MACAUDIT_HOME` works as for the CLI.
+
+The app is not sandboxed — it scans `~`, runs `brew`/`docker`/`xcrun` and
+moves files to the Trash, none of which the App Sandbox allows — and is ad-hoc
+signed for local builds. Because a Finder-launched app inherits launchd's
+minimal `PATH`, the engine adopts the login shell's `PATH` at startup (the
+same disclosure as the Shell scanner: this starts your shell once). Mail,
+Messages, Safari and Time Machine data need **Full Disk Access** granted to
+MacAudit.app in System Settings; without it those subtrees are skipped.
+
 ## Usage
 
 ```sh
