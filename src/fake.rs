@@ -874,6 +874,19 @@ fn fs_fixtures() -> Vec<Finding> {
         .meta(json!({ "group": "Large files" }))
         .remedy(trash("/Users/dev/Downloads/backup.dmg", Some(15 * GIB)))
         .remedy(reveal("/Users/dev/Downloads/backup.dmg")),
+        // A macOS package sized whole: never listed file-by-file, Reveal only.
+        Finding::new(
+            FindingKind::LargeFile,
+            "/Users/dev/Pictures/Photos Library.photoslibrary",
+            "Large package — Photos Library.photoslibrary",
+        )
+        .path("/Users/dev/Pictures/Photos Library.photoslibrary")
+        .detail("Photos library (63.9 GiB); a macOS package — manage it from its app, not by deleting files inside it")
+        .size(63 * GIB + 900 * MIB)
+        .severity(Severity::Attention)
+        .provenance("du over the whole package; contents never listed individually")
+        .meta(json!({ "group": "Large files", "package": "photoslibrary", "package_label": "Photos library" }))
+        .remedy(reveal("/Users/dev/Pictures/Photos Library.photoslibrary")),
         Finding::new(
             FindingKind::CacheDir,
             "/Users/dev/Library/Developer/Xcode/DerivedData",

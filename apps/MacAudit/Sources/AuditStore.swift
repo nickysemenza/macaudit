@@ -156,6 +156,38 @@ final class AuditStore {
         SectionId.allCases.reduce(0) { $0 + reclaimableBytes(in: $1) }
     }
 
+    /// The headline reclaimable figure partitioned by what it is. Same
+    /// filter as `reclaimableBytes(in:)` (severity == reclaimable, `sizeBytes`),
+    /// so the segments sum to `totalReclaimableBytes` by construction.
+    var reclaimableBreakdown: [BarSegment] {
+        var bytes: [String: UInt64] = [:]
+        for f in findings.values.flatMap(\.values) where f.severity == .reclaimable {
+            guard let size = f.sizeBytes, size > 0 else { continue }
+            let name: String
+            switch f.kind {
+            case .buildArtifact: name = f.isStaleArtifact ? "Stale build artifacts" : "Recent build artifacts"
+            case .cacheDir: name = "Caches"
+            case .brewFormula: if f.isBrewSummaryRow { continue } else { name = "Homebrew" }
+            case .dockerObject: name = "Docker"
+            case .simulator: name = "Simulators"
+            case .localSnapshot: name = "Time Machine snapshots"
+            case .globalTool: name = "Orphaned tools"
+            case .runtimeVersion: name = "Rust toolchains"
+            default: name = "Other"
+            }
+            bytes[name, default: 0] += size
+        }
+        return bytes.map { BarSegment(name: $0.key, bytes: $0.value) }.sorted { $0.bytes > $1.bytes }
+    }
+
+    /// Attention items that carry bytes but are deliberately not counted as
+    /// reclaimable: large files/packages and iOS backups need a human look.
+    var attentionNotCounted: (bytes: UInt64, count: Int) {
+        let items = findings.values.flatMap(\.values)
+            .filter { ($0.kind == .largeFile || $0.kind == .iosBackup) && $0.severity != .reclaimable }
+        return (items.reduce(0) { $0 + ($1.sizeBytes ?? 0) }, items.count)
+    }
+
     var isScanning: Bool {
         status.values.contains { if case .scanning = $0 { true } else { false } }
     }

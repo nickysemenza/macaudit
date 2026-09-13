@@ -44,8 +44,8 @@ extension AuditStore {
         add("ios-backups", "iOS backups",
             "Device backups kept by Finder; each one is a full copy.",
             "iphone.and.arrow.forward", .fs, fs.filter { $0.kind == .iosBackup })
-        add("large-files", "Large files",
-            "Loose files over the configured size threshold.",
+        add("large-files", "Large files and libraries",
+            "Loose files over the size threshold, plus data libraries (Photos, Music, VMs) sized as one item. Review before deleting; libraries are reveal-only.",
             "doc.zipper", .fs, fs.filter { $0.kind == .largeFile }, markable: false)
         add("brew-autoremove", "Homebrew autoremove candidates",
             "Formulae installed only as dependencies that nothing needs any more (`brew autoremove`).",
@@ -87,6 +87,7 @@ struct RecommendationsCard: View {
     var body: some View {
         let recs = store.recommendations
         Card(title: "Recommendations") {
+            ReclaimableBreakdown()
             if recs.isEmpty {
                 Text(store.isScanning ? "Looking for reclaimable space…" : "Nothing to reclaim right now.")
                     .foregroundStyle(.secondary)
@@ -141,6 +142,40 @@ private struct RecommendationRow: View {
             }
         }
         .padding(.vertical, 6)
+    }
+}
+
+/// What the headline reclaimable number is made of, as one full-width bar.
+private struct ReclaimableBreakdown: View {
+    @Environment(AuditStore.self) private var store
+
+    var body: some View {
+        let total = store.totalReclaimableBytes
+        let segments = store.reclaimableBreakdown
+        let skipped = store.attentionNotCounted
+        if total > 0 {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(Formatting.bytes(total))
+                        .font(.title2.weight(.semibold))
+                        .monospacedDigit()
+                        .contentTransition(.numericText())
+                    Text("reclaimable").foregroundStyle(.secondary)
+                    Spacer()
+                    if store.isScanning { ProgressView().controlSize(.small) }
+                }
+                SegmentedBar(segments: segments, capacity: total)
+                if skipped.bytes > 0 {
+                    Text("Not counted: \(Formatting.bytes(skipped.bytes)) in \(skipped.count) large files, packages and iOS backups — they need a look before anything is deleted.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(.bottom, 6)
+            .animation(.default, value: total)
+            Divider()
+        }
     }
 }
 
