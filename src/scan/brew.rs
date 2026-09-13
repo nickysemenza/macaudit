@@ -279,6 +279,8 @@ impl Scanner for BrewScanner {
                     },
                     reclaims_bytes: None,
                     destructive: false,
+                    alternative: false,
+                    guard: None,
                 });
             }
 
@@ -322,6 +324,8 @@ impl Scanner for BrewScanner {
                     },
                     reclaims_bytes: None,
                     destructive: false,
+                    alternative: false,
+                    guard: None,
                 });
             }
 

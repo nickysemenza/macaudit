@@ -84,7 +84,7 @@ fn golden_apps_tree() {
 #[test]
 fn golden_daemons_table_with_detail() {
     let mut app = app_with_fixtures();
-    app.handle(Action::Char('5'));
+    app.handle(Action::Char('6'));
     app.handle(Action::Down);
     app.handle(Action::Down);
     insta::assert_snapshot!(render(&mut app, 160, 44));

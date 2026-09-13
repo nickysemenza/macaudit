@@ -77,6 +77,8 @@ impl Scanner for PortsScanner {
                     },
                     reclaims_bytes: None,
                     destructive: false,
+                    alternative: false,
+                    guard: None,
                 });
 
             if let Some(path) = binary_path {
@@ -87,6 +89,8 @@ impl Scanner for PortsScanner {
                     command: RemedyCommand::RevealInFinder { path: path.into() },
                     reclaims_bytes: None,
                     destructive: false,
+                    alternative: false,
+                    guard: None,
                 });
             }
 

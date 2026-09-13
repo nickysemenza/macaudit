@@ -19,6 +19,7 @@ mod shell;
 mod simulator;
 mod ssh_keys;
 mod tm_snapshots;
+mod tools;
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -484,6 +485,7 @@ pub fn presenter(id: ScannerId) -> &'static SectionPresenter {
         ScannerId::Simulator => &simulator::PRESENTER,
         ScannerId::SshKeys => &ssh_keys::PRESENTER,
         ScannerId::TmSnapshots => &tm_snapshots::PRESENTER,
+        ScannerId::Tools => &tools::PRESENTER,
     }
 }
 

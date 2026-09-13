@@ -166,6 +166,8 @@ impl LaunchdScanner {
                     },
                     reclaims_bytes: None,
                     destructive: true,
+                    alternative: false,
+                    guard: None,
                 });
             }
             finding = finding.remedy(Remedy {
@@ -175,6 +177,8 @@ impl LaunchdScanner {
                 },
                 reclaims_bytes: None,
                 destructive: true,
+                alternative: false,
+                guard: None,
             });
         } else {
             let program_display = program_path

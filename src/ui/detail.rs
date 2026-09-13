@@ -229,6 +229,8 @@ mod tests {
                 command: RemedyCommand::Trash { path: long.into() },
                 reclaims_bytes: Some(12345678),
                 destructive: true,
+                alternative: false,
+                guard: None,
             });
         let fields = build(&f, ScannerId::Fs, DeleteMode::Rm, SystemTime::now());
         let text = text_of(&render(&fields, 60));

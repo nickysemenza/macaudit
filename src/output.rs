@@ -78,6 +78,8 @@ mod tests {
             },
             reclaims_bytes: Some(1000),
             destructive: true,
+            alternative: false,
+            guard: None,
         });
         m.insert(f.id, f);
         m

@@ -117,6 +117,8 @@ impl Scanner for SimulatorScanner {
                     },
                     reclaims_bytes: None,
                     destructive: true,
+                    alternative: false,
+                    guard: None,
                 });
             }
 
@@ -195,6 +197,8 @@ impl Scanner for SimulatorScanner {
                         },
                         reclaims_bytes: size_bytes,
                         destructive: true,
+                        alternative: false,
+                        guard: None,
                     });
                 }
 

@@ -56,6 +56,8 @@ impl Scanner for TmSnapshotsScanner {
                     },
                     reclaims_bytes: None,
                     destructive: true,
+                    alternative: false,
+                    guard: None,
                 });
 
             ctx.emit(finding).await;

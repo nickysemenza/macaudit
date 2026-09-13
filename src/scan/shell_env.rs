@@ -143,6 +143,8 @@ async fn scan_path(ctx: &ScanCtx) {
                 },
                 reclaims_bytes: None,
                 destructive: false,
+                alternative: false,
+                guard: None,
             });
         }
         ctx.emit(finding).await;

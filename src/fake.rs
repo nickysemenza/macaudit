@@ -10,13 +10,13 @@
 //! so this doubles as a seed for the UI ↔ scanner contract: if a real scanner
 //! changes its `meta` shape, this file should change with it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::model::{Finding, FindingKind, Remedy, RemedyCommand, ScannerId, Severity};
+use crate::model::{Finding, FindingKind, Guard, Remedy, RemedyCommand, ScannerId, Severity};
 use crate::scan::{ScanCtx, Scanner};
 
 const MIB: u64 = 1024 * 1024;
@@ -38,6 +38,8 @@ fn reveal(path: &str) -> Remedy {
         },
         reclaims_bytes: None,
         destructive: false,
+        alternative: false,
+        guard: None,
     }
 }
 
@@ -49,6 +51,8 @@ fn trash(path: &str, reclaims_bytes: Option<u64>) -> Remedy {
         },
         reclaims_bytes,
         destructive: true,
+        alternative: false,
+        guard: None,
     }
 }
 
@@ -70,6 +74,7 @@ pub fn fixtures(id: ScannerId) -> Vec<Finding> {
         ScannerId::Simulator => simulator_fixtures(),
         ScannerId::SshKeys => ssh_keys_fixtures(),
         ScannerId::TmSnapshots => tm_snapshots_fixtures(),
+        ScannerId::Tools => tools_fixtures(),
     }
 }
 
@@ -355,6 +360,8 @@ fn brew_fixtures() -> Vec<Finding> {
                 },
                 reclaims_bytes: None,
                 destructive: false,
+                alternative: false,
+                guard: None,
             }),
         Finding::new(FindingKind::BrewCask, "docker", "docker")
             .detail("cask — 4.29.0")
@@ -396,7 +403,312 @@ fn brew_fixtures() -> Vec<Finding> {
                 },
                 reclaims_bytes: None,
                 destructive: false,
+                alternative: false,
+                guard: None,
             }),
+    ]
+}
+
+/// Mirrors `src/scan/global_tools`: GlobalTool meta manager/layout/name/
+/// version (null = unknown)/identity_key/root/commands/launchers/resolution/
+/// classifications/primary_classification/completeness/removal/group;
+/// CommandResolution meta command/user_shell/user_resolution/
+/// process_resolution/differs/candidates; one ToolCoverage `__coverage__`.
+/// Scenarios are the real ones from the 2026-09-13 cleanup: an npm codex
+/// shadowed by a cask binary, dangling pnpm launchers left in npm's bin, a
+/// legacy pnpm global dir, a pipx venv on a removed interpreter, a uv tool
+/// with a missing entrypoint, brew-owned vs pip-installed site packages.
+fn tools_fixtures() -> Vec<Finding> {
+    struct Spec<'a> {
+        manager: &'a str,
+        root: &'a str,
+        name: &'a str,
+        version: Option<&'a str>,
+        class: &'a str,
+        detail: &'a str,
+        severity: Severity,
+    }
+    fn tool(spec: Spec<'_>, extra: serde_json::Value) -> Finding {
+        let Spec {
+            manager,
+            root,
+            name,
+            version,
+            class,
+            detail,
+            severity,
+        } = spec;
+        let key = format!("{manager}:{root}:{name}");
+        let mut meta = json!({
+            "manager": manager,
+            "layout": null,
+            "name": name,
+            "version": version,
+            "identity_key": key,
+            "root": root,
+            "root_realpath": null,
+            "install_dir": format!("{root}/{name}"),
+            "runtime": null,
+            "commands": [{ "name": name, "declared_target": null }],
+            "launchers": [],
+            "foreign_launchers": [],
+            "resolution": { name: { "user_shell": null, "process": null, "status": "unknown", "shadowed_by": null, "candidates": [] } },
+            "classifications": [{ "kind": class }],
+            "primary_classification": class,
+            "evidence": [],
+            "project_refs": [],
+            "project_coverage": null,
+            "history": null,
+            "completeness": { "level": "full", "missing": [] },
+            "protected": null,
+            "removal": { "native": null, "launcher_only": [], "refusals": [], "follow_up": [] },
+            "manager_extra": {},
+            "group": format!("{manager} ({})", root.replace("/Users/nicky", "~")),
+        });
+        if let (Some(base), Some(over)) = (meta.as_object_mut(), extra.as_object()) {
+            for (k, v) in over {
+                base.insert(k.clone(), v.clone());
+            }
+        }
+        Finding::new(FindingKind::GlobalTool, &key, name)
+            .detail(detail)
+            .path(PathBuf::from(format!("{root}/{name}")))
+            .severity(severity)
+            .provenance("package metadata + launcher inspection")
+            .meta(meta)
+    }
+    let native = |program: &str, args: &[&str]| -> Remedy {
+        Remedy {
+            label: format!(
+                "Uninstall via {}",
+                Path::new(program)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(program)
+            ),
+            command: RemedyCommand::Shell {
+                program: program.to_string(),
+                args: args.iter().map(|a| a.to_string()).collect(),
+            },
+            reclaims_bytes: None,
+            destructive: true,
+            alternative: false,
+            guard: None,
+        }
+    };
+    vec![
+        tool(
+            Spec {
+                manager: "npm",
+                root: "/opt/homebrew/lib/node_modules",
+                name: "@openai/codex",
+                version: Some("0.118.0"),
+                class: "shadowed",
+                detail: "shadowed — /opt/homebrew/bin/codex is the cask binary, not this npm copy",
+                severity: Severity::Attention,
+            },
+            json!({
+                "commands": [{ "name": "codex", "declared_target": "bin/codex.js" }],
+                "launchers": [],
+                "foreign_launchers": [{ "path": "/opt/homebrew/bin/codex", "owner": { "kind": "homebrew_cask", "token": "codex" } }],
+                "resolution": { "codex": { "user_shell": "/opt/homebrew/bin/codex", "process": "/opt/homebrew/bin/codex", "status": "shadowed", "shadowed_by": "/opt/homebrew/bin/codex", "candidates": [["/opt/homebrew/bin/codex", { "kind": "homebrew_cask", "token": "codex" }]] } },
+                "classifications": [{ "kind": "duplicate", "peers": ["brew_cask:codex"] }, { "kind": "shadowed", "by": "/opt/homebrew/bin/codex", "owner": { "kind": "homebrew_cask", "token": "codex" } }],
+                "primary_classification": "shadowed",
+                "removal": { "native": { "program": "/opt/homebrew/bin/npm", "args": ["uninstall", "-g", "@openai/codex"] }, "launcher_only": [], "refusals": [], "follow_up": ["the cask binary /opt/homebrew/bin/codex stays"] },
+            }),
+        )
+        .size(48 * 1024 * 1024)
+        .remedy(native("/opt/homebrew/bin/npm", &["uninstall", "-g", "@openai/codex"])),
+        tool(
+            Spec {
+                manager: "npm",
+                root: "/opt/homebrew/lib/node_modules",
+                name: "pnpm",
+                version: None,
+                class: "broken",
+                detail: "broken — launchers pn, pnpx, pnx dangle into a removed package",
+                severity: Severity::Attention,
+            },
+            json!({
+                "commands": [],
+                "launchers": [
+                    { "path": "/opt/homebrew/bin/pn", "kind": "symlink", "target": "../lib/node_modules/pnpm/pn", "target_exists": false, "owner": { "kind": "this_install" } },
+                    { "path": "/opt/homebrew/bin/pnpx", "kind": "symlink", "target": "../lib/node_modules/pnpm/pnpx", "target_exists": false, "owner": { "kind": "this_install" } },
+                    { "path": "/opt/homebrew/bin/pnx", "kind": "symlink", "target": "../lib/node_modules/pnpm/pnx", "target_exists": false, "owner": { "kind": "this_install" } }
+                ],
+                "classifications": [{ "kind": "broken", "reason": "3 launchers point at a package that is no longer installed" }],
+                "primary_classification": "broken",
+                "removal": { "native": null, "launcher_only": ["/opt/homebrew/bin/pn", "/opt/homebrew/bin/pnpx", "/opt/homebrew/bin/pnx"], "refusals": [], "follow_up": [] },
+            }),
+        )
+        .remedy(Remedy {
+            label: "Remove dangling launcher pn".to_string(),
+            command: RemedyCommand::Trash { path: PathBuf::from("/opt/homebrew/bin/pn") },
+            reclaims_bytes: None,
+            destructive: true,
+            alternative: false,
+            guard: Some(Guard::Launcher { path: PathBuf::from("/opt/homebrew/bin/pn"), expected_target: Some(PathBuf::from("../lib/node_modules/pnpm/pn")), expect_dangling: true, owner_key: "npm:/opt/homebrew/lib/node_modules:pnpm".to_string() }),
+        }),
+        tool(
+            Spec {
+                manager: "pnpm",
+                root: "/Users/nicky/Library/pnpm/global/5",
+                name: "clawhub",
+                version: Some("0.7.0"),
+                class: "review",
+                detail: "legacy pnpm layout 5 (pnpm@10.30.0 store) — current `pnpm ls -g` does not list it",
+                severity: Severity::Info,
+            },
+            json!({
+                "layout": "legacy-5",
+                "commands": [{ "name": "clawhub", "declared_target": "dist/cli.js" }, { "name": "clawdhub", "declared_target": "dist/cli.js" }],
+                "launchers": [
+                    { "path": "/Users/nicky/Library/pnpm/clawhub", "kind": "sh_shim", "target": "/Users/nicky/Library/pnpm/global/5/node_modules/clawhub/dist/cli.js", "target_exists": true, "owner": { "kind": "this_install" } },
+                    { "path": "/Users/nicky/Library/pnpm/clawdhub", "kind": "sh_shim", "target": "/Users/nicky/Library/pnpm/global/5/node_modules/clawhub/dist/cli.js", "target_exists": true, "owner": { "kind": "this_install" } }
+                ],
+                "resolution": { "clawhub": { "user_shell": "/Users/nicky/Library/pnpm/clawhub", "process": null, "status": "active_in_shell", "shadowed_by": null, "candidates": [] }, "clawdhub": { "user_shell": "/Users/nicky/Library/pnpm/clawdhub", "process": null, "status": "active_in_shell", "shadowed_by": null, "candidates": [] } },
+                "classifications": [{ "kind": "review", "reason": "no project references; legacy layout not shown by the current pnpm" }],
+                "manager_extra": { "layout_version": 5, "package_manager": "pnpm@10.30.0", "store_dir": "/Users/nicky/Library/pnpm/store/v10", "virtual_store_dir": "/Users/nicky/Library/pnpm/global/5/.pnpm", "matching_local_pnpm": "/Users/nicky/Library/pnpm/.tools/@pnpm+macos-arm64/10.30.0/bin/pnpm" },
+                "removal": { "native": { "program": "/Users/nicky/Library/pnpm/.tools/@pnpm+macos-arm64/10.30.0/bin/pnpm", "args": ["remove", "-g", "clawhub", "--global-dir", "/Users/nicky/Library/pnpm/global/5", "--store-dir", "/Users/nicky/Library/pnpm/store/v10", "--virtual-store-dir", "/Users/nicky/Library/pnpm/global/5/.pnpm"] }, "launcher_only": ["/Users/nicky/Library/pnpm/clawhub", "/Users/nicky/Library/pnpm/clawdhub"], "refusals": [], "follow_up": ["never remove ~/Library/pnpm/global or the store wholesale"] },
+            }),
+        )
+        .size(21 * 1024 * 1024)
+        .remedy(native("/Users/nicky/Library/pnpm/.tools/@pnpm+macos-arm64/10.30.0/bin/pnpm", &["remove", "-g", "clawhub", "--global-dir", "/Users/nicky/Library/pnpm/global/5", "--store-dir", "/Users/nicky/Library/pnpm/store/v10", "--virtual-store-dir", "/Users/nicky/Library/pnpm/global/5/.pnpm"])),
+        tool(
+            Spec {
+                manager: "cargo",
+                root: "/Users/nicky/.cargo",
+                name: "wasm-pack",
+                version: Some("0.14.0"),
+                class: "duplicate",
+                detail: "duplicate — npm also installs wasm-pack 0.13.1, and that copy wins in the login shell",
+                severity: Severity::Attention,
+            },
+            json!({
+                "launchers": [{ "path": "/Users/nicky/.cargo/bin/wasm-pack", "kind": "regular_binary", "target": null, "target_exists": true, "owner": { "kind": "this_install" } }],
+                "resolution": { "wasm-pack": { "user_shell": "/opt/homebrew/bin/wasm-pack", "process": "/Users/nicky/.cargo/bin/wasm-pack", "status": "shadowed", "shadowed_by": "/opt/homebrew/bin/wasm-pack", "candidates": [["/opt/homebrew/bin/wasm-pack", { "kind": "other_tool", "manager": "npm", "identity_key": "npm:/opt/homebrew/lib/node_modules:wasm-pack" }], ["/Users/nicky/.cargo/bin/wasm-pack", { "kind": "this_install" }]] } },
+                "classifications": [{ "kind": "duplicate", "peers": ["npm:/opt/homebrew/lib/node_modules:wasm-pack"] }, { "kind": "shadowed", "by": "/opt/homebrew/bin/wasm-pack", "owner": { "kind": "other_tool", "manager": "npm", "identity_key": "npm:/opt/homebrew/lib/node_modules:wasm-pack" } }],
+                "primary_classification": "duplicate",
+                "removal": { "native": { "program": "cargo", "args": ["uninstall", "wasm-pack", "--root", "/Users/nicky/.cargo"] }, "launcher_only": [], "refusals": [], "follow_up": [] },
+                "manager_extra": { "source": "registry+https://github.com/rust-lang/crates.io-index", "target": "aarch64-apple-darwin", "profile": "release" },
+            }),
+        )
+        .size(12 * 1024 * 1024)
+        .remedy(native("cargo", &["uninstall", "wasm-pack", "--root", "/Users/nicky/.cargo"])),
+        tool(
+            Spec {
+                manager: "pipx",
+                root: "/Users/nicky/.local/pipx/venvs",
+                name: "rendercv",
+                version: Some("1.17.0"),
+                class: "broken",
+                detail: "broken — venv interpreter /opt/homebrew/opt/python@3.13/bin/python3.13 no longer exists",
+                severity: Severity::Attention,
+            },
+            json!({
+                "runtime": { "kind": "python", "path": "/opt/homebrew/opt/python@3.13/bin/python3.13", "version": "3.13.7", "exists": false, "source": "pipx_metadata.json source_interpreter" },
+                "launchers": [{ "path": "/Users/nicky/.local/bin/rendercv", "kind": "symlink", "target": "/Users/nicky/.local/pipx/venvs/rendercv/bin/rendercv", "target_exists": true, "owner": { "kind": "this_install" } }],
+                "classifications": [{ "kind": "broken", "reason": "interpreter missing" }],
+                "primary_classification": "broken",
+                "removal": { "native": { "program": "pipx", "args": ["uninstall", "rendercv"] }, "launcher_only": ["/Users/nicky/.local/bin/rendercv"], "refusals": [], "follow_up": [] },
+            }),
+        )
+        .size(180 * 1024 * 1024)
+        .remedy(native("pipx", &["uninstall", "rendercv"])),
+        tool(
+            Spec {
+                manager: "uv",
+                root: "/Users/nicky/.local/share/uv/tools",
+                name: "mcp-proxy",
+                version: Some("0.12.0"),
+                class: "review",
+                detail: "entrypoint mcp-reverse-proxy has no launcher (removed); `uv tool upgrade` may recreate it",
+                severity: Severity::Info,
+            },
+            json!({
+                "runtime": { "kind": "python", "path": "/opt/homebrew/opt/python@3.14/bin", "version": "3.14.6", "exists": true, "source": "pyvenv.cfg home" },
+                "commands": [{ "name": "mcp-proxy", "declared_target": "bin/mcp-proxy" }, { "name": "mcp-reverse-proxy", "declared_target": "bin/mcp-reverse-proxy" }],
+                "launchers": [{ "path": "/Users/nicky/.local/bin/mcp-proxy", "kind": "symlink", "target": "/Users/nicky/.local/share/uv/tools/mcp-proxy/bin/mcp-proxy", "target_exists": true, "owner": { "kind": "this_install" } }],
+                "resolution": { "mcp-proxy": { "user_shell": "/Users/nicky/.local/bin/mcp-proxy", "process": "/Users/nicky/.local/bin/mcp-proxy", "status": "active", "shadowed_by": null, "candidates": [] }, "mcp-reverse-proxy": { "user_shell": null, "process": null, "status": "not_on_path", "shadowed_by": null, "candidates": [] } },
+                "classifications": [{ "kind": "review", "reason": "works; one entrypoint launcher missing" }],
+                "manager_extra": { "requirements": ["mcp-proxy @ git+https://github.com/sparfenyuk/mcp-proxy"], "entrypoints_missing": ["mcp-reverse-proxy"] },
+                "removal": { "native": { "program": "uv", "args": ["tool", "uninstall", "mcp-proxy"] }, "launcher_only": ["/Users/nicky/.local/bin/mcp-proxy"], "refusals": [], "follow_up": ["a future `uv tool upgrade mcp-proxy` may recreate mcp-reverse-proxy"] },
+            }),
+        )
+        .size(64 * 1024 * 1024)
+        .remedy(native("uv", &["tool", "uninstall", "mcp-proxy"])),
+        tool(
+            Spec {
+                manager: "pip",
+                root: "/opt/homebrew/lib/python3.14/site-packages",
+                name: "requests",
+                version: Some("2.32.5"),
+                class: "review",
+                detail: "pip-installed into Homebrew's python@3.14 site (INSTALLER: pip, no Cellar files)",
+                severity: Severity::Info,
+            },
+            json!({
+                "layout": "homebrew-3.14",
+                "runtime": { "kind": "python", "path": "/opt/homebrew/bin/python3.14", "version": "3.14.7", "exists": true, "source": "site-packages path" },
+                "commands": [],
+                "resolution": {},
+                "classifications": [{ "kind": "review", "reason": "manually installed; nothing in this site requires it" }],
+                "manager_extra": { "installer": "pip", "requested": true, "homebrew_formula": null, "requires_dist": ["charset-normalizer", "idna", "urllib3", "certifi"], "required_by": [], "unevaluated_markers": [] },
+                "removal": { "native": { "program": "/opt/homebrew/bin/python3.14", "args": ["-m", "pip", "uninstall", "-y", "--break-system-packages", "requests"] }, "launcher_only": [], "refusals": [], "follow_up": ["charset-normalizer, idna, urllib3 become unrequired; certifi stays (Homebrew-owned)"] },
+            }),
+        )
+        .size(2 * 1024 * 1024)
+        .remedy(native("/opt/homebrew/bin/python3.14", &["-m", "pip", "uninstall", "-y", "--break-system-packages", "requests"])),
+        tool(
+            Spec {
+                manager: "pip",
+                root: "/opt/homebrew/lib/python3.14/site-packages",
+                name: "certifi",
+                version: Some("2026.7.22"),
+                class: "required",
+                detail: "Homebrew-owned (Cellar/certifi) — required by python@3.14 tooling; no remedy",
+                severity: Severity::Info,
+            },
+            json!({
+                "layout": "homebrew-3.14",
+                "commands": [],
+                "resolution": {},
+                "classifications": [{ "kind": "required", "by": ["brew_formula:certifi", "requests"] }],
+                "protected": "Homebrew formula certifi owns these files",
+                "manager_extra": { "installer": "brew", "requested": null, "homebrew_formula": "certifi", "requires_dist": [], "required_by": ["requests"], "unevaluated_markers": [] },
+            }),
+        ),
+        Finding::new(FindingKind::CommandResolution, "pnpm", "pnpm")
+            .detail("fish resolves ~/Library/pnpm/bin/pnpm; this process cannot resolve it (~/Library/pnpm/bin is not on its PATH)")
+            .path(PathBuf::from("/Users/nicky/Library/pnpm/bin/pnpm"))
+            .severity(Severity::Attention)
+            .provenance("fish -lc 'string join : $PATH' (starts the login shell, which runs its startup files)")
+            .meta(json!({
+                "command": "pnpm",
+                "user_shell": { "shell": "fish", "path": "/opt/homebrew/bin/fish" },
+                "user_resolution": "/Users/nicky/Library/pnpm/bin/pnpm",
+                "process_resolution": null,
+                "differs": true,
+                "candidates": [{ "path": "/Users/nicky/Library/pnpm/bin/pnpm", "target": null, "owner": { "kind": "pnpm_home" }, "installation": null }],
+                "group": "Command resolution",
+            })),
+        Finding::new(FindingKind::ToolCoverage, "__coverage__", "Global tools coverage")
+            .detail("npm ok · pnpm ok (2 layouts) · cargo ok · pipx ok · uv ok · pip ok (3 sites) · bun absent")
+            .severity(Severity::Info)
+            .provenance("filesystem metadata; login shell PATH via fish -lc")
+            .coverage("projects: 41 scanned under ~/dev (not truncated); shell history evidence disabled")
+            .meta(json!({
+                "managers": {
+                    "npm": { "status": "ok", "prefixes": ["/opt/homebrew", "/Users/nicky/Library/pnpm/nodejs/24.15.0"] },
+                    "pnpm": { "status": "ok", "layouts": ["v11", "legacy-5"] },
+                    "cargo": { "status": "ok" }, "pipx": { "status": "ok" }, "uv": { "status": "ok" },
+                    "pip": { "status": "ok", "sites": 3 }, "bun": { "status": "absent" }
+                },
+                "shell": { "login_shell": "/opt/homebrew/bin/fish", "source": "fish -lc 'string join : $PATH'", "disclosure": "Starting the login shell executes its startup configuration." },
+                "projects": { "roots": ["/Users/nicky/dev"], "scanned": 41, "truncated": false },
+                "history": { "enabled": false },
+                "group": "Coverage",
+            })),
     ]
 }
 
@@ -631,12 +943,16 @@ fn launchd_fixtures() -> Vec<Finding> {
                     },
                     reclaims_bytes: None,
                     destructive: true,
+                    alternative: false,
+                    guard: None,
                 })
                 .remedy(Remedy {
                     label: "Move plist to Trash — do this after unloading".to_string(),
                     command: RemedyCommand::Trash { path: PathBuf::from(path) },
                     reclaims_bytes: None,
                     destructive: true,
+                    alternative: false,
+                    guard: None,
                 })
         },
         item(
@@ -713,6 +1029,8 @@ fn shell_env_fixtures() -> Vec<Finding> {
                 },
                 reclaims_bytes: None,
                 destructive: false,
+                alternative: false,
+                guard: None,
             }),
         ),
         Finding::new(
@@ -840,6 +1158,8 @@ fn docker_fixtures() -> Vec<Finding> {
             },
             reclaims_bytes: Some(1_800_000_000),
             destructive: true,
+            alternative: false,
+            guard: None,
         }),
         Finding::new(
             FindingKind::DockerObject,
@@ -865,6 +1185,8 @@ fn docker_fixtures() -> Vec<Finding> {
             },
             reclaims_bytes: Some(210_000_000),
             destructive: true,
+            alternative: false,
+            guard: None,
         }),
         Finding::new(
             FindingKind::DockerObject,
@@ -898,6 +1220,8 @@ fn docker_fixtures() -> Vec<Finding> {
             },
             reclaims_bytes: Some(2_600_000_000),
             destructive: true,
+            alternative: false,
+            guard: None,
         }),
         Finding::new(
             FindingKind::DockerObject,
@@ -949,6 +1273,8 @@ fn ports_fixtures() -> Vec<Finding> {
                     },
                     reclaims_bytes: None,
                     destructive: false,
+                    alternative: false,
+                    guard: None,
                 });
             if let Some(path) = path {
                 f = f.path(path).remedy(reveal(path));
@@ -1158,6 +1484,8 @@ fn simulator_fixtures() -> Vec<Finding> {
             },
             reclaims_bytes: None,
             destructive: true,
+            alternative: false,
+            guard: None,
         }),
         Finding::new(
             FindingKind::Simulator,
@@ -1197,6 +1525,8 @@ fn simulator_fixtures() -> Vec<Finding> {
             },
             reclaims_bytes: Some(5 * GIB),
             destructive: true,
+            alternative: false,
+            guard: None,
         }),
         Finding::new(
             FindingKind::Simulator,
@@ -1223,6 +1553,8 @@ fn simulator_fixtures() -> Vec<Finding> {
             },
             reclaims_bytes: Some(4 * GIB),
             destructive: true,
+            alternative: false,
+            guard: None,
         }),
         Finding::new(
             FindingKind::Simulator,
@@ -1249,6 +1581,8 @@ fn simulator_fixtures() -> Vec<Finding> {
             },
             reclaims_bytes: Some(3 * GIB + 500 * MIB),
             destructive: true,
+            alternative: false,
+            guard: None,
         }),
     ]
 }
@@ -1381,6 +1715,8 @@ fn tm_snapshots_fixtures() -> Vec<Finding> {
                 },
                 reclaims_bytes: None,
                 destructive: true,
+                alternative: false,
+                guard: None,
             })
         })
         .collect()

@@ -9,6 +9,7 @@ use crate::scan::brew::BrewScanner;
 use crate::scan::docker::DockerScanner;
 use crate::scan::fs::FsScanner;
 use crate::scan::git::GitScanner;
+use crate::scan::global_tools::ToolsScanner;
 use crate::scan::launchd::LaunchdScanner;
 use crate::scan::ports::PortsScanner;
 use crate::scan::runtimes::RuntimesScanner;
@@ -64,6 +65,13 @@ pub const REGISTRY: &[SectionMeta] = &[
         short_title: "Brew",
         view: ViewKind::Tree,
         build: || Box::new(BrewScanner),
+    },
+    SectionMeta {
+        id: ScannerId::Tools,
+        title: "Global Tools",
+        short_title: "Tools",
+        view: ViewKind::Tree,
+        build: || Box::new(ToolsScanner),
     },
     SectionMeta {
         id: ScannerId::Fs,

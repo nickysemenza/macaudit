@@ -545,6 +545,8 @@ fn artifact_finding(
         },
         reclaims_bytes: size,
         destructive: true,
+        alternative: false,
+        guard: None,
     })
 }
 
@@ -571,6 +573,8 @@ fn large_file_finding(path: &Path, size: u64) -> Finding {
             },
             reclaims_bytes: Some(size),
             destructive: true,
+            alternative: false,
+            guard: None,
         })
         .remedy(Remedy {
             label: "Reveal in Finder".into(),
@@ -579,6 +583,8 @@ fn large_file_finding(path: &Path, size: u64) -> Finding {
             },
             reclaims_bytes: None,
             destructive: false,
+            alternative: false,
+            guard: None,
         })
 }
 
@@ -770,6 +776,8 @@ fn emit_fixed(
                 },
                 reclaims_bytes: Some(size),
                 destructive: true,
+                alternative: false,
+                guard: None,
             },
         ),
         FixedRemedy::Reveal => (
@@ -781,6 +789,8 @@ fn emit_fixed(
                 },
                 reclaims_bytes: None,
                 destructive: false,
+                alternative: false,
+                guard: None,
             },
         ),
         FixedRemedy::Shell {
@@ -799,6 +809,8 @@ fn emit_fixed(
                 // removes unreferenced packages) — don't promise the full size.
                 reclaims_bytes: None,
                 destructive: true,
+                alternative: false,
+                guard: None,
             },
         ),
     };

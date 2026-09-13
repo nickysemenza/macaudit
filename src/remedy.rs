@@ -16,7 +16,7 @@ use crate::model::{FindingId, Remedy, RemedyCommand};
 use crate::runner::CommandRunner;
 
 /// A single, fully-resolved action ready to show and (optionally) run.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PlannedAction {
     pub finding_id: FindingId,
     pub label: String,
@@ -149,6 +149,40 @@ impl RemedyEngine {
                 clipboard.copy(text)?;
                 Ok(format!("Copied to clipboard: {text}"))
             }
+            RemedyCommand::Probe {
+                program,
+                args,
+                timeout_secs,
+            } => {
+                // A health check the user asked for explicitly. Bounded so a
+                // hung tool can't stall the cleanup flow; the first stdout
+                // line is what the user wanted to see (`--version` output).
+                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                let run = runner.run(program, &arg_refs, token);
+                match tokio::time::timeout(std::time::Duration::from_secs(*timeout_secs), run).await
+                {
+                    Err(_) => {
+                        anyhow::bail!("`{}` timed out after {timeout_secs}s", action.rendered)
+                    }
+                    Ok(Err(e)) => Err(e),
+                    Ok(Ok(out)) if out.success() => {
+                        let first = out
+                            .stdout_str()
+                            .lines()
+                            .find(|l| !l.trim().is_empty())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        Ok(format!("Probe ok: {} → {first}", action.rendered))
+                    }
+                    Ok(Ok(out)) => anyhow::bail!(
+                        "`{}` exited {}: {}",
+                        action.rendered,
+                        out.status,
+                        out.stderr_str().trim()
+                    ),
+                }
+            }
         }
     }
 }
@@ -173,6 +207,8 @@ mod tests {
             },
             reclaims_bytes: Some(10),
             destructive: true,
+            alternative: false,
+            guard: None,
         };
         let a = eng.plan_one(fid(), &r);
         assert_eq!(a.rendered, "trash /p/target");
@@ -189,6 +225,8 @@ mod tests {
             },
             reclaims_bytes: None,
             destructive: true,
+            alternative: false,
+            guard: None,
         };
         let a = eng.plan_one(fid(), &r);
         assert_eq!(a.rendered, "rm -rf '/p/My Target'");
@@ -222,6 +260,8 @@ mod tests {
             },
             reclaims_bytes: None,
             destructive: true,
+            alternative: false,
+            guard: None,
         };
         let a = eng.plan_one(fid(), &r);
         let trash = FakeTrash(Mutex::new(vec![]));
@@ -254,6 +294,8 @@ mod tests {
             },
             reclaims_bytes: None,
             destructive: false,
+            alternative: false,
+            guard: None,
         };
         let a = eng.plan_one(fid(), &r);
         let runner =
@@ -282,6 +324,8 @@ mod tests {
             },
             reclaims_bytes: None,
             destructive: false,
+            alternative: false,
+            guard: None,
         };
         let a = eng.plan_one(fid(), &r);
         let clip = FakeClipboard::default();

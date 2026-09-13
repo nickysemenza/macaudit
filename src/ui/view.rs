@@ -198,7 +198,7 @@ mod tests {
     #[test]
     fn sort_is_per_section_and_s_cycles_through_columns() {
         let mut app = app_with_gen(1);
-        app.handle(Action::Char('0')); // Git (index 9)
+        app.handle(Action::JumpSection(10)); // Git (index 10)
         app.apply(git_repo(1, "b-small", 1, "main"));
         app.apply(git_repo(1, "a-big", 100, "zeta"));
         app.apply(git_repo(1, "c-mid", 50, "alpha"));
@@ -226,7 +226,7 @@ mod tests {
         assert_eq!(names(&app), ["a-big", "b-small", "c-mid"]);
 
         // Another section is untouched by Git's sort.
-        app.handle(Action::Char('4')); // Disk
+        app.handle(Action::Char('5')); // Disk
         assert_eq!(app.sort_label(), "Size↓");
     }
 }
