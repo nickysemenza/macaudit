@@ -25,14 +25,20 @@ struct SegmentedBar: View {
             GeometryReader { geo in
                 let width = geo.size.width
                 let scale = capacity > 0 ? width / CGFloat(capacity) : 0
-                HStack(spacing: 1) {
-                    ForEach(segments) { seg in
-                        let w = max(CGFloat(seg.bytes) * scale, seg.bytes > 0 ? 2 : 0)
-                        Rectangle()
-                            .fill(seg.color.opacity(hovered == nil || hovered == seg.name ? 1 : 0.35))
-                            .frame(width: w)
-                            .onHover { hovered = $0 ? seg.name : nil }
-                            .help("\(seg.name): \(Formatting.bytes(seg.bytes))")
+                let spacing: CGFloat = 1
+                // Explicit widths so gaps and minimum widths come out of the
+                // remainder instead of pushing the bar past its container.
+                let widths = segments.map { max(CGFloat($0.bytes) * scale, $0.bytes > 0 ? 2 : 0) }
+                let usedWidth = widths.reduce(0, +) + spacing * CGFloat(widths.filter { $0 > 0 }.count)
+                HStack(spacing: spacing) {
+                    ForEach(Array(zip(segments, widths)), id: \.0.id) { seg, w in
+                        if w > 0 {
+                            Rectangle()
+                                .fill(seg.color.opacity(hovered == nil || hovered == seg.name ? 1 : 0.35))
+                                .frame(width: w)
+                                .onHover { hovered = $0 ? seg.name : nil }
+                                .help("\(seg.name): \(Formatting.bytes(seg.bytes))")
+                        }
                     }
                     ZStack(alignment: .trailing) {
                         Rectangle().fill(.quaternary)
@@ -43,8 +49,9 @@ struct SegmentedBar: View {
                                 .lineLimit(1)
                         }
                     }
-                    .frame(width: max(0, width - CGFloat(min(filled, capacity)) * scale))
+                    .frame(width: max(0, width - usedWidth))
                 }
+                .frame(width: width)
                 .clipShape(RoundedRectangle(cornerRadius: 6))
                 .animation(.easeOut(duration: 0.4), value: segments)
             }
