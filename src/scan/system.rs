@@ -16,6 +16,10 @@ use crate::scan::{ScanCtx, Scanner};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const PROCESS_LIMIT: usize = 12;
+/// Native macOS storage availability includes reclaimable space, such as local
+/// Time Machine snapshots. JXA/osascript ships with macOS and avoids compiling
+/// Swift on each manual scan.
+const VOLUME_CAPACITY_SCRIPT: &str = r#"ObjC.import("Foundation"); const url = $.NSURL.fileURLWithPath("/"); function value(key) { const out = Ref(); url.getResourceValueForKeyError(out, key, null); return ObjC.unwrap(out[0]); } JSON.stringify({total:value($.NSURLVolumeTotalCapacityKey), physical:value($.NSURLVolumeAvailableCapacityKey), important:value($.NSURLVolumeAvailableCapacityForImportantUsageKey)});"#;
 
 #[derive(Default)]
 pub struct SystemScanner;
@@ -123,7 +127,21 @@ impl Scanner for SystemScanner {
         ctx.progress("sampling disk", 2, Some(5)).await;
 
         let disk = command(&ctx, "diskutil", &["info", "-plist", "/"]).await;
+        let macos_capacity = command(
+            &ctx,
+            "osascript",
+            &["-l", "JavaScript", "-e", VOLUME_CAPACITY_SCRIPT],
+        )
+        .await
+        .and_then(|output| parse_macos_capacity(&output));
+        let local_snapshot_count = command(&ctx, "tmutil", &["listlocalsnapshots", "/"])
+            .await
+            .map(|output| count_local_snapshots(&output));
         if let Some(disk) = disk.as_deref().and_then(parse_diskutil_info) {
+            let available = macos_capacity
+                .map(|capacity| capacity.important)
+                .filter(|available| *available >= disk.free);
+            let reclaimable = available.map(|available| available.saturating_sub(disk.free));
             let severity = if disk.capacity > 0 && disk.used as f64 / disk.capacity as f64 >= 0.95 {
                 Severity::Warning
             } else if disk.capacity > 0 && disk.used as f64 / disk.capacity as f64 >= 0.85 {
@@ -133,17 +151,36 @@ impl Scanner for SystemScanner {
             };
             ctx.emit(
                 Finding::new(FindingKind::SystemMetric, "root-disk", "Root disk")
-                    .detail(format!(
-                        "{} used of {}; {} free",
-                        human(disk.used), human(disk.capacity), human(disk.free)
-                    ))
+                    .detail(match (available, reclaimable, local_snapshot_count) {
+                        (Some(available), Some(reclaimable), Some(snapshot_count)) => format!(
+                            "{} used of {}; {} APFS free; {} macOS available (includes ~{} macOS-managed space: {snapshot_count} local Time Machine snapshots, whose exact bytes macOS does not report, plus other purgeable space it does not itemize)",
+                            human(disk.used),
+                            human(disk.capacity),
+                            human(disk.free),
+                            human(available),
+                            human(reclaimable)
+                        ),
+                        (Some(available), Some(reclaimable), None) => format!(
+                            "{} used of {}; {} APFS free; {} macOS available (includes ~{} macOS-managed reclaimable space; category breakdown unavailable)",
+                            human(disk.used),
+                            human(disk.capacity),
+                            human(disk.free),
+                            human(available),
+                            human(reclaimable)
+                        ),
+                        _ => format!(
+                            "{} used of {}; {} APFS free",
+                            human(disk.used), human(disk.capacity), human(disk.free)
+                        ),
+                    })
                     // Root capacity is the one System metric that is useful
                     // in history; the live CPU/memory/process observations
                     // above remain ephemeral.
                     .size(disk.used)
                     .severity(severity)
-                    .provenance("diskutil info -plist /")
-                    .meta(json!({ "role": "disk", "capacity_bytes": disk.capacity, "used_bytes": disk.used, "free_bytes": disk.free })),
+                    .provenance("diskutil info -plist /; NSURLVolumeAvailableCapacityForImportantUsageKey via osascript")
+                    .coverage("APFS free is immediately unallocated space. macOS available includes purgeable space and is an estimate that can change without deleting user files. Time Machine local snapshots are counted, but macOS does not report reliable per-snapshot or aggregate byte sizes.")
+                    .meta(json!({ "role": "disk", "capacity_bytes": disk.capacity, "used_bytes": disk.used, "apfs_free_bytes": disk.free, "macos_available_bytes": available, "estimated_reclaimable_bytes": reclaimable, "local_time_machine_snapshot_count": local_snapshot_count })),
             )
             .await;
         }
@@ -349,6 +386,26 @@ fn parse_diskutil_info(input: &str) -> Option<DiskUsage> {
     })
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MacosCapacity {
+    important: u64,
+}
+
+fn parse_macos_capacity(input: &str) -> Option<MacosCapacity> {
+    let value: serde_json::Value = serde_json::from_str(input.trim()).ok()?;
+    let total = value.get("total")?.as_u64()?;
+    let physical = value.get("physical")?.as_u64()?;
+    let important = value.get("important")?.as_u64()?;
+    (important >= physical && total >= important).then_some(MacosCapacity { important })
+}
+
+fn count_local_snapshots(input: &str) -> u64 {
+    input
+        .lines()
+        .filter(|line| line.trim().starts_with("com.apple.TimeMachine."))
+        .count() as u64
+}
+
 #[derive(Debug, Clone)]
 struct Process {
     pid: u64,
@@ -487,6 +544,24 @@ mod tests {
         assert!(parse_diskutil_info("nope").is_none());
     }
 
+    #[test]
+    fn parses_native_macos_available_capacity() {
+        let capacity =
+            parse_macos_capacity(r#"{"total":1000,"physical":40,"important":330}"#).unwrap();
+        assert_eq!(capacity.important, 330);
+        assert!(parse_macos_capacity(r#"{"total":1000,"physical":40,"important":1200}"#).is_none());
+    }
+
+    #[test]
+    fn counts_time_machine_local_snapshots_without_assuming_sizes() {
+        assert_eq!(
+            count_local_snapshots(
+                "Snapshots for disk /:\ncom.apple.TimeMachine.2024-06-01-120000.local\nnot a snapshot\ncom.apple.TimeMachine.2024-06-02-120000.local\n"
+            ),
+            2
+        );
+    }
+
     #[tokio::test]
     async fn emits_ephemeral_live_data_and_durable_root_disk() {
         let disk_xml = r#"<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>TotalSize</key><integer>1000</integer><key>APFSContainerFree</key><integer>250</integer></dict></plist>"#;
@@ -498,6 +573,16 @@ mod tests {
             .on("memory_pressure", &["-Q"], "System-wide memory pressure: 10%\n")
             .on("sysctl", &["-n", "vm.swapusage"], "total = 4096.00M  used = 0.00M  free = 4096.00M")
             .on("diskutil", &["info", "-plist", "/"], disk_xml)
+            .on(
+                "osascript",
+                &["-l", "JavaScript", "-e", VOLUME_CAPACITY_SCRIPT],
+                r#"{"total":1000,"physical":250,"important":500}"#,
+            )
+            .on(
+                "tmutil",
+                &["listlocalsnapshots", "/"],
+                "Snapshots for disk /:\ncom.apple.TimeMachine.2024-06-01-120000.local\ncom.apple.TimeMachine.2024-06-02-120000.local\n",
+            )
             .on("ps", &["-axo", "pid=,user=,%cpu=,%mem=,rss=,state=,comm="], " 123 nicky 45.2 2.5 1048576 R /Applications/Chrome\n");
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let ctx = ScanCtx {
@@ -524,5 +609,9 @@ mod tests {
         let root = findings.iter().find(|f| f.title == "Root disk").unwrap();
         assert_eq!(root.snapshot_policy, crate::model::SnapshotPolicy::Durable);
         assert_eq!(root.size_bytes, Some(750));
+        assert_eq!(root.meta["macos_available_bytes"], 500);
+        assert_eq!(root.meta["estimated_reclaimable_bytes"], 250);
+        assert_eq!(root.meta["local_time_machine_snapshot_count"], 2);
+        assert!(root.detail.contains("2 local Time Machine snapshots"));
     }
 }

@@ -136,7 +136,7 @@ github_cache_ttl_hours = 72      # how long a cached GitHub release result stays
 
 | Section | What it finds |
 |---|---|
-| Resource Health | Manual CPU load, memory pressure/compression, swap, APFS root capacity, and current high-CPU/RAM processes. It is a point-in-time view, not a background monitor; live observations never enter snapshot diffs. |
+| Resource Health | Manual CPU load, memory pressure/compression, swap, and current high-CPU/RAM processes. Root Disk explicitly distinguishes raw APFS free space from macOS available capacity, which includes purgeable space. It names the count of local Time Machine snapshots, but does not invent a byte size for them: macOS does not report a reliable per-snapshot or aggregate total. It is a point-in-time view, not a background monitor; live observations never enter snapshot diffs. |
 | Apps | Installed applications, classified System / User / cask-managed / App Store / Unmanaged, with arch (Intel/Rosetta) and code-signing info. |
 | Brew | Installed formulae and casks, dependency tree, outdated packages, casks correlated to installed `.app`s. |
 | Disk | Build artifacts (`node_modules`, `target`, `.venv`, etc.), package-manager caches, and large loose files found by a parallel filesystem walk, plus bounded top-level allocation categories with explicit coverage labels. |
