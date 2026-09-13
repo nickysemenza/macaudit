@@ -50,6 +50,97 @@ struct Hit {
     label: String,
     last_used: Option<SystemTime>,
     stale: bool,
+    ctx: ArtifactCtx,
+}
+
+/// What we know about an artifact beyond its path: which marker justified
+/// it, the git worktree it lives in, and (pnpm) the store it shares files
+/// with.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ArtifactCtx {
+    marker: Option<String>,
+    /// `(main repo root, worktree name)` when the enclosing repo is a linked
+    /// worktree (`.git` is a file pointing into `<main>/.git/worktrees/<name>`).
+    worktree: Option<(PathBuf, String)>,
+    /// Nearest enclosing repository root (worktree or main).
+    repo_root: Option<PathBuf>,
+    /// pnpm-linked `node_modules`: the store dir from `.modules.yaml`.
+    pnpm_store: Option<PathBuf>,
+    pnpm_import_method: Option<String>,
+}
+
+/// Inspect an artifact's surroundings (cheap: a few `exists`/reads).
+fn artifact_ctx(name: &str, path: &Path) -> ArtifactCtx {
+    let parent = path.parent();
+    let sibling = |file: &str| parent.map(|p| p.join(file).exists()).unwrap_or(false);
+    let inside = |file: &str| path.join(file).exists();
+    let marker = match name {
+        "target" if sibling("Cargo.toml") => Some("Cargo.toml".to_string()),
+        "target" if inside(".rustc_info.json") => Some("target/.rustc_info.json".to_string()),
+        "target" if inside("CACHEDIR.TAG") => Some("target/CACHEDIR.TAG".to_string()),
+        "node_modules" => Some("package.json".to_string()),
+        _ => None,
+    };
+    let (repo_root, worktree) = enclosing_repo(path);
+    let (pnpm_store, pnpm_import_method) = if name == "node_modules" && path.join(".pnpm").is_dir()
+    {
+        let scalars = std::fs::read_to_string(path.join(".modules.yaml"))
+            .map(|t| crate::scan::global_tools::flatyaml::top_level_scalars(&t))
+            .unwrap_or_default();
+        (
+            Some(
+                scalars
+                    .get("storeDir")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("(pnpm store)")),
+            ),
+            scalars
+                .get("packageImportMethod")
+                .cloned()
+                .or(Some("auto (clone/hardlink)".into())),
+        )
+    } else {
+        (None, None)
+    };
+    ArtifactCtx {
+        marker,
+        worktree,
+        repo_root,
+        pnpm_store,
+        pnpm_import_method,
+    }
+}
+
+/// Walk up from `path` to the nearest `.git`; a `.git` *file* names a linked
+/// worktree (`gitdir: <main>/.git/worktrees/<name>`).
+fn enclosing_repo(path: &Path) -> (Option<PathBuf>, Option<(PathBuf, String)>) {
+    let mut cur = path.parent();
+    while let Some(dir) = cur {
+        let git = dir.join(".git");
+        if git.is_dir() {
+            return (Some(dir.to_path_buf()), None);
+        }
+        if git.is_file() {
+            let worktree = std::fs::read_to_string(&git).ok().and_then(|t| {
+                let gitdir = t.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim();
+                let gitdir = if Path::new(gitdir).is_absolute() {
+                    PathBuf::from(gitdir)
+                } else {
+                    dir.join(gitdir)
+                };
+                let s = gitdir.to_string_lossy();
+                let idx = s.find("/.git/worktrees/")?;
+                let main = PathBuf::from(&s[..idx]);
+                let name = s[idx + "/.git/worktrees/".len()..]
+                    .trim_end_matches('/')
+                    .to_string();
+                Some((main, name))
+            });
+            return (Some(dir.to_path_buf()), worktree);
+        }
+        cur = dir.parent();
+    }
+    (None, None)
 }
 
 /// Immutable state shared with every `WalkParallel` visitor closure. Held behind
@@ -163,9 +254,48 @@ impl Scanner for FsScanner {
                         .copied()
                         .filter(|c| is_fresh(c, root_mtime, now_secs, ttl_hours));
 
+                    // pnpm-linked node_modules: also learn how much is
+                    // hard-linked from the store (cached under a sibling key).
+                    let shared_key = hit.path.join("#macaudit-external-links");
+                    let shared_cached = cache
+                        .get(&shared_key)
+                        .copied()
+                        .filter(|c| is_fresh(c, root_mtime, now_secs, ttl_hours))
+                        .map(|c| c.size);
+                    let mut shared_bytes: Option<u64> = None;
                     let (size, was_cached) = match cached {
-                        Some(c) => (c.size, true),
-                        None => {
+                        Some(c) if hit.ctx.pnpm_store.is_none() || shared_cached.is_some() => {
+                            shared_bytes = shared_cached;
+                            (c.size, true)
+                        }
+                        _ if hit.ctx.pnpm_store.is_some() => {
+                            let s = crate::scan::sizing::du_blocks_shared(&hit.path, &|| {
+                                token_sz.is_cancelled()
+                            });
+                            if token_sz.is_cancelled() {
+                                return;
+                            }
+                            let mut fresh = fresh_sz.lock().unwrap();
+                            fresh.push((
+                                hit.path.clone(),
+                                CachedSize {
+                                    size: s.bytes,
+                                    computed_at: now_secs,
+                                    root_mtime,
+                                },
+                            ));
+                            fresh.push((
+                                shared_key.clone(),
+                                CachedSize {
+                                    size: s.externally_linked,
+                                    computed_at: now_secs,
+                                    root_mtime,
+                                },
+                            ));
+                            shared_bytes = Some(s.externally_linked);
+                            (s.bytes, false)
+                        }
+                        _ => {
                             let size = du_blocks(&hit.path, &|| token_sz.is_cancelled());
                             // A du interrupted by cancellation returns a PARTIAL
                             // sum. Never record that: with an unchanged root
@@ -194,6 +324,8 @@ impl Scanner for FsScanner {
                         hit.stale,
                         Some(size),
                         was_cached,
+                        &hit.ctx,
+                        shared_bytes,
                     );
                     let _ = tx_sz.blocking_send(ScanEvent::Finding {
                         scanner: ScannerId::Fs,
@@ -437,7 +569,8 @@ fn visit(shared: &WalkShared, result: Result<ignore::DirEntry, ignore::Error>) -
             if !shared.discovery_only {
                 let last_used = path.parent().and_then(parent_max_mtime);
                 let stale = is_stale(last_used, shared.stale_after_days);
-                let f = artifact_finding(path, name, last_used, stale, None, false);
+                let ctx = artifact_ctx(name, path);
+                let f = artifact_finding(path, name, last_used, stale, None, false, &ctx, None);
                 let _ = shared.tx.blocking_send(ScanEvent::Finding {
                     scanner: ScannerId::Fs,
                     gen: shared.gen,
@@ -450,6 +583,7 @@ fn visit(shared: &WalkShared, result: Result<ignore::DirEntry, ignore::Error>) -
                     label: name.to_string(),
                     last_used,
                     stale,
+                    ctx,
                 });
             }
             // Whether or not we emit, do NOT descend into an artifact subtree.
@@ -486,7 +620,10 @@ fn is_artifact(name: &str, path: &Path, config: &crate::config::Config) -> bool 
 
     match name {
         "node_modules" => sibling("package.json"),
-        "target" => sibling("Cargo.toml"),
+        // A cargo target dir is recognised by its parent manifest or, when
+        // CARGO_TARGET_DIR points elsewhere / the manifest is a workspace
+        // level up, by what cargo itself writes into it.
+        "target" => sibling("Cargo.toml") || inside(".rustc_info.json") || inside("CACHEDIR.TAG"),
         ".venv" | "venv" => inside("pyvenv.cfg"),
         "__pycache__" => true,
         "build" | "dist" => parent
@@ -506,6 +643,7 @@ fn is_artifact(name: &str, path: &Path, config: &crate::config::Config) -> bool 
 /// re-emit passes `Some` — same `(kind, key)` ⇒ same `FindingId`. `cached`
 /// marks a re-emit whose size came from the size cache rather than a fresh
 /// `du_blocks` (surfaced to the UI via `meta.size_cached`).
+#[allow(clippy::too_many_arguments)]
 fn artifact_finding(
     path: &Path,
     label: &str,
@@ -513,6 +651,8 @@ fn artifact_finding(
     stale: bool,
     size: Option<u64>,
     cached: bool,
+    ctx: &ArtifactCtx,
+    shared_bytes: Option<u64>,
 ) -> Finding {
     let key = path.to_string_lossy();
     let parent_name = path
@@ -520,16 +660,59 @@ fn artifact_finding(
         .and_then(|p| p.file_name())
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let title = format!("{label} — {parent_name}");
+    let title = match &ctx.worktree {
+        Some((_, wt)) => format!("{label} — {parent_name} (worktree {wt})"),
+        None => format!("{label} — {parent_name}"),
+    };
 
-    let mut meta = json!({ "stale": stale, "artifact": label, "group": label });
+    let mut meta = json!({
+        "stale": stale,
+        "artifact": label,
+        "group": label,
+        "marker": ctx.marker,
+        "repo_root": ctx.repo_root,
+        "worktree_of": ctx.worktree.as_ref().map(|(m, _)| m.clone()),
+        "worktree_name": ctx.worktree.as_ref().map(|(_, n)| n.clone()),
+    });
     if cached {
         meta["size_cached"] = json!(true);
+    }
+    // What trashing actually reclaims: pnpm links package files from its
+    // store, so the store keeps most of these bytes alive.
+    let reclaim = match (size, shared_bytes) {
+        (Some(s), Some(shared)) => Some(s.saturating_sub(shared)),
+        (s, _) => s,
+    };
+    let mut coverage: Option<String> = None;
+    if let Some(store) = &ctx.pnpm_store {
+        meta["layout"] = json!("pnpm");
+        meta["store_dir"] = json!(store);
+        meta["import_method"] = json!(ctx.pnpm_import_method);
+        meta["shared_hardlink_bytes"] = json!(shared_bytes);
+        meta["estimated_reclaim_bytes"] = json!(reclaim);
+        coverage = Some(match shared_bytes {
+            Some(b) => format!(
+                "pnpm links package files from {}: {} of this size is hard-linked from the store and reclaims nothing while the store keeps it; APFS clones (pnpm's default import method) are not detectable and may make the real reclaim smaller still. Run `pnpm store prune` afterwards.",
+                store.display(),
+                humansize::format_size(b, humansize::BINARY)
+            ),
+            None => format!(
+                "pnpm links package files from {}; the hard-linked and cloned share is not measured yet, so the real reclaim is at most this size.",
+                store.display()
+            ),
+        });
     }
 
     let mut f = Finding::new(FindingKind::BuildArtifact, &key, title)
         .path(path.to_path_buf())
-        .detail(format!("Build artifact ({label})"))
+        .detail(match (&ctx.worktree, &ctx.pnpm_store) {
+            (Some((main, _)), _) => format!(
+                "Build artifact ({label}) in a worktree of {}",
+                main.display()
+            ),
+            (_, Some(_)) => format!("Build artifact ({label}, pnpm-linked)"),
+            _ => format!("Build artifact ({label})"),
+        })
         .severity(Severity::Reclaimable)
         .meta(meta);
     if let Some(sz) = size {
@@ -538,16 +721,60 @@ fn artifact_finding(
     if let Some(lu) = last_used {
         f = f.last_used(lu);
     }
-    f.remedy(Remedy {
-        label: "Move to Trash".into(),
-        command: RemedyCommand::Trash {
+    if let Some(c) = coverage {
+        f = f.coverage(c);
+    }
+    let trash = Remedy::new(
+        "Move to Trash",
+        RemedyCommand::Trash {
             path: path.to_path_buf(),
         },
-        reclaims_bytes: size,
-        destructive: true,
-        alternative: false,
-        guard: None,
-    })
+    )
+    .destructive()
+    .reclaims(reclaim);
+    // cargo's own cleanup respects its layout and reclaims immediately; Trash
+    // stays available as the alternative (and is the primary action when the
+    // manifest is missing).
+    let manifest = path
+        .parent()
+        .map(|p| p.join("Cargo.toml"))
+        .filter(|m| m.exists());
+    match (label, manifest) {
+        ("target", Some(manifest)) => {
+            f = f
+                .remedy(
+                    Remedy::new(
+                        "cargo clean",
+                        RemedyCommand::Shell {
+                            program: "cargo".into(),
+                            args: vec![
+                                "clean".into(),
+                                "--manifest-path".into(),
+                                manifest.display().to_string(),
+                            ],
+                        },
+                    )
+                    .destructive()
+                    .reclaims(reclaim),
+                )
+                .remedy(trash.alternative());
+        }
+        _ => f = f.remedy(trash),
+    }
+    if ctx.pnpm_store.is_some() {
+        f = f.remedy(
+            Remedy::new(
+                "pnpm store prune (after trashing)",
+                RemedyCommand::Shell {
+                    program: "pnpm".into(),
+                    args: vec!["store".into(), "prune".into()],
+                },
+            )
+            .destructive()
+            .alternative(),
+        );
+    }
+    f
 }
 
 /// A large loose file: sized inline (we already have its metadata). Severity
@@ -959,6 +1186,143 @@ mod tests {
         assert!(drain(rx)
             .iter()
             .any(|f| f.path.as_deref() == Some(proj.join("target").as_path())));
+    }
+
+    #[tokio::test]
+    async fn target_recognised_by_contents_without_manifest_and_cargo_clean_primary() {
+        let home = tempfile::tempdir().unwrap();
+        // A workspace: manifest at the root, target beside it → cargo clean
+        // with that manifest is primary, Trash the alternative.
+        let ws = home.path().join("ws");
+        fs::create_dir_all(ws.join("target/debug")).unwrap();
+        fs::write(ws.join("Cargo.toml"), "[workspace]").unwrap();
+        fs::write(ws.join("target/debug/bin"), "x").unwrap();
+        // A relocated target dir with only cargo's own markers inside.
+        let reloc = home.path().join("cache/target");
+        fs::create_dir_all(reloc.join("release")).unwrap();
+        fs::write(reloc.join(".rustc_info.json"), "{}").unwrap();
+        fs::write(reloc.join("release/bin"), "x").unwrap();
+        // A plain dir named target with neither: not an artifact.
+        let decoy = home.path().join("docs/target");
+        fs::create_dir_all(&decoy).unwrap();
+        fs::write(decoy.join("goal.md"), "x").unwrap();
+
+        let (ctx, rx, _) = ctx_for(home.path(), false, false, vec![]);
+        FsScanner.scan(ctx).await.unwrap();
+        let findings = drain(rx);
+        let by_path = |p: &Path| {
+            findings
+                .iter()
+                .rfind(|f| f.path.as_deref() == Some(p))
+                .cloned()
+        };
+        let ws_target = by_path(&ws.join("target")).expect("workspace target");
+        assert_eq!(ws_target.meta["marker"], "Cargo.toml");
+        assert_eq!(
+            ws_target.remedies[0].command.rendered(),
+            format!(
+                "cargo clean --manifest-path {}",
+                ws.join("Cargo.toml").display()
+            )
+        );
+        assert!(!ws_target.remedies[0].alternative);
+        assert!(matches!(
+            ws_target.remedies[1].command,
+            RemedyCommand::Trash { .. }
+        ));
+        assert!(ws_target.remedies[1].alternative);
+        let reloc_target = by_path(&reloc).expect("relocated target");
+        assert_eq!(reloc_target.meta["marker"], "target/.rustc_info.json");
+        assert!(matches!(
+            reloc_target.remedies[0].command,
+            RemedyCommand::Trash { .. }
+        ));
+        assert!(by_path(&decoy).is_none());
+    }
+
+    #[tokio::test]
+    async fn worktree_artifacts_name_their_main_repo() {
+        let home = tempfile::tempdir().unwrap();
+        let main = home.path().join("dev/cubby");
+        fs::create_dir_all(main.join(".git/worktrees/native-api")).unwrap();
+        let wt = main.join(".claude/worktrees/native-api/cubby-ffi");
+        fs::create_dir_all(wt.join("target/debug")).unwrap();
+        fs::write(wt.join("Cargo.toml"), "[package]").unwrap();
+        fs::write(wt.join("target/debug/bin"), "x").unwrap();
+        fs::write(
+            main.join(".claude/worktrees/native-api/.git"),
+            format!(
+                "gitdir: {}\n",
+                main.join(".git/worktrees/native-api").display()
+            ),
+        )
+        .unwrap();
+        let (ctx, rx, _) = ctx_for(home.path(), false, false, vec![]);
+        FsScanner.scan(ctx).await.unwrap();
+        let f = drain(rx)
+            .into_iter()
+            .rfind(|f| f.path.as_deref() == Some(wt.join("target").as_path()))
+            .expect("worktree target");
+        assert_eq!(f.meta["worktree_of"], main.display().to_string());
+        assert_eq!(f.meta["worktree_name"], "native-api");
+        assert!(f.title.contains("(worktree native-api)"));
+        assert_eq!(
+            f.meta["repo_root"],
+            main.join(".claude/worktrees/native-api")
+                .display()
+                .to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn pnpm_node_modules_reports_store_shared_bytes_honestly() {
+        let home = tempfile::tempdir().unwrap();
+        let proj = home.path().join("code/app");
+        let nm = proj.join("node_modules");
+        fs::create_dir_all(nm.join(".pnpm/pkg@1/node_modules/pkg")).unwrap();
+        fs::write(proj.join("package.json"), "{}").unwrap();
+        let store = home.path().join("store/v10/files");
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("blob"), vec![b'x'; 8192]).unwrap();
+        fs::hard_link(
+            store.join("blob"),
+            nm.join(".pnpm/pkg@1/node_modules/pkg/index.js"),
+        )
+        .unwrap();
+        fs::write(
+            nm.join(".pnpm/pkg@1/node_modules/pkg/own.js"),
+            vec![b'y'; 4096],
+        )
+        .unwrap();
+        fs::write(
+            nm.join(".modules.yaml"),
+            format!(
+                "layoutVersion: 5\nstoreDir: {}\npackageImportMethod: clone-or-copy\n",
+                home.path().join("store/v10").display()
+            ),
+        )
+        .unwrap();
+
+        let (ctx, rx, _) = ctx_for(home.path(), false, false, vec![]);
+        FsScanner.scan(ctx).await.unwrap();
+        let f = drain(rx)
+            .into_iter()
+            .rfind(|f| f.path.as_deref() == Some(nm.as_path()) && f.size_bytes.is_some())
+            .expect("sized node_modules");
+        assert_eq!(f.meta["layout"], "pnpm");
+        let shared = f.meta["shared_hardlink_bytes"].as_u64().unwrap();
+        let size = f.size_bytes.unwrap();
+        assert!(shared > 0 && shared < size, "shared={shared} size={size}");
+        assert_eq!(
+            f.meta["estimated_reclaim_bytes"].as_u64().unwrap(),
+            size - shared
+        );
+        assert_eq!(f.remedies[0].reclaims_bytes, Some(size - shared));
+        assert!(f.coverage.as_deref().unwrap().contains("pnpm store prune"));
+        assert!(f
+            .remedies
+            .iter()
+            .any(|r| r.command.rendered() == "pnpm store prune" && r.alternative));
     }
 
     #[tokio::test]

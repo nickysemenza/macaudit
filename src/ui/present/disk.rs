@@ -24,6 +24,32 @@ fn detail(_: &Finding, m: &mut MetaView<'_>) -> Vec<Field> {
         ));
     }
     out.extend(kv_u64(m, "entries", "Entries"));
+    out.extend(kv_str(m, "marker", "Recognised by"));
+    if let Some(main) = m.str("worktree_of") {
+        let name = m.str("worktree_name").unwrap_or("?");
+        out.push(kv("Worktree", format!("{name} of {main}")));
+    }
+    out.extend(kv_str(m, "repo_root", "Repository"));
+    if let Some(layout) = m.str("layout") {
+        out.push(kv("Layout", layout));
+        out.extend(kv_str(m, "store_dir", "pnpm store"));
+        out.extend(kv_str(m, "import_method", "Import method"));
+        match m.u64("shared_hardlink_bytes") {
+            Some(b) => out.push(kv_styled(
+                "Hard-linked from store",
+                fmt::bytes(b),
+                ratatui::style::Color::Yellow,
+            )),
+            None => out.push(kv_styled(
+                "Hard-linked from store",
+                "not measured",
+                ratatui::style::Color::DarkGray,
+            )),
+        }
+        if let Some(r) = m.u64("estimated_reclaim_bytes") {
+            out.push(kv("Reclaim (at most)", fmt::bytes(r)));
+        }
+    }
     m.skip("size_cached");
     out
 }
