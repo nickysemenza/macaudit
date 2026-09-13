@@ -1078,9 +1078,13 @@ fn shell_env_fixtures() -> Vec<Finding> {
             .detail(detail)
             .path(path)
             .severity(severity)
+            .provenance("/opt/homebrew/bin/fish -lc 'string join : $PATH'")
             .meta(json!({
                 "entry": path, "index": index, "occurrences": occurrences,
                 "exists": exists, "shadowed_by": shadowed_by,
+                "shell": "fish", "from_login_shell": true,
+                "in_process_path": path != "/Users/dev/Library/pnpm/bin",
+                "group": "$PATH entries",
             }));
         if let Some(r) = remedy {
             f = f.remedy(r);
@@ -1094,6 +1098,7 @@ fn shell_env_fixtures() -> Vec<Finding> {
         entry("/opt/homebrew/bin", 2, 1, true, None, None),
         entry("/opt/homebrew/sbin", 3, 1, true, None, None),
         entry("/usr/local/bin", 4, 2, true, None, None),
+        entry("/Users/dev/Library/pnpm/bin", 6, 1, true, None, None),
         entry(
             "/Users/dev/bin",
             5,
@@ -1116,12 +1121,28 @@ fn shell_env_fixtures() -> Vec<Finding> {
             "__shell_startup__",
             "Shell startup time",
         )
-        .detail("Median shell startup: 1450ms across 3 run(s)")
+        .detail("Median fish startup: 1450ms across 3 run(s)")
         .severity(Severity::Attention)
+        .provenance("/opt/homebrew/bin/fish -i -c exit ×3 (starts the login shell)")
         .meta(json!({
+            "shell": "fish",
             "median_ms": 1450.0,
             "runs_ms": [1390.0, 1450.0, 1510.0],
+            "group": "Startup",
         })),
+        Finding::new(FindingKind::PathEntry, "__path_diff__", "Login shell vs process PATH")
+            .detail("fish PATH has 1 entry this process lacks; this process has 1 the shell lacks")
+            .severity(Severity::Attention)
+            .provenance("/opt/homebrew/bin/fish -lc 'string join : $PATH' (Reading the login shell's PATH starts that shell (fish/zsh/bash -l), which executes its startup configuration.)")
+            .coverage("Tools launched by an agent or app inherit the process PATH, not the login shell's; command resolution can differ between the two.")
+            .meta(json!({
+                "login_shell": "/opt/homebrew/bin/fish", "shell": "fish",
+                "source": "/opt/homebrew/bin/fish -lc 'string join : $PATH'",
+                "only_in_shell": ["/Users/dev/Library/pnpm/bin"],
+                "only_in_process": ["/Users/dev/Library/pnpm"],
+                "shell_entries": 7, "process_entries": 7, "notes": [],
+                "group": "Comparison",
+            })),
     ]
 }
 

@@ -93,7 +93,7 @@ pub const REGISTRY: &[SectionMeta] = &[
         id: ScannerId::ShellEnv,
         title: "Shell",
         short_title: "Shell",
-        view: ViewKind::Table,
+        view: ViewKind::Tree,
         build: || Box::new(ShellEnvScanner),
     },
     SectionMeta {
