@@ -24,7 +24,10 @@ impl AppState {
     pub(super) fn handle_mouse_at(&mut self, me: MouseEvent, now: Instant) {
         // Modals own the screen; the filter box only changes what typing
         // means, so pointing still works there.
-        if matches!(self.mode, Mode::Confirm | Mode::Help) {
+        if matches!(
+            self.mode,
+            Mode::Confirm | Mode::Help | Mode::Preview | Mode::Cleanup | Mode::Report
+        ) {
             return;
         }
         let Some(hit) = self.viewport.hit(me.column, me.row) else {

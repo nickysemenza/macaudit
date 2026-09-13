@@ -35,7 +35,7 @@ use crate::ui::keys::Action;
 use crate::ui::layout::{self, DetailMode, Hit, RailMode, Viewport};
 use crate::ui::present::{CellCtx, SortSpec};
 use crate::ui::rows::{self, RowsView};
-use crate::ui::{activity, confirm, detail, help, overview, sidebar, statusbar};
+use crate::ui::{activity, cleanup_view, confirm, detail, help, overview, sidebar, statusbar};
 
 /// Per-section scan status shown in the sidebar.
 #[derive(Clone, Debug, PartialEq)]
@@ -63,6 +63,56 @@ pub enum Mode {
     Confirm,
     /// The `?` keybindings overlay.
     Help,
+    /// `v`: impact preview of everything marked (Homebrew orphans, launchers
+    /// preserved, follow-ups) before opening the confirm dialog.
+    Preview,
+    /// A confirmed batch is running; Esc stops after the current action.
+    Cleanup,
+    /// The completion report of the last cleanup (`c` reopens it).
+    Report,
+}
+
+/// What the confirm dialog shows: the actions that passed the in-memory
+/// preflight (in execution order), the ones it refused with reasons, and
+/// the batch's impact.
+#[derive(Clone, Debug, Default)]
+pub struct ConfirmModel {
+    pub actions: Vec<PlannedAction>,
+    pub refused: Vec<crate::cleanup::Refused>,
+    pub removed: Vec<String>,
+    pub remaining: Vec<String>,
+    pub follow_up: Vec<String>,
+    pub impact: Option<crate::brewgraph::RemovalPreview>,
+    pub scroll: u16,
+}
+
+/// A confirmed batch handed to the loop for asynchronous execution.
+#[derive(Clone, Debug)]
+pub struct CleanupRequest {
+    pub actions: Vec<PlannedAction>,
+    pub affected: Vec<ScannerId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CleanupPhase {
+    Preflight,
+    Executing { idx: usize, total: usize },
+    Verifying,
+    Done,
+}
+
+/// Progress of the running (or just finished) cleanup, fed by `ExecEvent`s.
+#[derive(Clone, Debug)]
+pub struct CleanupRun {
+    pub phase: CleanupPhase,
+    /// Actions as confirmed; replaced by the refreshed preflight's order.
+    pub actions: Vec<PlannedAction>,
+    pub refused: Vec<crate::cleanup::Refused>,
+    pub results: std::collections::BTreeMap<usize, Result<String, String>>,
+    pub cancelled: Vec<PlannedAction>,
+    pub cancel_requested: bool,
+    pub affected: Vec<ScannerId>,
+    pub report: Option<crate::cleanup::CleanupReport>,
 }
 
 pub struct AppState {
@@ -94,8 +144,18 @@ pub struct AppState {
     /// (section, group key) so collapsing in one section doesn't affect
     /// another.
     pub(super) collapsed_groups: HashSet<(ScannerId, String)>,
-    /// The planned actions currently shown in the confirm dialog.
-    pub(super) confirm_actions: Vec<PlannedAction>,
+    /// The confirm dialog's model while `mode == Confirm`.
+    pub(super) confirm: Option<ConfirmModel>,
+    /// The user's explicit remedy choice per finding (`e` cycles); absent ⇒
+    /// the primary remedies.
+    pub(super) remedy_choice: HashMap<FindingId, usize>,
+    /// The cleanup in progress / just finished, for the progress and report
+    /// overlays.
+    pub(crate) cleanup: Option<CleanupRun>,
+    /// Set by Esc during a cleanup; the loop cancels the batch's stop token.
+    pub pending_cancel_cleanup: bool,
+    /// Scroll offset of the preview/report overlays.
+    pub(crate) overlay_scroll: u16,
     /// Delete mode used when planning remedies. Defaults to `Trash`, matching
     /// `Config::default()` — see the module-level contract-friction note in
     /// the lane report: `AppState` has no path to the real `Config` because
@@ -117,8 +177,8 @@ pub struct AppState {
     /// Set when the user requests a rescan; the loop consumes and clears it.
     pub pending_rescan: Option<RescanRequest>,
     /// Set when the confirm dialog is accepted; the loop consumes and clears
-    /// it, executing (or, pre-Phase-2, just logging) each action.
-    pub pending_execute: Option<Vec<PlannedAction>>,
+    /// it, running the batch asynchronously (see `cleanup::run_batch`).
+    pub pending_execute: Option<CleanupRequest>,
 
     /// Geometry from the last `draw`: hit regions for the mouse, the main
     /// panel's scroll offset and page size, and which panes are visible.
@@ -153,7 +213,11 @@ impl Default for AppState {
             mode: Mode::Normal,
             filter: String::new(),
             collapsed_groups: HashSet::new(),
-            confirm_actions: Vec::new(),
+            confirm: None,
+            remedy_choice: HashMap::new(),
+            cleanup: None,
+            pending_cancel_cleanup: false,
+            overlay_scroll: 0,
             delete_mode: DeleteMode::Trash,
             activity: Vec::new(),
             baseline: HashMap::new(),
@@ -179,6 +243,9 @@ impl AppState {
             Mode::Filter => self.handle_filter(action),
             Mode::Confirm => self.handle_confirm(action),
             Mode::Help => self.handle_help(action),
+            Mode::Preview => self.handle_preview(action),
+            Mode::Cleanup => self.handle_cleanup(action),
+            Mode::Report => self.handle_report(action),
         }
     }
 
@@ -227,6 +294,9 @@ impl AppState {
                 .split(main[0]);
             self.draw_main_panel(frame, split[0], vp);
             vp.push(split[1], Hit::Detail);
+            let chosen = self
+                .selected_finding()
+                .and_then(|f| self.remedy_choice_for(f.id));
             detail::draw(
                 frame,
                 split[1],
@@ -234,6 +304,7 @@ impl AppState {
                 self.selected_section_id(),
                 self.delete_mode,
                 self.detail_scroll,
+                chosen,
             );
         } else {
             self.draw_main_panel(frame, main[0], vp);
@@ -247,11 +318,17 @@ impl AppState {
         };
         statusbar::draw(self, frame, statusbar_area, rail, vp);
 
-        if self.mode == Mode::Confirm {
-            confirm::draw(frame, area, &self.confirm_actions, self.delete_mode);
-        }
-        if self.mode == Mode::Help {
-            help::draw(frame, area);
+        match self.mode {
+            Mode::Confirm => {
+                if let Some(model) = &self.confirm {
+                    confirm::draw(frame, area, model, self.delete_mode);
+                }
+            }
+            Mode::Help => help::draw(frame, area),
+            Mode::Preview => cleanup_view::draw_preview(self, frame, area),
+            Mode::Cleanup => cleanup_view::draw_progress(self, frame, area),
+            Mode::Report => cleanup_view::draw_report(self, frame, area),
+            _ => {}
         }
     }
 

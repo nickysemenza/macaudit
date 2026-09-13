@@ -26,6 +26,9 @@ pub struct PlannedAction {
     pub rendered: String,
     pub destructive: bool,
     pub reclaims_bytes: Option<u64>,
+    /// Ownership guard carried over from the remedy (see `model::Guard`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<crate::model::Guard>,
 }
 
 /// Abstraction over the `trash` crate so tests don't move real files.
@@ -100,6 +103,7 @@ impl RemedyEngine {
             rendered: command.rendered(),
             destructive: remedy.destructive,
             reclaims_bytes: remedy.reclaims_bytes,
+            guard: remedy.guard.clone(),
             command,
         }
     }

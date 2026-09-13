@@ -36,6 +36,9 @@ impl AppState {
             Action::Char('K') => self.scroll_detail(-3),
             Action::ScrollDetail(d) => self.scroll_detail(d),
             Action::Char('x') => self.open_confirm(),
+            Action::Char('v') => self.open_preview(),
+            Action::Char('c') => self.open_report(),
+            Action::Char('e') => self.cycle_remedy_choice(),
             Action::Char('r') => {
                 self.pending_rescan = Some(RescanRequest::Section(self.selected_section_id()));
             }

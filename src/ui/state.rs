@@ -21,6 +21,10 @@ pub const CORRELATED_SECTIONS: &[ScannerId] = &[
 ];
 
 impl AppState {
+    pub(crate) fn delete_mode(&self) -> DeleteMode {
+        self.delete_mode
+    }
+
     /// Set the delete mode used when planning remedies (wired from `Config` by
     /// the run loop, honoring `--rm`).
     pub fn set_delete_mode(&mut self, mode: DeleteMode) {
@@ -193,10 +197,49 @@ impl AppState {
             } => {
                 self.status
                     .insert(scanner, SectionStatus::Done { duration });
+                self.drop_stale_marks(scanner);
             }
             ScanEvent::Failed { scanner, error, .. } => {
                 self.status.insert(scanner, SectionStatus::Failed { error });
+                self.drop_stale_marks(scanner);
             }
+        }
+    }
+
+    /// After a section re-scans, marks (and remedy choices) whose findings no
+    /// longer exist are dropped and announced, and an open confirm dialog is
+    /// rebuilt so it cannot reference a vanished target.
+    fn drop_stale_marks(&mut self, scanner: ScannerId) {
+        if self.marked.is_empty() {
+            return;
+        }
+        let present: std::collections::HashSet<FindingId> = self
+            .findings
+            .values()
+            .flat_map(|m| m.keys().copied())
+            .collect();
+        let stale: Vec<FindingId> = self
+            .marked
+            .iter()
+            .filter(|id| !present.contains(id))
+            .copied()
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        for id in &stale {
+            self.marked.remove(id);
+            self.remedy_choice.remove(id);
+        }
+        self.push_activity(format!(
+            "dropped {} stale mark(s) after rescanning {}",
+            stale.len(),
+            scanner.slug()
+        ));
+        if self.mode == crate::ui::app::Mode::Confirm {
+            self.confirm = None;
+            self.mode = crate::ui::app::Mode::Normal;
+            self.open_confirm();
         }
     }
 
