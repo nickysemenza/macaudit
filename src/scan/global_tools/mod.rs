@@ -1179,13 +1179,18 @@ mod tests {
             repo_rx: None,
             fs_discovery_only: false,
         };
-        ToolsScanner.scan(ctx).await.unwrap();
+        // Drain while scanning: the scanner also resolves commands on the
+        // *host's* PATH, so on a machine with many tools installed (CI
+        // runners) it emits more events than the channel holds and would
+        // block forever if the receiver only started after `scan` returned.
+        let scan = tokio::spawn(async move { ToolsScanner.scan(ctx).await });
         let mut findings = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
+        while let Some(ev) = rx.recv().await {
             if let ScanEvent::Finding { finding, .. } = ev {
                 findings.push(*finding);
             }
         }
+        scan.await.unwrap().unwrap();
         let cov = findings
             .iter()
             .find(|f| f.kind == FindingKind::ToolCoverage)
