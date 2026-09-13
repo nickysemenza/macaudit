@@ -306,106 +306,184 @@ fn apps_fixtures() -> Vec<Finding> {
     ]
 }
 
-/// Mirrors `src/scan/brew.rs`: BrewFormula meta name/version/is_leaf/
-/// dependencies/dependents/outdated/current_version, detail
-/// `"leaf — {ver}"` / `"dependency — {ver}"`; BrewCask meta token/name/
-/// version/app_paths/outdated/current_version, detail `"cask — {ver}"`.
+/// Mirrors `src/scan/brew.rs`: BrewFormula meta name/full_name/version/
+/// install_reason (requested|dependency|unknown, from installed_on_request)/
+/// is_leaf/dependencies/dependents (+ `_transitive`)/autoremove_candidate/
+/// removal_preview/group, detail `"{reason} — {ver}[ · leaf]"`; BrewCask meta
+/// token/version/app_paths/binaries/depends_on/cask_dependents/group=Casks;
+/// plus the `__autoremove__` summary row.
 fn brew_fixtures() -> Vec<Finding> {
+    struct F<'a> {
+        name: &'a str,
+        version: &'a str,
+        reason: &'a str,
+        deps: &'a [&'a str],
+        deps_t: &'a [&'a str],
+        used_by: &'a [&'a str],
+        used_by_t: &'a [&'a str],
+        auto: bool,
+    }
+    fn formula(f: F<'_>) -> Finding {
+        let F {
+            name,
+            version,
+            reason,
+            deps,
+            deps_t,
+            used_by,
+            used_by_t,
+            auto,
+        } = f;
+        let leaf = used_by.is_empty() && used_by_t.is_empty();
+        let group = if auto {
+            "Autoremove candidates"
+        } else {
+            match reason {
+                "requested" => "Explicitly installed",
+                "dependency" => "Installed as dependency",
+                _ => "Unknown origin",
+            }
+        };
+        let mut detail = format!("{reason} — {version}");
+        if leaf {
+            detail.push_str(" · leaf");
+        }
+        if auto {
+            detail.push_str(" · brew autoremove candidate");
+        }
+        let on_request = match reason {
+            "requested" => json!(true),
+            "dependency" => json!(false),
+            _ => json!(null),
+        };
+        let mut f = Finding::new(FindingKind::BrewFormula, name, name)
+            .detail(detail)
+            .path(PathBuf::from(format!("/opt/homebrew/Cellar/{name}")))
+            .severity(if auto { Severity::Reclaimable } else { Severity::Info })
+            .provenance("brew info --json=v2 --installed (install receipt runtime_dependencies); brew autoremove --dry-run")
+            .meta(json!({
+                "name": name, "full_name": name, "tap": "homebrew/core", "aliases": [],
+                "version": version, "install_reason": reason, "installed_on_request": on_request,
+                "installed_as_dependency": null, "is_leaf": leaf, "pinned": false,
+                "outdated": false, "current_version": null,
+                "dependencies": deps, "dependents": used_by,
+                "dependencies_transitive": deps_t, "dependents_transitive": used_by_t,
+                "cask_dependents": [], "dependency_source": "installed_runtime",
+                "why_installed": { "reason": reason, "requested_roots": used_by_t.iter().chain(used_by.iter()).collect::<Vec<_>>(), "paths": [] },
+                "autoremove_candidate": auto,
+                "removal_preview": { "removable": leaf, "blocked_by": used_by, "would_orphan": [], "confirmed_orphans": [], "uncertain_orphans": [] },
+                "graph_caveats": [], "completeness": "full", "group": group,
+            }));
+        if leaf {
+            f = f.remedy(
+                Remedy::new(
+                    "Uninstall formula",
+                    RemedyCommand::Shell {
+                        program: "brew".to_string(),
+                        args: vec!["uninstall".to_string(), name.to_string()],
+                    },
+                )
+                .destructive()
+                .guard(Guard::BrewFormula {
+                    full_name: name.to_string(),
+                    expected_version: Some(version.to_string()),
+                    require_no_retained_dependents: true,
+                }),
+            );
+        }
+        f
+    }
+    fn cask(
+        token: &str,
+        version: &str,
+        app: &str,
+        binary: Option<&str>,
+        formula_deps: &[&str],
+    ) -> Finding {
+        let binaries = match binary {
+            Some(b) => {
+                json!([{ "source": format!("bin/{b}"), "target": format!("/opt/homebrew/bin/{b}") }])
+            }
+            None => json!([]),
+        };
+        Finding::new(FindingKind::BrewCask, token, token)
+            .detail(format!("cask — {version}"))
+            .severity(Severity::Info)
+            .provenance("brew info --json=v2 --installed")
+            .meta(json!({
+                "token": token, "name": token, "version": version,
+                "app_paths": [format!("/Applications/{app}")], "binaries": binaries,
+                "depends_on": { "formula": formula_deps, "cask": [] }, "cask_dependents": [],
+                "outdated": false, "current_version": null, "completeness": "full", "group": "Casks",
+            }))
+            .remedy(
+                Remedy::new(
+                    "Uninstall cask",
+                    RemedyCommand::Shell {
+                        program: "brew".to_string(),
+                        args: vec!["uninstall".to_string(), "--cask".to_string(), token.to_string()],
+                    },
+                )
+                .destructive()
+                .guard(Guard::BrewCask { token: token.to_string(), expected_version: Some(version.to_string()) }),
+            )
+    }
+    let mut wget = formula(F {
+        name: "wget",
+        version: "1.21.4",
+        reason: "requested",
+        deps: &["libidn2", "openssl@3"],
+        deps_t: &["libunistring"],
+        used_by: &[],
+        used_by_t: &[],
+        auto: false,
+    })
+    .severity(Severity::Attention)
+    .detail("requested — 1.21.4 · leaf · 1.24.5 available");
+    if let Some(m) = wget.meta.as_object_mut() {
+        m.insert("outdated".into(), json!(true));
+        m.insert("current_version".into(), json!("1.24.5"));
+    }
+    wget.remedies.insert(
+        0,
+        Remedy::new(
+            "Upgrade to 1.24.5",
+            RemedyCommand::Shell {
+                program: "brew".to_string(),
+                args: vec!["upgrade".to_string(), "wget".to_string()],
+            },
+        ),
+    );
     vec![
-        Finding::new(FindingKind::BrewFormula, "ripgrep", "ripgrep")
-            .detail("leaf — 14.1.0")
-            .severity(Severity::Info)
-            .meta(json!({
-                "name": "ripgrep", "version": "14.1.0", "is_leaf": true,
-                "dependencies": [], "dependents": [], "outdated": false,
-                "current_version": null,
-            })),
-        Finding::new(FindingKind::BrewFormula, "jq", "jq")
-            .detail("leaf — 1.7.1")
-            .severity(Severity::Info)
-            .meta(json!({
-                "name": "jq", "version": "1.7.1", "is_leaf": true,
-                "dependencies": ["oniguruma"], "dependents": [], "outdated": false,
-                "current_version": null,
-            })),
-        Finding::new(FindingKind::BrewFormula, "openssl@3", "openssl@3")
-            .detail("dependency — 3.3.1")
-            .severity(Severity::Info)
-            .meta(json!({
-                "name": "openssl@3", "version": "3.3.1", "is_leaf": false,
-                "dependencies": [], "dependents": ["ripgrep", "python@3.12"],
-                "outdated": false, "current_version": null,
-            })),
-        Finding::new(FindingKind::BrewFormula, "python@3.12", "python@3.12")
-            .detail("dependency — 3.12.3")
-            .severity(Severity::Info)
-            .meta(json!({
-                "name": "python@3.12", "version": "3.12.3", "is_leaf": false,
-                "dependencies": ["openssl@3"], "dependents": ["pyenv-build-helper"],
-                "outdated": false, "current_version": null,
-            })),
-        Finding::new(FindingKind::BrewFormula, "wget", "wget")
-            .detail("leaf — 1.21.4")
-            .severity(Severity::Attention)
-            .meta(json!({
-                "name": "wget", "version": "1.21.4", "is_leaf": true,
-                "dependencies": ["openssl@3"], "dependents": [], "outdated": true,
-                "current_version": "1.24.5",
-            }))
-            .remedy(Remedy {
-                label: "Upgrade to 1.24.5".to_string(),
-                command: RemedyCommand::Shell {
-                    program: "brew".to_string(),
-                    args: vec!["upgrade".to_string(), "wget".to_string()],
-                },
-                reclaims_bytes: None,
-                destructive: false,
-                alternative: false,
-                guard: None,
-            }),
-        Finding::new(FindingKind::BrewCask, "docker", "docker")
-            .detail("cask — 4.29.0")
-            .severity(Severity::Info)
-            .meta(json!({
-                "token": "docker", "name": "docker", "version": "4.29.0",
-                "app_paths": ["/Applications/Docker.app"], "outdated": false,
-                "current_version": null,
-            })),
-        Finding::new(
-            FindingKind::BrewCask,
-            "visual-studio-code",
-            "visual-studio-code",
-        )
-        .detail("cask — 1.89.1")
-        .severity(Severity::Info)
-        .meta(json!({
-            "token": "visual-studio-code", "name": "visual-studio-code",
-            "version": "1.89.1", "app_paths": ["/Applications/Visual Studio Code.app"],
-            "outdated": false, "current_version": null,
-        })),
-        Finding::new(FindingKind::BrewCask, "rectangle", "rectangle")
-            .detail("cask — 0.77")
-            .severity(Severity::Attention)
-            .meta(json!({
-                "token": "rectangle", "name": "rectangle", "version": "0.77",
-                "app_paths": ["/Applications/Rectangle.app"], "outdated": true,
-                "current_version": "0.83",
-            }))
-            .remedy(Remedy {
-                label: "Upgrade to 0.83".to_string(),
-                command: RemedyCommand::Shell {
-                    program: "brew".to_string(),
-                    args: vec![
-                        "upgrade".to_string(),
-                        "--cask".to_string(),
-                        "rectangle".to_string(),
-                    ],
-                },
-                reclaims_bytes: None,
-                destructive: false,
-                alternative: false,
-                guard: None,
-            }),
+        formula(F { name: "ripgrep", version: "14.1.0", reason: "requested", deps: &["pcre2"], deps_t: &[], used_by: &[], used_by_t: &[], auto: false }),
+        formula(F { name: "jq", version: "1.7.1", reason: "requested", deps: &["oniguruma"], deps_t: &[], used_by: &[], used_by_t: &[], auto: false }),
+        wget,
+        formula(F { name: "python@3.14", version: "3.14.7", reason: "requested", deps: &["openssl@3", "sqlite", "xz"], deps_t: &["ca-certificates"], used_by: &["pgcli", "pre-commit", "yt-dlp"], used_by_t: &[], auto: false }),
+        formula(F { name: "pgcli", version: "4.3.0", reason: "requested", deps: &["python@3.14"], deps_t: &["openssl@3", "sqlite", "xz", "ca-certificates"], used_by: &[], used_by_t: &[], auto: false }),
+        formula(F { name: "pre-commit", version: "4.3.0", reason: "requested", deps: &["python@3.14"], deps_t: &["openssl@3", "sqlite", "xz", "ca-certificates"], used_by: &[], used_by_t: &[], auto: false }),
+        formula(F { name: "yt-dlp", version: "2026.09.01", reason: "requested", deps: &["python@3.14"], deps_t: &["openssl@3", "sqlite", "xz", "ca-certificates"], used_by: &[], used_by_t: &[], auto: false }),
+        formula(F { name: "openssl@3", version: "3.6.3", reason: "dependency", deps: &["ca-certificates"], deps_t: &[], used_by: &["python@3.14", "wget"], used_by_t: &["pgcli", "pre-commit", "yt-dlp"], auto: false }),
+        formula(F { name: "libidn2", version: "2.3.7", reason: "dependency", deps: &["libunistring"], deps_t: &[], used_by: &["wget"], used_by_t: &[], auto: false }),
+        formula(F { name: "libunistring", version: "1.2", reason: "dependency", deps: &[], deps_t: &[], used_by: &["libidn2"], used_by_t: &["wget"], auto: false }),
+        formula(F { name: "pcre2", version: "10.43", reason: "dependency", deps: &[], deps_t: &[], used_by: &["ripgrep"], used_by_t: &[], auto: false }),
+        formula(F { name: "oniguruma", version: "6.9.9", reason: "dependency", deps: &[], deps_t: &[], used_by: &["jq"], used_by_t: &[], auto: false }),
+        formula(F { name: "libevent", version: "2.1.13", reason: "dependency", deps: &[], deps_t: &[], used_by: &[], used_by_t: &[], auto: true }),
+        formula(F { name: "oldlib", version: "0.1", reason: "unknown", deps: &[], deps_t: &[], used_by: &[], used_by_t: &[], auto: false }),
+        cask("docker", "4.29.0", "Docker.app", None, &[]),
+        cask("visual-studio-code", "1.89.1", "Visual Studio Code.app", Some("code"), &[]),
+        cask("pdftk-java", "3.3.3", "PDFtk.app", Some("pdftk"), &["openjdk"]),
+        Finding::new(FindingKind::BrewFormula, "__autoremove__", "Homebrew autoremove candidates")
+            .detail("1 formula(e) Homebrew reports as no longer needed: libevent")
+            .severity(Severity::Reclaimable)
+            .provenance("brew autoremove --dry-run")
+            .meta(json!({ "candidates": ["libevent"], "source": "brew autoremove --dry-run", "group": "Autoremove candidates" }))
+            .remedy(
+                Remedy::new(
+                    "Remove all unneeded dependencies",
+                    RemedyCommand::Shell { program: "brew".into(), args: vec!["autoremove".into()] },
+                )
+                .destructive(),
+            ),
     ]
 }
 

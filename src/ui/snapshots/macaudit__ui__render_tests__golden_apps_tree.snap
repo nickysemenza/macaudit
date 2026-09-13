@@ -4,7 +4,7 @@ expression: "render(&mut app, 150, 44)"
 ---
 " 1  Health        8              │┌ Apps · 8 ───────────────────────────────────────────────────────────────┐│ Detail                                 "
 "▸2  Apps          8              ││   Name↑                 Version      Source     Arch      Path          ││Xcode 15.3                              "
-" 3  Brew          8              ││▾  App Store  (1)                                                        ││app_store — mac_app_store               "
+" 3  Brew         18              ││▾  App Store  (1)                                                        ││app_store — mac_app_store               "
 " 4  Tools        10              ││     Xcode 15.3          15.3         App Store  universal /Appli…ode.app││                                        "
 " 5  Disk         10   13G        ││▾  Homebrew Cask  (2)                                                    ││Path           /Applications/Xcode.app  "
 " 6  Daemons       7              ││     Docker 4.29.0       4.29.0       cask       universal /Appli…ker.app││Severity       info                     "

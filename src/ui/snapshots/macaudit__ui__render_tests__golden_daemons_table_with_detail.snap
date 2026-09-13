@@ -4,7 +4,7 @@ expression: "render(&mut app, 160, 44)"
 ---
 " 1  Health        8              │┌ Daemons · 7 ───────────────────────────────────────────────────────────────┐│ Detail                                        "
 " 2  Apps          8              ││   Label                 Domain   State↓    Program                         ││com.microsoft.autoupdate.helper                "
-" 3  Brew          8              ││   com.docker.helper     user     running   /Applications/D…om.docker.helper││com.microsoft.autoupdate.helper —              "
+" 3  Brew         18              ││   com.docker.helper     user     running   /Applications/D…om.docker.helper││com.microsoft.autoupdate.helper —              "
 " 4  Tools        10              ││   com.google.keystone.… user     running   ~/Library/Googl…twareUpdateAgent││/Library/Application                           "
 " 5  Disk         10   13G        ││   com.microsoft.autoup… daemon   running   /Library/Applic…s/MacOS/msupdate││Support/Microsoft/MAU2.0/Microsoft             "
 "▸6  Daemons       7              ││   com.spotify.webhelper user     running   /Applications/S…SpotifyWebHelper││AutoUpdate.app/Contents/MacOS/msupdate         "

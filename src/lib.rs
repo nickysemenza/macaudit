@@ -3,6 +3,7 @@
 //! The library holds everything except terminal setup, so `macaudit scan --json`
 //! and the test suite exercise the exact same engine the TUI drives (spec §5).
 
+pub mod brewgraph;
 pub mod cli;
 pub mod config;
 pub mod correlate;
