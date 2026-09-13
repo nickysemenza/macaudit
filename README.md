@@ -113,8 +113,12 @@ static library carry matching checksums and are always rebuilt together
 synthetic `--fake` findings; `MACAUDIT_HOME` works as for the CLI.
 
 The app is not sandboxed — it scans `~`, runs `brew`/`docker`/`xcrun` and
-moves files to the Trash, none of which the App Sandbox allows — and is ad-hoc
-signed for local builds. Because a Finder-launched app inherits launchd's
+moves files to the Trash, none of which the App Sandbox allows. Local builds
+are signed with an Apple Development certificate (team in `project.yml`;
+override `DEVELOPMENT_TEAM`, or pass `CODE_SIGN_IDENTITY=-` for an ad-hoc
+build) — macOS keys its folder-access grants on the signing identity, and an
+ad-hoc signature changes with every rebuild, so it would re-prompt each
+time. Because a Finder-launched app inherits launchd's
 minimal `PATH`, the engine adopts the login shell's `PATH` at startup (the
 same disclosure as the Shell scanner: this starts your shell once). Mail,
 Messages, Safari and Time Machine data need **Full Disk Access** granted to
