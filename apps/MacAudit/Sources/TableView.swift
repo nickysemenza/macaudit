@@ -1,3 +1,4 @@
+import AppKit
 import MacAuditKit
 import SwiftUI
 
@@ -37,6 +38,11 @@ struct TableView: View {
                 Text(f.path ?? "").foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
             }
         }
+        .contextMenu(forSelectionType: UInt64.self) { ids in
+            if let id = ids.first, let finding = store.finding(id) {
+                RowContextMenu(finding: finding)
+            }
+        }
     }
 }
 
@@ -51,5 +57,26 @@ extension Finding {
         case .reclaimable: 2
         case .warning: 3
         }
+    }
+}
+
+/// Shared row context menu (Table uses the selection-typed variant).
+struct RowContextMenu: View {
+    @Environment(AuditStore.self) private var store
+    let finding: Finding
+
+    var body: some View {
+        Button(store.marked.contains(finding.id) ? "Unmark" : "Mark for Cleanup") { store.toggleMark(finding.id) }
+        if let path = finding.path {
+            Button("Reveal in Finder") {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+            }
+            Button("Copy Path") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(path, forType: .string)
+            }
+        }
+        Divider()
+        Button("Rescan \(store.meta(for: finding.section)?.title ?? "Section")") { store.rescan(finding.section) }
     }
 }

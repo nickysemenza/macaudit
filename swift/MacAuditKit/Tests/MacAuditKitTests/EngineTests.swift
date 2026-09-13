@@ -76,6 +76,23 @@ final class TerminalWaiter: ScanListener, @unchecked Sendable {
     let diff = try engine.diffSnapshots(a: a, b: b)
     #expect(diff.added.isEmpty && diff.removed.isEmpty && diff.grown.isEmpty && diff.changed.isEmpty)
     #expect(try engine.snapshots().count >= 2)
+    let history = try engine.sectionHistory()
+    #expect(Set(history.map(\.snapshotId)).count == 3)  // auto-save + two manual saves
+    #expect(history.contains { $0.section == .fs && $0.reclaimableBytes > 0 })
     let baseline = engine.baselineCounts()
     #expect(baseline.contains { $0.section == .apps && $0.findingCount == UInt64(apps.count) })
+}
+
+@Test func findingMetaDistinguishesBooleansFromNumbers() {
+    let m = FindingMeta(json: #"{"stale": true, "load_1": 1.0, "cores": 8, "n": null, "name": "x", "pct": 0}"#)
+    #expect(m.bool("stale") == true)
+    #expect(m.double("stale") == nil)
+    #expect(m.double("load_1") == 1.0)
+    #expect(m.bool("load_1") == nil)
+    #expect(m.uint64("cores") == 8)
+    #expect(m.uint64("pct") == 0)
+    #expect(m.bool("pct") == nil)
+    #expect(m.has("n") == false)
+    #expect(m.string("name") == "x")
+    #expect(FindingMeta(json: "not json").isEmpty)
 }

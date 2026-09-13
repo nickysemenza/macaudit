@@ -198,6 +198,37 @@ impl FindingKind {
         }
     }
 
+    /// Every kind, for tag lookups and exhaustive tests.
+    pub const ALL: &'static [FindingKind] = &[
+        FindingKind::SystemMetric,
+        FindingKind::ProcessResource,
+        FindingKind::DiskCategory,
+        FindingKind::App,
+        FindingKind::BrewFormula,
+        FindingKind::BrewCask,
+        FindingKind::GlobalTool,
+        FindingKind::CommandResolution,
+        FindingKind::ToolCoverage,
+        FindingKind::BuildArtifact,
+        FindingKind::CacheDir,
+        FindingKind::LaunchdItem,
+        FindingKind::PathEntry,
+        FindingKind::RuntimeVersion,
+        FindingKind::DockerObject,
+        FindingKind::PortListener,
+        FindingKind::GitRepo,
+        FindingKind::Simulator,
+        FindingKind::SshKey,
+        FindingKind::IosBackup,
+        FindingKind::LocalSnapshot,
+        FindingKind::LargeFile,
+    ];
+
+    /// Inverse of `tag()` — how the snapshot store's `kind` column maps back.
+    pub fn from_tag(tag: &str) -> Option<FindingKind> {
+        FindingKind::ALL.iter().copied().find(|k| k.tag() == tag)
+    }
+
     /// A stable string tag for id hashing (independent of enum layout).
     pub fn tag(self) -> &'static str {
         match self {
@@ -601,6 +632,14 @@ impl ScanEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_kind_round_trips_through_its_tag() {
+        for k in FindingKind::ALL {
+            assert_eq!(FindingKind::from_tag(k.tag()), Some(*k));
+        }
+        assert_eq!(FindingKind::from_tag("nope"), None);
+    }
 
     #[test]
     fn group_label_title_cases_underscored_key() {

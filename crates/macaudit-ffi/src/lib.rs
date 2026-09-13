@@ -331,6 +331,13 @@ impl Engine {
             .map_err(snapshot_err)
     }
 
+    /// Per-section totals for every snapshot, oldest first (history chart).
+    pub fn section_history(&self) -> Result<Vec<SectionHistoryPoint>, MacAuditError> {
+        let store = self.store()?;
+        let rows = store.section_history().map_err(snapshot_err)?;
+        Ok(rows.iter().map(SectionHistoryPoint::from).collect())
+    }
+
     /// Per-section counts from the latest snapshot, for Δ badges.
     pub fn baseline_counts(&self) -> Vec<SectionBaseline> {
         session::baseline(&self.shared.manager)
@@ -469,6 +476,12 @@ mod tests {
             .any(|e| matches!(e, ScanEvent::SnapshotSaved { id: Some(_), .. })));
         assert_eq!(engine.snapshots().unwrap().len(), 1);
         assert_eq!(engine.sections().len(), ScannerId::ALL.len());
+        let history = engine.section_history().unwrap();
+        let sections: std::collections::HashSet<SectionId> =
+            history.iter().map(|p| p.section).collect();
+        // Every section with durable fixtures shows up once for the one snapshot.
+        assert!(sections.contains(&SectionId::Fs) && sections.contains(&SectionId::Brew));
+        assert!(history.iter().all(|p| p.snapshot_id == 1));
     }
 
     #[test]

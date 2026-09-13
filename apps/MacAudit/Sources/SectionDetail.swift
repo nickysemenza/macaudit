@@ -6,15 +6,26 @@ struct SectionDetail: View {
     let meta: SectionMeta
 
     var body: some View {
-        let findings = store.findings(in: meta.id)
+        let all = store.findings(in: meta.id)
+        let findings = store.visibleFindings(in: meta.id)
         Group {
-            if findings.isEmpty {
+            if all.isEmpty {
                 emptyState
+            } else if findings.isEmpty {
+                ContentUnavailableView.search(text: store.searchText)
             } else {
                 switch meta.view {
-                case .overview: OverviewView(findings: findings)
-                case .tree: TreeView(findings: findings)
-                case .table: TableView(findings: findings)
+                case .overview:
+                    OverviewView(findings: findings)
+                case .tree, .table:
+                    VStack(spacing: 0) {
+                        SectionChartHeader(section: meta.id, findings: all)
+                        if meta.view == .tree {
+                            TreeView(findings: findings)
+                        } else {
+                            TableView(findings: findings)
+                        }
+                    }
                 }
             }
         }

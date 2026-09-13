@@ -11,14 +11,23 @@ struct ContentView: View {
         NavigationSplitView {
             SectionSidebar()
         } detail: {
-            if let section = store.selectedSection, let meta = store.meta(for: section) {
-                SectionDetail(meta: meta)
-                    .navigationTitle(meta.title)
-                    .navigationSubtitle(subtitle(for: section))
-            } else {
+            switch store.selectedItem {
+            case .storage:
+                StorageOverview()
+                    .navigationTitle("Storage")
+                    .navigationSubtitle("\(Formatting.bytes(store.totalReclaimableBytes)) reclaimable across \(store.sections.count) sections")
+            case .section(let section):
+                if let meta = store.meta(for: section) {
+                    SectionDetail(meta: meta)
+                        .navigationTitle(meta.title)
+                        .navigationSubtitle(subtitle(for: section))
+                        .searchable(text: $store.searchText, placement: .toolbar, prompt: "Filter \(meta.title)")
+                }
+            case nil:
                 ContentUnavailableView("Pick a section", systemImage: "sidebar.left")
             }
         }
+        .onChange(of: store.selectedItem) { _, _ in store.searchText = "" }
         .inspector(isPresented: $showInspector) {
             FindingInspector(finding: store.finding(store.selectedFinding))
                 .inspectorColumnWidth(min: 280, ideal: 340, max: 520)
@@ -47,8 +56,13 @@ struct ContentView: View {
                 Button {
                     store.openConfirm()
                 } label: {
-                    Label("Clean Up… (\(store.marked.count))", systemImage: "trash")
+                    Label {
+                        Text("Clean Up… (\(store.marked.count))").contentTransition(.numericText())
+                    } icon: {
+                        Image(systemName: "trash")
+                    }
                 }
+                .animation(.default, value: store.marked.count)
                 .disabled(store.marked.isEmpty)
                 .help("Plan and confirm the marked cleanup (⌘X)")
 

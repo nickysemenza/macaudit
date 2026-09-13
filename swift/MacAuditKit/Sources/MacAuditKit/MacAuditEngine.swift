@@ -18,6 +18,7 @@ public protocol MacAuditEngine: AnyObject, Sendable {
     func saveSnapshot() throws -> Int64
     func diffSnapshots(a: Int64, b: Int64) throws -> SnapshotDiff
     func baselineCounts() -> [SectionBaseline]
+    func sectionHistory() throws -> [SectionHistoryPoint]
 }
 
 extension Engine: MacAuditEngine {}

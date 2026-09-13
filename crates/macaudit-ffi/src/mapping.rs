@@ -648,6 +648,30 @@ impl From<snapshot::SnapshotDiff> for SnapshotDiff {
     }
 }
 
+/// One section's totals in one snapshot — the history chart's input.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct SectionHistoryPoint {
+    pub snapshot_id: i64,
+    pub created_at: SystemTime,
+    pub section: SectionId,
+    pub finding_count: u64,
+    pub total_bytes: u64,
+    pub reclaimable_bytes: u64,
+}
+
+impl From<&snapshot::SectionTotals> for SectionHistoryPoint {
+    fn from(t: &snapshot::SectionTotals) -> Self {
+        SectionHistoryPoint {
+            snapshot_id: t.snapshot_id,
+            created_at: UNIX_EPOCH + Duration::from_secs(t.created_at.max(0) as u64),
+            section: t.section.into(),
+            finding_count: t.finding_count.max(0) as u64,
+            total_bytes: t.total_bytes.max(0) as u64,
+            reclaimable_bytes: t.reclaimable_bytes.max(0) as u64,
+        }
+    }
+}
+
 /// Per-section counts from the latest saved snapshot, for Δ badges.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct SectionBaseline {

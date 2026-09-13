@@ -41,6 +41,16 @@ struct CleanupProgressView: View {
                         }
                         if let summary = run.summary {
                             Divider()
+                            if store.lastReclaimedBytes > 0 {
+                                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                                    Text(Formatting.bytes(store.lastReclaimedBytes))
+                                        .font(.system(.title, design: .rounded).weight(.semibold))
+                                        .monospacedDigit()
+                                        .contentTransition(.numericText(value: Double(store.lastReclaimedBytes)))
+                                    Text("reclaimed").foregroundStyle(.secondary)
+                                }
+                                .animation(.easeOut(duration: 0.8), value: store.lastReclaimedBytes)
+                            }
                             Text(summary).font(.callout).textSelection(.enabled)
                         }
                     }

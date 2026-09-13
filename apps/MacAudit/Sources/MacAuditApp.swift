@@ -58,6 +58,60 @@ struct MacAuditApp: App {
         Settings {
             SettingsView().environment(store)
         }
+        MenuBarExtra {
+            MenuBarContent().environment(store)
+        } label: {
+            Label(Formatting.bytes(store.totalReclaimableBytes), systemImage: store.isScanning ? "internaldrive.fill" : "internaldrive")
+                .labelStyle(.titleAndIcon)
+                .monospacedDigit()
+        }
+        .menuBarExtraStyle(.window)
+    }
+}
+
+private struct MenuBarContent: View {
+    @Environment(AuditStore.self) private var store
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Reclaimable").font(.headline)
+                Spacer()
+                Text(Formatting.bytes(store.totalReclaimableBytes))
+                    .font(.headline).monospacedDigit().contentTransition(.numericText())
+            }
+            ForEach(store.sections, id: \.id) { meta in
+                let bytes = store.reclaimableBytes(in: meta.id)
+                if bytes > 0 || { if case .scanning = store.status(of: meta.id) { true } else { false } }() {
+                    HStack {
+                        Circle().fill(Palette.section(meta.id)).frame(width: 7, height: 7)
+                        Text(meta.title).font(.callout)
+                        Spacer()
+                        if case .scanning = store.status(of: meta.id) {
+                            ProgressView().controlSize(.mini)
+                        } else {
+                            Text(Formatting.bytes(bytes)).font(.callout).monospacedDigit().foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+            Divider()
+            HStack {
+                Button(store.isScanning ? "Scanning…" : "Rescan All") { store.rescanAll() }
+                    .disabled(store.isScanning)
+                Spacer()
+                Button("Open MacAudit") {
+                    NSApp.activate(ignoringOtherApps: true)
+                    NSApp.windows.first { $0.canBecomeMain }?.makeKeyAndOrderFront(nil)
+                }
+                Button("Quit") { NSApplication.shared.terminate(nil) }
+            }
+            .controlSize(.small)
+        }
+        .padding(12)
+        .frame(width: 300)
+        .animation(.default, value: store.totalReclaimableBytes)
     }
 }
 
@@ -79,4 +133,5 @@ final class UnavailableEngine: MacAuditEngine {
         SnapshotDiff(added: [], removed: [], grown: [], changed: [])
     }
     func baselineCounts() -> [SectionBaseline] { [] }
+    func sectionHistory() throws -> [SectionHistoryPoint] { [] }
 }

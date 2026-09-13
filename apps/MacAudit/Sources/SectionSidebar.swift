@@ -6,8 +6,14 @@ struct SectionSidebar: View {
 
     var body: some View {
         @Bindable var store = store
-        List(store.sections, id: \.id, selection: $store.selectedSection) { meta in
-            SectionRow(meta: meta)
+        List(selection: $store.selectedItem) {
+            Label("Storage", systemImage: "internaldrive")
+                .tag(SidebarItem.storage)
+            Section("Sections") {
+                ForEach(store.sections, id: \.id) { meta in
+                    SectionRow(meta: meta).tag(SidebarItem.section(meta.id))
+                }
+            }
         }
         .listStyle(.sidebar)
         .navigationSplitViewColumnWidth(min: 200, ideal: 240)
@@ -21,7 +27,10 @@ struct SectionSidebar: View {
                 HStack {
                     Text("Reclaimable")
                     Spacer()
-                    Text(Formatting.bytes(store.totalReclaimableBytes)).monospacedDigit()
+                    Text(Formatting.bytes(store.totalReclaimableBytes))
+                        .monospacedDigit()
+                        .contentTransition(.numericText())
+                        .animation(.default, value: store.totalReclaimableBytes)
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -71,8 +80,17 @@ private struct SectionRow: View {
         switch status {
         case .idle:
             EmptyView()
-        case .scanning:
-            ProgressView().controlSize(.mini)
+        case .scanning(let msg, let done, let total):
+            Group {
+                if let total, total > 0 {
+                    ProgressView(value: Double(done), total: Double(total))
+                        .progressViewStyle(.circular)
+                } else {
+                    ProgressView()
+                }
+            }
+            .controlSize(.mini)
+            .help(msg.isEmpty ? "scanning" : msg)
         case .done:
             HStack(spacing: 4) {
                 if let delta = store.reclaimableDelta(in: meta.id) {
@@ -85,6 +103,8 @@ private struct SectionRow: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
+                    .contentTransition(.numericText())
+                    .animation(.default, value: store.count(of: meta.id))
             }
         case .failed:
             Image(systemName: "exclamationmark.triangle.fill")

@@ -1,3 +1,4 @@
+import AppKit
 import MacAuditKit
 import SwiftUI
 
@@ -79,5 +80,6 @@ struct FindingRow: View {
             SeverityBadge(severity: finding.severity)
         }
         .padding(.vertical, 2)
+        .contextMenu { RowContextMenu(finding: finding) }
     }
 }

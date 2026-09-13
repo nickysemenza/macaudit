@@ -36,6 +36,17 @@ struct CleanupRun {
     var reportJSON: String?
 }
 
+/// What the sidebar can select: the Storage overview or a scanner section.
+enum SidebarItem: Hashable {
+    case storage
+    case section(SectionId)
+
+    var section: SectionId? {
+        if case .section(let id) = self { return id }
+        return nil
+    }
+}
+
 /// The app's single source of truth: the TUI's `AppState` in Swift. Owns the
 /// engine, ingests scan/cleanup events on the main actor, and holds the
 /// UI-only state (selection, marks, remedy choices).
@@ -51,8 +62,10 @@ final class AuditStore {
     private(set) var activity: [String] = []
     private(set) var lastSnapshotMessage: String?
 
-    var selectedSection: SectionId? = .system
+    var selectedItem: SidebarItem? = .storage
     var selectedFinding: UInt64?
+    /// Free-text filter for the current section (title / detail / path).
+    var searchText = ""
     var marked: Set<UInt64> = []
     var remedyChoice: [UInt64: Int] = [:]
 
@@ -87,8 +100,31 @@ final class AuditStore {
         status[id] ?? .idle
     }
 
+    var selectedSection: SectionId? { selectedItem?.section }
+
     func findings(in id: SectionId) -> [Finding] {
         findings[id].map { Array($0.values) } ?? []
+    }
+
+    /// `findings(in:)` narrowed by `searchText`.
+    func visibleFindings(in id: SectionId) -> [Finding] {
+        let all = findings(in: id)
+        let q = searchText.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return all }
+        return all.filter {
+            $0.title.localizedCaseInsensitiveContains(q)
+                || $0.detail.localizedCaseInsensitiveContains(q)
+                || ($0.path?.localizedCaseInsensitiveContains(q) ?? false)
+                || $0.group.localizedCaseInsensitiveContains(q)
+        }
+    }
+
+    /// Bytes the last cleanup batch actually reclaimed (executed actions only).
+    var lastReclaimedBytes: UInt64 {
+        guard let run = cleanup else { return 0 }
+        return run.results.filter(\.value.ok).keys
+            .compactMap { run.actions[safe: $0]?.reclaimsBytes }
+            .reduce(0, +)
     }
 
     func finding(_ id: UInt64?) -> Finding? {
@@ -367,6 +403,10 @@ final class AuditStore {
 
     func diff(_ a: Int64, _ b: Int64) -> Result<SnapshotDiff, Error> {
         Result { try engine.diffSnapshots(a: a, b: b) }
+    }
+
+    func loadHistory() -> [SectionHistoryPoint] {
+        (try? engine.sectionHistory()) ?? []
     }
 
     // MARK: - Activity
