@@ -4,27 +4,32 @@
 //! ctrl-c, which always quits) do anything while this is up, so nothing
 //! drawn here can be mistaken for an active navigation surface.
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
+use crate::ui::layout::centered_rect;
+
 /// Keybinding, short description pairs, in the order they read most usefully
 /// (navigation first, then actions, then view controls).
 const BINDINGS: &[(&str, &str)] = &[
+    ("←/→, h/l, tab / shift-tab", "previous / next section"),
+    ("1-9, 0", "jump to section"),
     ("j/k, ↑/↓", "move selection"),
-    ("tab / shift-tab", "next / previous section"),
-    ("←/→", "collapse/expand tree group (else switch section)"),
+    ("PgUp / PgDn (ctrl-u / ctrl-d)", "page selection"),
     ("space", "mark / unmark row"),
-    ("enter", "toggle detail pane (else expand/collapse group)"),
+    ("enter", "open detail (on a group header: fold/unfold)"),
+    ("z", "fold / unfold the group under the cursor"),
+    ("p", "show / hide detail pane"),
+    ("J / K, wheel", "scroll detail pane"),
     ("x", "execute marked remedies (confirm dialog)"),
     ("r", "refresh current section's point-in-time sample"),
     ("R", "refresh all sections and save durable history"),
-    ("/", "filter by substring"),
+    ("/", "filter by substring (esc clears)"),
     ("s", "cycle sort (size / name / severity)"),
-    ("h", "toggle System apps visibility"),
-    ("PgUp / PgDn (ctrl-u / ctrl-d)", "scroll detail pane"),
+    ("H", "toggle System apps visibility"),
     ("?", "toggle this help"),
     ("q", "quit"),
 ];
@@ -62,24 +67,4 @@ pub fn draw(frame: &mut Frame, area: Rect) {
             .wrap(Wrap { trim: false }),
         popup,
     );
-}
-
-/// A `percent_x` × `percent_y` rectangle centered within `area`.
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(vertical[1])[1]
 }

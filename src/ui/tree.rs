@@ -1,33 +1,15 @@
-//! Tree grouping for `ViewKind::Tree` sections (Apps, Brew).
+//! Tree grouping for `ViewKind::Tree` sections (Apps, Brew, Disk).
 //!
 //! Findings are bucketed into named groups — a scanner-supplied
 //! `meta.group` string when present, else the `FindingKind` tag as a
 //! reasonable default bucket — and each group is independently collapsible.
-//! `enter`/`right` expands a group, `left` collapses it; `h` stays reserved
-//! for the System-apps visibility toggle (spec §4).
+//! `z` (or `enter` on the header) toggles a group; `←/→` never touch the
+//! tree — they always switch sections. Rendering is `rows::draw`.
 
-use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
-use ratatui::Frame;
+use std::collections::BTreeMap;
 
-use crate::model::{Finding, FindingId, Severity};
-use crate::ui::theme;
-
-/// One flattened, navigable row in the tree: either a group header or a leaf
-/// finding. `selected_row` in `AppState` indexes into a `Vec<TreeRow>`
-/// exactly like it indexes into the flat table rows.
-#[derive(Clone, Debug)]
-pub enum TreeRow<'a> {
-    Group {
-        key: String,
-        count: usize,
-        reclaimable_bytes: u64,
-        expanded: bool,
-    },
-    Item(&'a Finding),
-}
+use crate::model::{Finding, Severity};
+use crate::ui::rows::RenderRow;
 
 /// The group a finding belongs to: `meta.group` VERBATIM when a scanner sets
 /// it (scanners choose display-ready labels — "node_modules" must not become
@@ -55,130 +37,46 @@ pub fn group_label(key: &str) -> String {
 }
 
 /// Build the flattened row list from a set of findings, respecting which
-/// groups are currently collapsed. Groups are sorted by key; items within a
-/// group KEEP the caller's order (the reducer already applied the active
-/// sort — size/name/severity — and re-sorting here would silently ignore it).
+/// groups are currently collapsed. Groups are ordered by total bytes (biggest
+/// first — a disk view should lead with what's eating the disk), then by
+/// key for size-less sections; items within a group KEEP the caller's order
+/// (the reducer already applied the active sort, and re-sorting here would
+/// silently ignore it).
 pub fn build_rows<'a>(
     findings: impl Iterator<Item = &'a Finding>,
     is_collapsed: impl Fn(&str) -> bool,
-) -> Vec<TreeRow<'a>> {
-    use std::collections::BTreeMap;
+) -> Vec<RenderRow<'a>> {
     let mut groups: BTreeMap<String, Vec<&Finding>> = BTreeMap::new();
     for f in findings {
         groups.entry(group_key(f)).or_default().push(f);
     }
+    let mut ordered: Vec<(String, Vec<&Finding>)> = groups.into_iter().collect();
+    ordered
+        .sort_by(|(ka, a), (kb, b)| total_bytes(b).cmp(&total_bytes(a)).then_with(|| ka.cmp(kb)));
+
     let mut rows = Vec::new();
-    for (key, items) in groups {
+    for (key, items) in ordered {
         let reclaimable_bytes = items
             .iter()
             .filter(|f| f.severity == Severity::Reclaimable)
             .filter_map(|f| f.size_bytes)
             .sum();
         let expanded = !is_collapsed(&key);
-        rows.push(TreeRow::Group {
-            key: key.clone(),
+        rows.push(RenderRow::Group {
+            key,
             count: items.len(),
             reclaimable_bytes,
             expanded,
         });
         if expanded {
-            rows.extend(items.into_iter().map(TreeRow::Item));
+            rows.extend(items.into_iter().map(|f| RenderRow::Item { f, depth: 1 }));
         }
     }
     rows
 }
 
-/// Render the tree as a `List`, highlighting `selected`.
-pub fn draw(
-    frame: &mut Frame,
-    area: Rect,
-    title: &str,
-    rows: &[TreeRow],
-    is_marked: impl Fn(FindingId) -> bool,
-    selected: usize,
-) {
-    let items: Vec<ListItem> = rows
-        .iter()
-        .map(|row| match row {
-            TreeRow::Group {
-                key,
-                count,
-                reclaimable_bytes,
-                expanded,
-            } => {
-                let glyph = if *expanded {
-                    theme::EXPANDED
-                } else {
-                    theme::COLLAPSED
-                };
-                let size = if *reclaimable_bytes > 0 {
-                    format!(
-                        " · {}",
-                        humansize::format_size(*reclaimable_bytes, humansize::BINARY)
-                    )
-                } else {
-                    String::new()
-                };
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!("{glyph} "), Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        // group_key is already the display label.
-                        format!("{key} ({count}){size}"),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                ]))
-            }
-            TreeRow::Item(f) => {
-                let mark = if is_marked(f.id) { theme::MARK } else { " " };
-                // Some tree items have no size concept (apps/brew) — show it
-                // only if present (blank, not a perpetual `…`).
-                let size = f
-                    .size_bytes
-                    .map(|b| humansize::format_size(b, humansize::BINARY))
-                    .unwrap_or_default();
-                let mut spans = vec![
-                    Span::raw(format!("    {mark} ")),
-                    Span::raw(format!("{:<32}", f.title)),
-                    Span::styled(
-                        format!("{size:>10}  "),
-                        Style::default().fg(theme::severity_color(f.severity)),
-                    ),
-                    Span::styled(
-                        super::table::abbrev_path(f),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ];
-                if let Some(badge) = cask_badge(f) {
-                    spans.push(Span::styled(
-                        badge,
-                        Style::default().fg(theme::severity_color(Severity::Attention)),
-                    ));
-                }
-                ListItem::new(Line::from(spans))
-            }
-        })
-        .collect();
-
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" {title} ")),
-        )
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    let mut state = ListState::default();
-    if !rows.is_empty() {
-        state.select(Some(selected.min(rows.len() - 1)));
-    }
-    frame.render_stateful_widget(list, area, &mut state);
-}
-
-/// Warning badge for an app the cask catalog says could be brew-managed
-/// (`meta.available_cask` from network enrichment): the user can swap it to
-/// Homebrew with the adopt remedy shown in the detail pane / confirm dialog.
-pub fn cask_badge(f: &Finding) -> Option<String> {
-    let token = f.meta.get("available_cask")?.as_str()?;
-    Some(format!("  ⚠ brew cask available: {token}"))
+fn total_bytes(items: &[&Finding]) -> u64 {
+    items.iter().filter_map(|f| f.size_bytes).sum()
 }
 
 #[cfg(test)]
@@ -188,6 +86,10 @@ mod tests {
 
     fn finding(kind: FindingKind, key: &str, title: &str) -> Finding {
         Finding::new(kind, key, title)
+    }
+
+    fn rows<'a>(findings: &[&'a Finding], collapsed: bool) -> Vec<RenderRow<'a>> {
+        build_rows(findings.iter().copied(), |_| collapsed)
     }
 
     #[test]
@@ -225,10 +127,9 @@ mod tests {
         small.meta = serde_json::json!({"group": "node_modules"});
         small.size_bytes = Some(1);
         // Caller order: big first (size desc), despite 'zzz' > 'aaa'.
-        let ordered = [&big, &small];
-        let rows = build_rows(ordered.iter().copied(), |_| false);
+        let rows = rows(&[&big, &small], false);
         match (&rows[1], &rows[2]) {
-            (TreeRow::Item(first), TreeRow::Item(second)) => {
+            (RenderRow::Item { f: first, .. }, RenderRow::Item { f: second, .. }) => {
                 assert_eq!(first.title, "zzz-big");
                 assert_eq!(second.title, "aaa-small");
             }
@@ -237,18 +138,39 @@ mod tests {
     }
 
     #[test]
+    fn build_rows_orders_groups_by_total_bytes_then_key() {
+        let mut tiny = finding(FindingKind::BuildArtifact, "/p/a", "a");
+        tiny.meta = serde_json::json!({"group": ".wrangler"});
+        tiny.size_bytes = Some(1);
+        let mut huge = finding(FindingKind::LargeFile, "/p/b", "b");
+        huge.meta = serde_json::json!({"group": "Large files"});
+        huge.size_bytes = Some(1 << 30);
+        let x = finding(FindingKind::App, "/x", "x");
+        let y = finding(FindingKind::BrewCask, "/y", "y");
+        let rows = rows(&[&tiny, &huge, &y, &x], true);
+        let order: Vec<&str> = rows
+            .iter()
+            .map(|r| match r {
+                RenderRow::Group { key, .. } => key.as_str(),
+                _ => unreachable!(),
+            })
+            .collect();
+        // Sized groups biggest first; size-less groups alphabetical after.
+        assert_eq!(order, ["Large files", ".wrangler", "App", "Brew Cask"]);
+    }
+
+    #[test]
     fn build_rows_nests_items_under_expanded_group_only() {
         let a = finding(FindingKind::App, "/a", "A");
         let b = finding(FindingKind::App, "/b", "B");
-        let findings = [&a, &b];
-        let expanded_rows = build_rows(findings.iter().copied(), |_| false);
+        let expanded_rows = rows(&[&a, &b], false);
         assert_eq!(expanded_rows.len(), 3); // 1 group header + 2 items
 
-        let collapsed_rows = build_rows(findings.iter().copied(), |_| true);
+        let collapsed_rows = rows(&[&a, &b], true);
         assert_eq!(collapsed_rows.len(), 1); // just the header
         assert!(matches!(
             collapsed_rows[0],
-            TreeRow::Group {
+            RenderRow::Group {
                 expanded: false,
                 ..
             }
@@ -258,26 +180,5 @@ mod tests {
     #[test]
     fn group_label_title_cases_underscored_key() {
         assert_eq!(group_label("brew_formula"), "Brew Formula");
-    }
-
-    #[test]
-    fn cask_badge_only_for_catalog_matches() {
-        let mut matched = finding(FindingKind::App, "/Applications/Slack.app", "Slack");
-        matched.meta = serde_json::json!({
-            "classification": "unmanaged",
-            "available_cask": "slack"
-        });
-        assert_eq!(
-            cask_badge(&matched).as_deref(),
-            Some("  ⚠ brew cask available: slack")
-        );
-
-        let unmatched = finding(FindingKind::App, "/Applications/Bespoke.app", "Bespoke");
-        assert_eq!(cask_badge(&unmatched), None);
-
-        // Malformed meta (non-string) must not badge or panic.
-        let mut weird = finding(FindingKind::App, "/Applications/W.app", "W");
-        weird.meta = serde_json::json!({ "available_cask": 42 });
-        assert_eq!(cask_badge(&weird), None);
     }
 }

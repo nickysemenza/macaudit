@@ -14,6 +14,19 @@ pub fn severity_color(sev: Severity) -> Color {
     }
 }
 
+/// Short severity label ("info"/"attention"/"reclaim"/"warning") shown in the
+/// flat table view. `output::Finding::severity_label` has its own, longer-form
+/// labels ("reclaimable") for headless/CLI output — a different audience, so
+/// it's kept separate rather than unified with this one.
+pub fn severity_label(sev: Severity) -> &'static str {
+    match sev {
+        Severity::Info => "info",
+        Severity::Attention => "attention",
+        Severity::Reclaimable => "reclaim",
+        Severity::Warning => "warning",
+    }
+}
+
 /// Spinner frames for in-progress sections.
 pub const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 

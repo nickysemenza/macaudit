@@ -10,20 +10,37 @@ use ratatui::Frame;
 
 use crate::model::{Finding, FindingKind, ScannerId, Severity};
 use crate::ui::app::{AppState, SectionStatus};
-use crate::ui::theme;
+use crate::ui::layout::{Hit, Viewport};
+use crate::ui::{fmt, theme};
 
-pub fn draw(app: &AppState, frame: &mut Frame, area: Rect) {
+pub fn draw(app: &AppState, frame: &mut Frame, area: Rect, vp: &mut Viewport) {
+    // One frame, three headed sections — nested boxes cost four cells each
+    // and made the cards wrap early.
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Resource Health ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7),
-            Constraint::Length(8),
-            Constraint::Min(8),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Min(6),
         ])
-        .split(area);
+        .split(inner);
     draw_now(app, frame, rows[0]);
     draw_attention(app, frame, rows[1]);
-    draw_sources(app, frame, rows[2]);
+    draw_sources(app, frame, rows[2], vp);
+}
+
+fn heading(text: &'static str) -> Line<'static> {
+    Line::from(Span::styled(
+        text,
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ))
 }
 
 fn draw_now(app: &AppState, frame: &mut Frame, area: Rect) {
@@ -44,21 +61,16 @@ fn draw_now(app: &AppState, frame: &mut Frame, area: Rect) {
             ])
         })
         .collect();
-    let text = if cards.is_empty() {
-        vec![Line::from("Waiting for the manual resource snapshot…")]
+    let mut text = vec![heading("Now — manual point-in-time sample")];
+    if cards.is_empty() {
+        text.push(Line::from(Span::styled(
+            "Waiting for the manual resource snapshot…",
+            Style::default().fg(Color::DarkGray),
+        )));
     } else {
-        cards
-    };
-    frame.render_widget(
-        Paragraph::new(text)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Now — manual point-in-time sample "),
-            )
-            .wrap(Wrap { trim: true }),
-        area,
-    );
+        text.extend(cards);
+    }
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), area);
 }
 
 fn draw_attention(app: &AppState, frame: &mut Frame, area: Rect) {
@@ -74,7 +86,7 @@ fn draw_attention(app: &AppState, frame: &mut Frame, area: Rect) {
             .cmp(&a.severity)
             .then_with(|| b.size_bytes.cmp(&a.size_bytes))
     });
-    let mut lines = Vec::new();
+    let mut lines = vec![heading("Attention & active consumers")];
     for f in items.into_iter().take(5) {
         lines.push(Line::from(vec![
             Span::styled("• ", Style::default().fg(theme::severity_color(f.severity))),
@@ -85,34 +97,41 @@ fn draw_attention(app: &AppState, frame: &mut Frame, area: Rect) {
             Span::raw(format!(" — {}", f.detail)),
         ]));
     }
-    if lines.is_empty() {
-        lines.push(Line::from(
+    if lines.len() == 1 {
+        lines.push(Line::from(Span::styled(
             "No current pressure signals or sampled top processes yet.",
-        ));
+            Style::default().fg(Color::DarkGray),
+        )));
     }
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Attention & active consumers "),
-            )
-            .wrap(Wrap { trim: true }),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
 }
 
-fn draw_sources(app: &AppState, frame: &mut Frame, area: Rect) {
-    let mut lines = vec![Line::from(Span::styled(
-        "Drill into these source sections with Tab or the sidebar. Cleanup actions remain only on their original findings.",
-        Style::default().fg(Color::DarkGray),
-    ))];
-    for (id, label) in [
+fn draw_sources(app: &AppState, frame: &mut Frame, area: Rect, vp: &mut Viewport) {
+    // Heading + hint are one line each and kept short enough not to wrap at
+    // any width the rail is shown at, so the source rows below land at
+    // predictable y positions for hit-testing.
+    let mut lines = vec![
+        heading("Disk and cleanup sources"),
+        Line::from(Span::styled(
+            "Click a row (or Tab) to drill in; cleanup stays on the source findings.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    for (i, (id, label)) in [
         (ScannerId::Fs, "Disk allocation"),
         (ScannerId::Docker, "Docker"),
         (ScannerId::Simulator, "Simulators"),
         (ScannerId::TmSnapshots, "Snapshots"),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if let Some(idx) = ScannerId::ALL.iter().position(|s| *s == id) {
+            vp.push(
+                Rect::new(area.x, area.y + 2 + i as u16, area.width, 1),
+                Hit::OverviewSection(idx),
+            );
+        }
         let findings = app.overview_findings(id);
         let bytes: u64 = findings.iter().filter_map(|f| f.size_bytes).sum();
         let reclaimable: u64 = findings
@@ -127,7 +146,7 @@ fn draw_sources(app: &AppState, frame: &mut Frame, area: Rect) {
             SectionStatus::Idle => "idle",
         };
         let suffix = if reclaimable > 0 {
-            format!(" · {} actionable", human(reclaimable))
+            format!(" · {} actionable", fmt::bytes(reclaimable))
         } else {
             String::new()
         };
@@ -139,7 +158,7 @@ fn draw_sources(app: &AppState, frame: &mut Frame, area: Rect) {
             Span::raw(format!(
                 "{state} · {} findings · {}{suffix}",
                 findings.len(),
-                human(bytes)
+                fmt::bytes(bytes)
             )),
         ]));
     }
@@ -158,21 +177,12 @@ fn draw_sources(app: &AppState, frame: &mut Frame, area: Rect) {
             lines.push(Line::from(format!(
                 "  {} — {} ({})",
                 category.title,
-                human(category.size_bytes.unwrap_or(0)),
+                fmt::bytes(category.size_bytes.unwrap_or(0)),
                 category.coverage.as_deref().unwrap_or("scope unknown")
             )));
         }
     }
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Disk and cleanup sources "),
-            )
-            .wrap(Wrap { trim: true }),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
 }
 
 fn metric<'a>(findings: &'a [&Finding], role: &str) -> Option<&'a Finding> {
@@ -180,10 +190,6 @@ fn metric<'a>(findings: &'a [&Finding], role: &str) -> Option<&'a Finding> {
         .iter()
         .copied()
         .find(|f| f.meta.get("role").and_then(|v| v.as_str()) == Some(role))
-}
-
-fn human(bytes: u64) -> String {
-    humansize::format_size(bytes, humansize::BINARY)
 }
 
 #[cfg(test)]

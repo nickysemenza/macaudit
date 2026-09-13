@@ -398,17 +398,21 @@ mod tests {
     #[tokio::test]
     async fn fake_run_produces_findings() {
         let m = mgr(Mode::Fake);
-        let outcome = m.run_to_completion(&[ScannerId::Apps]).await;
-        // 3 distinct ids (item 1 upserted, not duplicated).
-        assert_eq!(outcome.findings.len(), 3);
+        // Disk has sized fixtures, so the deferred-size re-emit is exercised.
+        let outcome = m.run_to_completion(&[ScannerId::Fs]).await;
+        let expected = crate::fake::fixtures(ScannerId::Fs);
+        // Distinct ids: the deferred re-emit upserts rather than duplicates.
+        assert_eq!(outcome.findings.len(), expected.len());
         assert!(outcome.failures.is_empty());
-        // Item 1's size was set by the deferred update.
+        // Every fixture that carries a size ends up sized — including the one
+        // that was first emitted unsized.
+        let expect_sized = expected.iter().filter(|f| f.size_bytes.is_some()).count();
         let sized = outcome
             .findings
             .values()
             .filter(|f| f.size_bytes.is_some())
             .count();
-        assert!(sized >= 2, "expected deferred size to land");
+        assert_eq!(sized, expect_sized, "expected deferred size to land");
     }
 
     #[tokio::test]

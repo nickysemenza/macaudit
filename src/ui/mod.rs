@@ -5,6 +5,7 @@
 //! scanners run as tasks and report over the channel.
 
 pub mod app;
+pub mod fmt;
 pub mod keys;
 pub mod theme;
 
@@ -12,11 +13,23 @@ mod activity;
 mod confirm;
 mod detail;
 mod help;
+mod layout;
+mod marking;
+mod mouse;
+mod nav;
 mod overview;
+mod present;
+mod rows;
 mod sidebar;
+mod state;
 mod statusbar;
-mod table;
 mod tree;
+mod view;
+
+#[cfg(test)]
+mod render_tests;
+#[cfg(test)]
+mod testutil;
 
 use std::collections::HashMap;
 use std::sync::Arc;

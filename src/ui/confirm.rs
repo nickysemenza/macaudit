@@ -4,7 +4,7 @@
 //! §4's "never run anything unseen" guarantee — the detail pane shows one
 //! finding's commands, this shows the whole batch right before it runs.
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
@@ -12,7 +12,8 @@ use ratatui::Frame;
 
 use crate::config::DeleteMode;
 use crate::remedy::PlannedAction;
-use crate::ui::theme;
+use crate::ui::layout::centered_rect;
+use crate::ui::{fmt, theme};
 
 pub fn draw(frame: &mut Frame, area: Rect, actions: &[PlannedAction], delete_mode: DeleteMode) {
     let popup = centered_rect(72, 60, area);
@@ -44,10 +45,7 @@ pub fn draw(frame: &mut Frame, area: Rect, actions: &[PlannedAction], delete_mod
         ]));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(format!(
-        "Reclaims: {}",
-        humansize::format_size(total, humansize::BINARY)
-    )));
+    lines.push(Line::from(format!("Reclaims: {}", fmt::bytes(total))));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "y / enter: confirm    n / esc: cancel",
@@ -64,24 +62,4 @@ pub fn draw(frame: &mut Frame, area: Rect, actions: &[PlannedAction], delete_mod
             .wrap(Wrap { trim: false }),
         popup,
     );
-}
-
-/// A `percent_x` × `percent_y` rectangle centered within `area`.
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(vertical[1])[1]
 }

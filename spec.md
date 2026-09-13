@@ -217,20 +217,52 @@ Design notes:
 
 ## 4. TUI layout (ratatui + crossterm)
 
-- **Left sidebar**: sections (Apps, Brew, Disk, Daemons, Shell, Runtimes,
-  Docker, Ports, Git, Keys) with per-section status glyph: spinner while
-  scanning, count + total reclaimable when done, ⚠ on failure.
-- **Main panel**: tree view (Apps/Brew) or sortable table (Disk/others).
-  Tree nodes collapsible; `h` toggles System apps visibility.
-- **Bottom bar**: keybinds + running totals ("Selected: 7 items · 18.3 GB").
-- **Keys**: arrows/jk navigate, `space` mark, `enter` detail pane, `x` execute
-  remedies on marked (confirm dialog listing exact commands; destructive ones
-  in red), `r` rescan section, `R` rescan all, `/` filter, `s` cycle sort,
-  `q` quit.
+- **Nav rail** (left, adaptive width): one row per section (Overview, Apps,
+  Brew, Disk, Daemons, Shell, Runtimes, Docker, Ports, Git, Simulators, Keys,
+  Snapshots) — a map, not a focusable list. `←/→`, `h/l`, `Tab`/`Shift-Tab`,
+  digits `1`-`9`/`0`, or a click always switch sections; row movement never
+  touches it. Full rows (≥100 cols) show a status glyph (spinner / ⚠),
+  finding count, compact reclaimable size, and a `Δ±` badge vs. the last
+  snapshot; 70-99 cols shows title only; below 70 the rail is hidden and the
+  statusbar names the section instead.
+- **Main panel**: a tree (Apps/Brew/Disk, ordered by total size) or flat
+  sortable table for the rest, with columns specific to each section (e.g.
+  Git: Repo · Branch · State · Size · Used · Path; Ports: Port · PID ·
+  Command · User · Host · Binary). Severity colors the primary cell rather
+  than occupying a column; `z` folds/unfolds the tree group under the
+  cursor. `s` cycles a section's sort (default → each sortable column →
+  severity); clicking a column header sorts by it, clicking again flips
+  direction.
+- **Detail pane** (optional, right): shown automatically at 120+ columns,
+  hidden below, `p` forces it either way; not shown on the Overview. Renders
+  the selected Finding as typed key/value rows plus every remedy's literal
+  command, wrapped so it's never clipped.
+- **Bottom bar**: clickable key hints + running totals ("Selected: 7 items ·
+  18.3 GB"); becomes the filter text-input line while filtering.
+- **Keys**: `←/→`/`h/l`/`Tab` switch sections, `j/k`/`↑/↓` move the
+  selection, `space` mark, `enter` opens detail (or folds/unfolds a group
+  header), `z` fold/unfold, `p` toggle detail pane, `x` execute remedies on
+  marked (confirm dialog listing exact commands; destructive ones in red),
+  `r` rescan section, `R` rescan all, `/` filter (`esc` clears it, else
+  quits), `s` cycle sort, `H` toggle System apps, `?` help, `q` quit.
+- **Mouse**: a click on a nav rail row switches section; a row click selects,
+  a double-click opens detail or folds a group header; a column header click
+  sorts; a statusbar hint click performs its action; wheel switches sections
+  over the rail, moves the selection over the main panel, and scrolls over
+  the detail pane. Every click/wheel resolves through a `Viewport`/`Hit` map
+  recorded during the previous draw, then is re-expressed as the same
+  keyboard `Action` a key would produce — the mouse can never do anything a
+  key can't.
 - Detail pane shows the Finding's full meta + each remedy's literal command —
   the tool must never run anything the user hasn't seen verbatim.
 - Remediation runs as tokio tasks; results stream into an activity log pane;
   affected Findings get re-checked (targeted rescan) after completion.
+- Presentation architecture: `src/ui/present/` holds one `SectionPresenter`
+  per scanner (its `Column`s, sort behavior, and a detail fn) so a section's
+  columns live next to nothing else; `src/ui/rows.rs` is the single renderer
+  that draws any section's rows from its presenter; `src/ui/layout.rs` owns
+  `Viewport`/`Hit`, the screen-geometry map recorded during `draw` that mouse
+  handling and paging read back.
 
 ## 5. CLI surface (clap)
 

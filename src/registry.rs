@@ -34,6 +34,8 @@ pub enum ViewKind {
 pub struct SectionMeta {
     pub id: ScannerId,
     pub title: &'static str,
+    /// ≤10-column label for the nav rail.
+    pub short_title: &'static str,
     pub view: ViewKind,
     /// Build a fresh scanner instance. Boxed trait object so the engine can hold
     /// a heterogeneous list.
@@ -45,24 +47,28 @@ pub const REGISTRY: &[SectionMeta] = &[
     SectionMeta {
         id: ScannerId::System,
         title: "Resource Health",
+        short_title: "Health",
         view: ViewKind::Overview,
         build: || Box::new(SystemScanner),
     },
     SectionMeta {
         id: ScannerId::Apps,
         title: "Apps",
+        short_title: "Apps",
         view: ViewKind::Tree,
         build: || Box::new(AppsScanner),
     },
     SectionMeta {
         id: ScannerId::Brew,
         title: "Brew",
+        short_title: "Brew",
         view: ViewKind::Tree,
         build: || Box::new(BrewScanner),
     },
     SectionMeta {
         id: ScannerId::Fs,
         title: "Disk",
+        short_title: "Disk",
         // Grouped by artifact category (node_modules / target / Caches /
         // Large files / iOS Backups …) — thousands of flat rows are unreadable.
         view: ViewKind::Tree,
@@ -71,54 +77,63 @@ pub const REGISTRY: &[SectionMeta] = &[
     SectionMeta {
         id: ScannerId::Launchd,
         title: "Daemons",
+        short_title: "Daemons",
         view: ViewKind::Table,
         build: || Box::new(LaunchdScanner),
     },
     SectionMeta {
         id: ScannerId::ShellEnv,
         title: "Shell",
+        short_title: "Shell",
         view: ViewKind::Table,
         build: || Box::new(ShellEnvScanner),
     },
     SectionMeta {
         id: ScannerId::Runtimes,
         title: "Runtimes",
+        short_title: "Runtimes",
         view: ViewKind::Table,
         build: || Box::new(RuntimesScanner),
     },
     SectionMeta {
         id: ScannerId::Docker,
         title: "Docker",
+        short_title: "Docker",
         view: ViewKind::Table,
         build: || Box::new(DockerScanner),
     },
     SectionMeta {
         id: ScannerId::Ports,
         title: "Ports",
+        short_title: "Ports",
         view: ViewKind::Table,
         build: || Box::new(PortsScanner),
     },
     SectionMeta {
         id: ScannerId::Git,
         title: "Git",
+        short_title: "Git",
         view: ViewKind::Table,
         build: || Box::new(GitScanner),
     },
     SectionMeta {
         id: ScannerId::Simulator,
         title: "Simulators",
+        short_title: "Simulators",
         view: ViewKind::Table,
         build: || Box::new(SimulatorScanner),
     },
     SectionMeta {
         id: ScannerId::SshKeys,
         title: "Keys",
+        short_title: "Keys",
         view: ViewKind::Table,
         build: || Box::new(SshKeysScanner),
     },
     SectionMeta {
         id: ScannerId::TmSnapshots,
         title: "Snapshots",
+        short_title: "Snapshots",
         view: ViewKind::Table,
         build: || Box::new(TmSnapshotsScanner),
     },

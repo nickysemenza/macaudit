@@ -12,6 +12,8 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::ui::present::ColumnId;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     Up,
@@ -23,7 +25,7 @@ pub enum Action {
     Enter,
     Esc,
     Backspace,
-    /// Scroll the detail pane down/up (PageDown/PageUp, or ctrl-d/ctrl-u —
+    /// Page the main panel down/up (PageDown/PageUp, or ctrl-d/ctrl-u —
     /// the readline-ish aliases many terminal users reach for).
     PageDown,
     PageUp,
@@ -33,6 +35,15 @@ pub enum Action {
     Char(char),
     /// ctrl-c always quits, in every mode.
     CtrlC,
+    /// Move the cursor to an absolute row of the current section (mouse).
+    SelectRow(usize),
+    /// Switch to the section at this `REGISTRY` index (digit keys, mouse).
+    JumpSection(usize),
+    /// Scroll the detail pane by this many lines (wheel, `J`/`K`).
+    ScrollDetail(i16),
+    /// Sort by a column, flipping direction if it's already active (header
+    /// click).
+    SortBy(ColumnId),
 }
 
 /// Map a key event to an action (`None` if unbound/unhandled, e.g. key-release

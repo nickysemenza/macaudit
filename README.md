@@ -82,22 +82,48 @@ Global flags (apply to every subcommand and the TUI):
 
 ## Keybindings
 
+The left sidebar is a *nav rail*, not a selectable list: section-switching
+keys always switch sections, and row-movement keys always move rows.
+
 | Key | Action |
 |---|---|
-| `j`/`k`, arrows | Move selection |
-| `tab` / `shift-tab` | Next / previous section |
-| `←` / `→` | Collapse/expand tree group (else switch section) |
+| `←`/`→`, `h`/`l`, `tab`/`shift-tab` | Previous / next section |
+| `1`-`9`, `0` | Jump to section |
+| `j`/`k`, `↑`/`↓` | Move selection |
+| `PgUp` / `PgDn` (`ctrl-u` / `ctrl-d`) | Page selection |
 | `space` | Mark / unmark row |
-| `enter` | Toggle detail pane (else expand/collapse tree group) |
+| `enter` | Open detail (on a group header: fold/unfold) |
+| `z` | Fold / unfold the group under the cursor |
+| `p` | Show / hide detail pane |
+| `J` / `K`, wheel | Scroll detail pane |
 | `x` | Execute marked remedies (confirm dialog) |
-| `r` | Refresh the current point-in-time section |
+| `r` | Refresh current section's point-in-time sample |
 | `R` | Refresh all sections and save durable history |
-| `/` | Filter by substring |
+| `/` | Filter by substring (`esc` clears) |
 | `s` | Cycle sort (size / name / severity) |
-| `h` | Toggle System apps visibility |
-| `PgUp` / `PgDn` (or `ctrl-u` / `ctrl-d`) | Scroll detail pane |
-| `?` | Toggle keybindings help |
+| `H` | Toggle System apps visibility |
+| `?` | Toggle this help |
 | `q` | Quit |
+
+The detail pane shows automatically once the terminal is at least 120
+columns wide (`p` forces it either way), and the nav rail itself adapts to
+width: full (with finding counts, reclaimable size, and a `Δ` badge vs. the
+last snapshot) at 100+ columns, title-only from 70-99, and hidden below 70
+(the statusbar then names the current section instead).
+
+### Mouse
+
+| Target | Click | Double-click | Wheel |
+|---|---|---|---|
+| Nav rail row | Switch section | — | Switch section |
+| Data row | Select | Open detail / fold header | Move selection 3 rows |
+| Column header | Sort by it (click again to flip direction) | — | — |
+| Statusbar hint | Perform its action | — | — |
+| Overview source row | Jump to that section | — | — |
+| Detail pane | — | — | Scroll |
+
+Mouse works while the `/` filter box is open; the Confirm and Help modals
+swallow it.
 
 ## Configuration
 
