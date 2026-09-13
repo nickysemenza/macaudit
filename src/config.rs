@@ -151,6 +151,9 @@ pub struct ToolsConfig {
     pub python_sites: Vec<String>,
     /// Inventory Apple's `/Library/Python` sites (never offers remedies there).
     pub include_apple_python: bool,
+    /// Override the Homebrew prefix (default: `$HOMEBREW_PREFIX`, then
+    /// `/opt/homebrew`, then `/usr/local`, whichever has a `Cellar/`).
+    pub homebrew_prefix: Option<String>,
 }
 
 impl Default for ToolsConfig {
@@ -172,6 +175,7 @@ impl Default for ToolsConfig {
             bun_home: "~/.bun".to_string(),
             python_sites: Vec::new(),
             include_apple_python: true,
+            homebrew_prefix: None,
         }
     }
 }

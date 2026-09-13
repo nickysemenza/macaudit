@@ -92,7 +92,7 @@ struct OutdatedEntry {
 
 /// The Homebrew prefix whose `Cellar/` exists (`$HOMEBREW_PREFIX`, then the
 /// two standard locations). `None` means sizes stay unknown.
-fn brew_prefix() -> Option<PathBuf> {
+pub fn brew_prefix() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(p) = std::env::var_os("HOMEBREW_PREFIX") {
         candidates.push(PathBuf::from(p));
