@@ -21,6 +21,7 @@ fn status(f: &Finding, _: &CellCtx) -> CellText {
     }
     match f.kind {
         FindingKind::BrewCask => dim("cask"),
+        _ if f.meta.get("candidates").is_some() => dim("summary"),
         _ if meta_bool(f, "autoremove_candidate").unwrap_or(false) => {
             colored("autoremove", theme::severity_color(Severity::Reclaimable))
         }
@@ -123,7 +124,86 @@ fn detail(f: &Finding, m: &mut MetaView<'_>) -> Vec<Field> {
         "Needed by (transitive)",
     ));
     out.extend(kv_list(m, "cask_dependents", "Needed by casks"));
+    if let Some(why) = f.meta.get("why_installed") {
+        let roots: Vec<String> = why
+            .get("requested_roots")
+            .and_then(|r| r.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !roots.is_empty() {
+            out.push(kv("Kept because of", roots.join(", ")));
+        }
+        if let Some(paths) = why.get("paths").and_then(|p| p.as_array()) {
+            for p in paths.iter().take(3) {
+                let chain: Vec<String> = p
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if chain.len() > 1 {
+                    out.push(kv("  chain", chain.join(" ← ")));
+                }
+            }
+        }
+        m.skip("why_installed");
+    }
+    if let Some(p) = f.meta.get("removal_preview") {
+        out.push(Field::Header("If removed"));
+        let list = |k: &str| -> Vec<String> {
+            p.get(k)
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let blocked = list("blocked_by");
+        if blocked.is_empty() {
+            out.push(kv("Removable", "yes — nothing installed still needs it"));
+        } else {
+            out.push(kv_styled("Blocked by", blocked.join(", "), Color::Red));
+        }
+        let orphans = list("would_orphan");
+        if !orphans.is_empty() {
+            out.push(kv("Would orphan", orphans.join(", ")));
+        }
+        let confirmed = list("confirmed_orphans");
+        if !confirmed.is_empty() {
+            out.push(kv_styled(
+                "brew-confirmed",
+                confirmed.join(", "),
+                Color::Cyan,
+            ));
+        }
+        let uncertain = list("uncertain_orphans");
+        if !uncertain.is_empty() {
+            out.push(kv_styled(
+                "Origin unknown",
+                uncertain.join(", "),
+                Color::Yellow,
+            ));
+        }
+        m.skip("removal_preview");
+    }
+    out.extend(kv_list(m, "graph_caveats", "Graph caveats"));
+    out.extend(kv_list(m, "binaries", "Binaries"));
     out.extend(kv_list(m, "app_paths", "Installs"));
+    out.extend(kv_list(m, "tool_peers", "Same command as tools"));
+    m.skip("group");
+    m.skip("completeness");
+    m.skip("full_name");
+    m.skip("tap");
+    m.skip("aliases");
+    m.skip("pinned");
     out
 }
 

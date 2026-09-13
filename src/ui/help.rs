@@ -21,7 +21,11 @@ const BINDINGS: &[(&str, &str)] = &[
     ("PgUp / PgDn (ctrl-u / ctrl-d)", "page selection"),
     ("space", "mark / unmark row"),
     ("enter", "open detail (on a group header: fold/unfold)"),
-    ("z", "fold / unfold the group under the cursor"),
+    (
+        "z",
+        "fold / unfold the group or dependency node under the cursor",
+    ),
+    ("d", "Brew: flip the explorer between needs / needed-by"),
     ("p", "show / hide detail pane"),
     ("J / K, wheel", "scroll detail pane"),
     ("e", "cycle which remedy the row will run (marks it)"),

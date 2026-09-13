@@ -12,6 +12,7 @@ pub mod theme;
 mod activity;
 mod cleanup_view;
 mod confirm;
+mod deps;
 mod detail;
 mod help;
 mod layout;

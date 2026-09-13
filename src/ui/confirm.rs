@@ -123,8 +123,14 @@ pub fn lines(model: &ConfirmModel, delete_mode: DeleteMode) -> Vec<Line<'static>
             out.push(dim(
                 "  after removal, review: brew autoremove --dry-run (re-run automatically)",
             ));
-            for c in &p.caveats {
+            for c in p.caveats.iter().take(3) {
                 out.push(dim(format!("  note: {c}")));
+            }
+            if p.caveats.len() > 3 {
+                out.push(dim(format!(
+                    "  … {} more graph notes (see the detail pane)",
+                    p.caveats.len() - 3
+                )));
             }
         }
     }

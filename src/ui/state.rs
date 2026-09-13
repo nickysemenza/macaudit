@@ -123,6 +123,7 @@ impl AppState {
             return;
         }
         crate::correlate::correlate(&mut merged);
+        self.brew_version += 1;
         for (fid, f) in merged {
             self.findings
                 .entry(f.kind.scanner())
@@ -165,6 +166,9 @@ impl AppState {
         match ev {
             ScanEvent::Started { scanner, .. } => {
                 self.findings.entry(scanner).or_default().clear();
+                if scanner == ScannerId::Brew {
+                    self.brew_version += 1;
+                }
                 self.status.insert(
                     scanner,
                     SectionStatus::Scanning {
@@ -187,6 +191,9 @@ impl AppState {
             ScanEvent::Finding {
                 scanner, finding, ..
             } => {
+                if scanner == ScannerId::Brew {
+                    self.brew_version += 1;
+                }
                 self.findings
                     .entry(scanner)
                     .or_default()
@@ -197,6 +204,9 @@ impl AppState {
             } => {
                 self.status
                     .insert(scanner, SectionStatus::Done { duration });
+                if scanner == ScannerId::Brew {
+                    self.brew_version += 1;
+                }
                 self.drop_stale_marks(scanner);
             }
             ScanEvent::Failed { scanner, error, .. } => {

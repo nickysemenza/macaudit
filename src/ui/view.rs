@@ -77,8 +77,18 @@ impl AppState {
     /// this list.
     pub(super) fn rows(&self) -> Vec<RenderRow<'_>> {
         let findings = self.visible_findings();
+        let id = self.selected_section_id();
+        if id == ScannerId::Brew {
+            let graph = self.brew_graph();
+            return crate::ui::deps::build_explorer_rows(
+                &graph,
+                &findings,
+                self.deps_direction,
+                &|key| self.collapsed_groups.contains(&(id, key.to_string())),
+                &|key| self.expanded_nodes.contains(key),
+            );
+        }
         if self.is_tree_view() {
-            let id = self.selected_section_id();
             tree::build_rows(findings.into_iter(), |key| {
                 self.collapsed_groups.contains(&(id, key.to_string()))
             })
@@ -94,12 +104,49 @@ impl AppState {
         self.rows().len()
     }
 
-    /// The Finding under the cursor (`None` on a tree group header).
+    /// The Finding under the cursor (`None` on a tree group header or an
+    /// explorer placeholder).
     pub(super) fn selected_finding(&self) -> Option<&Finding> {
         match self.rows().into_iter().nth(self.selected_row) {
             Some(RenderRow::Item { f, .. }) => Some(f),
+            Some(RenderRow::Node { f, .. }) => f,
             _ => None,
         }
+    }
+
+    /// The Homebrew graph for the explorer and previews, rebuilt only when
+    /// the Brew findings changed.
+    pub(crate) fn brew_graph(&self) -> std::rc::Rc<crate::brewgraph::BrewGraph> {
+        if let Some((v, g)) = self.brew_graph.borrow().as_ref() {
+            if *v == self.brew_version {
+                return g.clone();
+            }
+        }
+        let graph = std::rc::Rc::new(crate::brewgraph::BrewGraph::from_findings(
+            self.findings
+                .get(&ScannerId::Brew)
+                .into_iter()
+                .flat_map(|m| m.values()),
+        ));
+        *self.brew_graph.borrow_mut() = Some((self.brew_version, graph.clone()));
+        graph
+    }
+
+    pub(crate) fn deps_direction(&self) -> crate::brewgraph::Direction {
+        self.deps_direction
+    }
+
+    /// Row titles in display order (tests): group keys, finding titles, node names.
+    #[cfg(test)]
+    pub(crate) fn rows_titles(&self) -> Vec<Option<String>> {
+        self.rows()
+            .into_iter()
+            .map(|r| match r {
+                RenderRow::Group { .. } => None,
+                RenderRow::Item { f, .. } => Some(f.title.clone()),
+                RenderRow::Node { name, .. } => Some(name),
+            })
+            .collect()
     }
 }
 
@@ -138,6 +185,42 @@ fn matches_filter(f: &Finding, needle: &str) -> bool {
             .as_ref()
             .map(|p| p.display().to_string().to_lowercase().contains(needle))
             .unwrap_or(false)
+        || searchable_meta(f)
+            .iter()
+            .any(|s| s.to_lowercase().contains(needle))
+}
+
+/// Meta strings worth filtering on: group, manager, package/command names,
+/// aliases — so `/eslint` finds the tool whose *command* is eslint.
+fn searchable_meta(f: &Finding) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in [
+        "group",
+        "manager",
+        "name",
+        "command",
+        "layout",
+        "primary_classification",
+    ] {
+        if let Some(s) = f.meta.get(key).and_then(|v| v.as_str()) {
+            out.push(s.to_string());
+        }
+    }
+    if let Some(cmds) = f.meta.get("commands").and_then(|v| v.as_array()) {
+        for c in cmds {
+            if let Some(n) = c.get("name").and_then(|n| n.as_str()) {
+                out.push(n.to_string());
+            }
+        }
+    }
+    if let Some(aliases) = f.meta.get("aliases").and_then(|v| v.as_array()) {
+        for a in aliases {
+            if let Some(n) = a.as_str() {
+                out.push(n.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// Whether a finding is a System app (hidden unless `H` toggled). Heuristic on

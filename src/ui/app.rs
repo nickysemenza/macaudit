@@ -156,6 +156,16 @@ pub struct AppState {
     pub pending_cancel_cleanup: bool,
     /// Scroll offset of the preview/report overlays.
     pub(crate) overlay_scroll: u16,
+    /// Brew explorer direction (`d` toggles).
+    pub(super) deps_direction: crate::brewgraph::Direction,
+    /// Explorer nodes the user expanded, keyed by direction-prefixed path.
+    pub(super) expanded_nodes: HashSet<String>,
+    /// Cached Homebrew graph built from the Brew findings, tagged with the
+    /// Brew map version it was built from.
+    pub(super) brew_graph:
+        std::cell::RefCell<Option<(u64, std::rc::Rc<crate::brewgraph::BrewGraph>)>>,
+    /// Bumped on every Brew map mutation so the cached graph is rebuilt.
+    pub(super) brew_version: u64,
     /// Delete mode used when planning remedies. Defaults to `Trash`, matching
     /// `Config::default()` — see the module-level contract-friction note in
     /// the lane report: `AppState` has no path to the real `Config` because
@@ -218,6 +228,10 @@ impl Default for AppState {
             cleanup: None,
             pending_cancel_cleanup: false,
             overlay_scroll: 0,
+            deps_direction: crate::brewgraph::Direction::Forward,
+            expanded_nodes: HashSet::new(),
+            brew_graph: std::cell::RefCell::new(None),
+            brew_version: 0,
             delete_mode: DeleteMode::Trash,
             activity: Vec::new(),
             baseline: HashMap::new(),
@@ -344,13 +358,24 @@ impl AppState {
         let total = self.section_count(id);
         let shown = rows
             .iter()
-            .filter(|r| matches!(r, rows::RenderRow::Item { .. }))
+            .filter(|r| {
+                matches!(
+                    r,
+                    rows::RenderRow::Item { .. } | rows::RenderRow::Node { depth: 1, .. }
+                )
+            })
             .count();
-        let title = if self.filter.is_empty() {
+        let mut title = if self.filter.is_empty() {
             format!("{} · {total}", section.title)
         } else {
             format!("{} · {shown}/{total} · /{}", section.title, self.filter)
         };
+        if id == ScannerId::Brew {
+            title.push_str(match self.deps_direction() {
+                crate::brewgraph::Direction::Forward => " · needs (d: needed-by)",
+                crate::brewgraph::Direction::Reverse => " · needed by (d: needs)",
+            });
+        }
         let is_scanning = matches!(self.status_of(id), SectionStatus::Scanning { .. });
         let empty_message = if is_scanning {
             "scanning…"
