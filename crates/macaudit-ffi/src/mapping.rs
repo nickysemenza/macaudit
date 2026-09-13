@@ -526,8 +526,11 @@ pub enum ExecEvent {
     },
     Executed {
         cancelled: Vec<PlannedActionView>,
-        /// Sections the engine is rescanning now that the batch has run.
+        /// Sections the engine is rescanning now that the batch has run, and
+        /// the generation those scans report under (None when nothing was
+        /// affected).
         rescanning: Vec<SectionId>,
+        rescan_gen: Option<u64>,
     },
     Verifying,
     Finished {
@@ -561,6 +564,7 @@ impl From<cleanup::ExecEvent> for ExecEvent {
             E::Executed { cancelled } => ExecEvent::Executed {
                 cancelled: cancelled.iter().map(PlannedActionView::from).collect(),
                 rescanning: Vec::new(),
+                rescan_gen: None,
             },
             E::Verifying => ExecEvent::Verifying,
             E::Finished(report) => ExecEvent::Finished {

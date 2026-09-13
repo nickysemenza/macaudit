@@ -11,7 +11,7 @@
 //!   enrichment has landed.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use macaudit::correlate::{self, CORRELATED_SECTIONS};
@@ -258,9 +258,16 @@ impl Pending {
 /// Drain the engine channel forever: apply each event to the session, batch
 /// what goes to Swift, and run the post-scan steps (correlate, enrich,
 /// auto-snapshot) exactly as the TUI loop does.
-pub async fn pump(mut rx: mpsc::Receiver<ScanEvent>, shared: Arc<Shared>) {
+///
+/// Holds the session weakly: `Shared` owns the channel's sender, so a strong
+/// reference here would keep the channel open (and this task alive) after
+/// the app drops its `Engine`. When the engine is gone, the pump exits.
+pub async fn pump(mut rx: mpsc::Receiver<ScanEvent>, weak: Weak<Shared>) {
     let mut pending = Pending::default();
     loop {
+        let Some(shared) = weak.upgrade() else {
+            return;
+        };
         match tokio::time::timeout(FLUSH_INTERVAL, rx.recv()).await {
             Ok(Some(ev)) => {
                 let (accepted, terminal) = {

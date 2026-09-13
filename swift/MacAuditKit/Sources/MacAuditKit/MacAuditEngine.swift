@@ -36,3 +36,25 @@ extension SectionId: Identifiable {
 
 extension Finding: Identifiable {}
 extension SnapshotMeta: Identifiable {}
+
+extension SectionId {
+    /// The engine's section slug (`macaudit scan --section <slug>`).
+    public var slug: String {
+        switch self {
+        case .system: "system"
+        case .apps: "apps"
+        case .brew: "brew"
+        case .tools: "tools"
+        case .fs: "fs"
+        case .launchd: "launchd"
+        case .shellEnv: "shell_env"
+        case .runtimes: "runtimes"
+        case .docker: "docker"
+        case .ports: "ports"
+        case .git: "git"
+        case .simulator: "simulator"
+        case .sshKeys: "ssh_keys"
+        case .tmSnapshots: "tm_snapshots"
+        }
+    }
+}

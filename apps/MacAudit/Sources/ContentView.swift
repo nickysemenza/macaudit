@@ -1,0 +1,109 @@
+import MacAuditKit
+import SwiftUI
+
+struct ContentView: View {
+    @Environment(AuditStore.self) private var store
+    @State private var showInspector = true
+    @State private var showSnapshots = false
+
+    var body: some View {
+        @Bindable var store = store
+        NavigationSplitView {
+            SectionSidebar()
+        } detail: {
+            if let section = store.selectedSection, let meta = store.meta(for: section) {
+                SectionDetail(meta: meta)
+                    .navigationTitle(meta.title)
+                    .navigationSubtitle(subtitle(for: section))
+            } else {
+                ContentUnavailableView("Pick a section", systemImage: "sidebar.left")
+            }
+        }
+        .inspector(isPresented: $showInspector) {
+            FindingInspector(finding: store.finding(store.selectedFinding))
+                .inspectorColumnWidth(min: 280, ideal: 340, max: 520)
+        }
+        .toolbar {
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button {
+                    if let s = store.selectedSection { store.rescan(s) }
+                } label: {
+                    Label("Rescan Section", systemImage: "arrow.clockwise")
+                }
+                .disabled(store.selectedSection == nil)
+                .help("Rescan this section (⇧⌘R)")
+
+                Button {
+                    if let id = store.selectedFinding { store.toggleMark(id) }
+                } label: {
+                    Label(
+                        store.selectedFinding.map { store.marked.contains($0) } == true ? "Unmark" : "Mark",
+                        systemImage: store.selectedFinding.map { store.marked.contains($0) } == true
+                            ? "checkmark.circle.fill" : "checkmark.circle")
+                }
+                .disabled(store.selectedFinding == nil)
+                .help("Mark the selected finding for cleanup (space)")
+
+                Button {
+                    store.openConfirm()
+                } label: {
+                    Label("Clean Up… (\(store.marked.count))", systemImage: "trash")
+                }
+                .disabled(store.marked.isEmpty)
+                .help("Plan and confirm the marked cleanup (⌘X)")
+
+                Button {
+                    store.refreshSnapshots()
+                    showSnapshots = true
+                } label: {
+                    Label("Snapshots", systemImage: "clock.arrow.circlepath")
+                }
+
+                Button {
+                    showInspector.toggle()
+                } label: {
+                    Label("Inspector", systemImage: "sidebar.right")
+                }
+            }
+        }
+        .sheet(isPresented: Binding(get: { store.pendingSummary != nil }, set: { if !$0 { store.dismissConfirm() } })) {
+            if let summary = store.pendingSummary {
+                ConfirmSheet(summary: summary)
+            }
+        }
+        .sheet(isPresented: Binding(get: { store.cleanup != nil }, set: { if !$0 { store.dismissCleanup() } })) {
+            CleanupProgressView()
+        }
+        .sheet(isPresented: $showSnapshots) {
+            SnapshotsView()
+        }
+        .alert("Could not plan cleanup", isPresented: Binding(get: { store.planError != nil }, set: { _ in store.clearPlanError() })) {
+            Button("OK") {}
+        } message: {
+            Text(store.planError ?? "")
+        }
+    }
+
+    private func subtitle(for section: SectionId) -> String {
+        switch store.status(of: section) {
+        case .idle: return "not scanned"
+        case .scanning(let msg, let done, let total):
+            var s = "scanning"
+            if let total, total > 0 { s += " \(done)/\(total)" } else if done > 0 { s += " \(done)" }
+            if !msg.isEmpty { s += " — \(msg)" }
+            return s
+        case .done(let ms):
+            let reclaimable = store.reclaimableBytes(in: section)
+            var s = "\(store.count(of: section)) findings in \(Double(ms) / 1000, specifier: "%.1f")s"
+            if reclaimable > 0 { s += " · \(Formatting.bytes(reclaimable)) reclaimable" }
+            return s
+        case .failed(let error): return "failed: \(error)"
+        }
+    }
+}
+
+extension String.StringInterpolation {
+    mutating func appendInterpolation(_ value: Double, specifier: String) {
+        appendLiteral(String(format: specifier, value))
+    }
+}

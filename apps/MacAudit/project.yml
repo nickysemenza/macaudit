@@ -1,0 +1,69 @@
+# xcodegen spec — `xcodegen generate --spec apps/MacAudit/project.yml`
+# produces MacAudit.xcodeproj (gitignored). Run scripts/build-ffi.sh first:
+# the app links MacAuditKit, which needs the generated bindings + xcframework.
+name: MacAudit
+options:
+  bundleIdPrefix: dev.nickysemenza
+  deploymentTarget:
+    macOS: "14.0"
+  xcodeVersion: "16.0"
+  createIntermediateGroups: true
+packages:
+  MacAuditKit:
+    path: ../../swift/MacAuditKit
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    # No App Sandbox: the engine scans ~, runs brew/docker/xcrun and trashes
+    # files. Ad-hoc signed for local builds; hardened runtime is a
+    # notarization-time concern.
+    ENABLE_APP_SANDBOX: NO
+    ENABLE_HARDENED_RUNTIME: NO
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "-"
+    DEVELOPMENT_TEAM: ""
+targets:
+  MacAudit:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources
+    dependencies:
+      - package: MacAuditKit
+    info:
+      path: Resources/Info.plist
+      properties:
+        CFBundleName: MacAudit
+        CFBundleDisplayName: MacAudit
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        LSMinimumSystemVersion: "14.0"
+        LSApplicationCategoryType: public.app-category.developer-tools
+        NSHumanReadableCopyright: "MIT"
+        NSDesktopFolderUsageDescription: "MacAudit sizes build artifacts and caches under your home folder."
+        NSDocumentsFolderUsageDescription: "MacAudit sizes build artifacts and caches under your home folder."
+        NSDownloadsFolderUsageDescription: "MacAudit sizes build artifacts and caches under your home folder."
+        NSRemovableVolumesUsageDescription: "MacAudit only reads sizes; nothing is changed without confirmation."
+        NSNetworkVolumesUsageDescription: "MacAudit only reads sizes; nothing is changed without confirmation."
+    entitlements:
+      path: Resources/MacAudit.entitlements
+      properties: {}
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.nickysemenza.macaudit
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        OTHER_LDFLAGS: ["-liconv", "-lobjc"]
+schemes:
+  MacAudit:
+    build:
+      targets:
+        MacAudit: all
+    run:
+      config: Debug
+      environmentVariables:
+        - variable: MACAUDIT_FAKE
+          value: "1"
+          isEnabled: false

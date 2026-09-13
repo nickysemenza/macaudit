@@ -142,7 +142,7 @@ impl Engine {
             listener: Mutex::new(None),
             tx,
         });
-        runtime().spawn(session::pump(rx, shared.clone()));
+        runtime().spawn(session::pump(rx, Arc::downgrade(&shared)));
 
         Ok(Arc::new(Engine {
             shared,
@@ -269,9 +269,14 @@ impl Engine {
             while let Some(ev) = erx.recv().await {
                 let finished = matches!(ev, cleanup::ExecEvent::Finished(_));
                 let mut ffi = ExecEvent::from(ev);
-                if let ExecEvent::Executed { rescanning, .. } = &mut ffi {
+                if let ExecEvent::Executed {
+                    rescanning,
+                    rescan_gen,
+                    ..
+                } = &mut ffi
+                {
                     if !affected.is_empty() {
-                        shared.start_scan(&affected);
+                        *rescan_gen = Some(shared.start_scan(&affected));
                         *rescanning = affected.iter().map(|s| SectionId::from(*s)).collect();
                     }
                 }
