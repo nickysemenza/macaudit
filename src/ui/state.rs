@@ -11,6 +11,15 @@ use crate::config::DeleteMode;
 use crate::model::{Finding, FindingId, ScanEvent, ScannerId, Severity};
 use crate::ui::app::{AppState, SectionStatus};
 
+/// Sections whose findings take part in cross-scanner correlation (cask ↔
+/// app, cask binary ↔ tool, tool interpreter ↔ formula/runtime).
+pub const CORRELATED_SECTIONS: &[ScannerId] = &[
+    ScannerId::Apps,
+    ScannerId::Brew,
+    ScannerId::Tools,
+    ScannerId::Runtimes,
+];
+
 impl AppState {
     /// Set the delete mode used when planning remedies (wired from `Config` by
     /// the run loop, honoring `--rm`).
@@ -84,12 +93,12 @@ impl AppState {
         })
     }
 
-    /// A merged snapshot of the Apps + Brew section maps — the input to both
+    /// A merged snapshot of the correlated section maps — the input to both
     /// sync correlation and the async network-enrichment task.
     pub fn apps_brew_findings(&self) -> BTreeMap<FindingId, Finding> {
         let mut merged: BTreeMap<FindingId, Finding> = BTreeMap::new();
-        for id in [ScannerId::Apps, ScannerId::Brew] {
-            if let Some(map) = self.findings.get(&id) {
+        for id in CORRELATED_SECTIONS {
+            if let Some(map) = self.findings.get(id) {
                 for (fid, f) in map {
                     merged.insert(*fid, f.clone());
                 }

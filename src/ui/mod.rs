@@ -139,9 +139,7 @@ async fn run_loop(
         // path. Then kick the async network half (catalog matching + release
         // checks) in the background; results arrive on `enrich_rx`. Once per
         // generation.
-        if correlated_gen != full_scan_gen
-            && app.sections_terminal(&[ScannerId::Apps, ScannerId::Brew])
-        {
+        if correlated_gen != full_scan_gen && app.sections_terminal(state::CORRELATED_SECTIONS) {
             correlated_gen = full_scan_gen;
             app.correlate_now();
 
@@ -213,7 +211,7 @@ async fn run_loop(
                 full_scan_gen = gen;
             } else if sections
                 .iter()
-                .any(|s| matches!(s, ScannerId::Apps | ScannerId::Brew))
+                .any(|s| state::CORRELATED_SECTIONS.contains(s))
             {
                 // Rescanning Apps/Brew invalidates correlation for the new data.
                 full_scan_gen = gen;
@@ -254,7 +252,7 @@ async fn run_loop(
                 // same rule as the `r`-key rescan path above.
                 if affected
                     .iter()
-                    .any(|s| matches!(s, ScannerId::Apps | ScannerId::Brew))
+                    .any(|s| state::CORRELATED_SECTIONS.contains(s))
                 {
                     full_scan_gen = gen;
                 }

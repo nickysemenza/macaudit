@@ -18,10 +18,12 @@
 pub mod bun;
 pub mod cargo;
 pub mod flatyaml;
+pub mod history;
 pub mod launchers;
 pub mod npm;
 pub mod pipx;
 pub mod pnpm;
+pub mod projects;
 pub mod pymeta;
 pub mod python;
 pub mod shellpath;
@@ -75,6 +77,40 @@ pub struct Assembled {
     pub install: ToolInstall,
     pub resolution: BTreeMap<String, Resolution>,
     pub classifications: Vec<Classification>,
+    pub project_refs: Vec<Value>,
+    pub history: Option<Value>,
+}
+
+/// Does the globally installed version satisfy a project's declared range?
+/// `None` when either side is missing or not comparable.
+pub fn range_satisfied(
+    manager: Manager,
+    installed: Option<&str>,
+    declared: Option<&str>,
+) -> Option<bool> {
+    let installed = installed?;
+    let declared = declared?;
+    match manager {
+        Manager::Npm | Manager::Pnpm | Manager::Bun => {
+            let range: node_semver::Range = declared.parse().ok()?;
+            let v: node_semver::Version = installed.parse().ok()?;
+            Some(range.satisfies(&v))
+        }
+        Manager::Cargo => {
+            let req = semver::VersionReq::parse(declared).ok()?;
+            let v = semver::Version::parse(installed).ok()?;
+            Some(req.matches(&v))
+        }
+        _ => {
+            // Exact pins only (bootstrap scripts, .tool-versions).
+            let d = declared.trim_start_matches(['=', 'v']);
+            d.chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false)
+                .then(|| d == installed)
+        }
+    }
 }
 
 /// A command name's resolution across the shell and the process.
@@ -146,6 +182,8 @@ fn owner_of(
 pub fn assemble(
     installs: Vec<ToolInstall>,
     shell: &ShellPath,
+    projects: &projects::ProjectIndex,
+    history: Option<&BTreeMap<String, history::HistoryStat>>,
 ) -> (Vec<Assembled>, Vec<CommandView>) {
     let mut by_cmd: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (i, t) in installs.iter().enumerate() {
@@ -292,6 +330,46 @@ pub fn assemble(
         if let Some((by, owner)) = shadowed {
             classes.push(Classification::Shadowed { by, owner });
         }
+        // Project evidence: declarations are evidence; an *installed* local
+        // copy (binary present) is an alternative.
+        let mut names = t.command_names();
+        names.push(t.name.clone());
+        let refs = projects.refs_for(&names);
+        let mut alt_projects: BTreeSet<String> = BTreeSet::new();
+        let project_refs: Vec<Value> = refs
+            .iter()
+            .map(|r| {
+                let installed_alt = r.local_binary.as_ref().map(|b| b.exists).unwrap_or(false);
+                if installed_alt {
+                    alt_projects.insert(r.project.display().to_string());
+                }
+                let satisfied = range_satisfied(
+                    t.manager,
+                    t.version.as_deref(),
+                    r.declared_version.as_deref(),
+                );
+                let mut v = serde_json::to_value(r).unwrap_or(Value::Null);
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("global_satisfies_declaration".into(), json!(satisfied));
+                    o.insert("installed_alternative".into(), json!(installed_alt));
+                }
+                v
+            })
+            .collect();
+        if !alt_projects.is_empty() {
+            classes.push(Classification::ProjectAlternative {
+                projects: alt_projects.into_iter().collect(),
+            });
+        }
+        let hist = history.map(|h| {
+            let mut m = serde_json::Map::new();
+            for n in &names {
+                if let Some(st) = h.get(n) {
+                    m.insert(n.clone(), serde_json::to_value(st).unwrap_or(Value::Null));
+                }
+            }
+            Value::Object(m)
+        });
         if classes.is_empty() {
             classes.push(Classification::Review {
                 reason: "no evidence that it is broken, duplicated, shadowed, or required; global installs are not unnecessary by default".into(),
@@ -302,6 +380,8 @@ pub fn assemble(
             install: t.clone(),
             resolution,
             classifications: classes,
+            project_refs,
+            history: hist,
         });
     }
     (out, views.into_values().collect())
@@ -473,9 +553,9 @@ fn install_finding(
             serde_json::to_value(&a.classifications).unwrap_or(Value::Null),
         );
         obj.insert("primary_classification".into(), json!(primary.slug()));
-        obj.insert("project_refs".into(), json!([]));
+        obj.insert("project_refs".into(), Value::Array(a.project_refs.clone()));
         obj.insert("project_coverage".into(), project_coverage.clone());
-        obj.insert("history".into(), Value::Null);
+        obj.insert("history".into(), a.history.clone().unwrap_or(Value::Null));
         obj.insert("group".into(), json!(group_label(home, t)));
     }
     let mut f = Finding::new(FindingKind::GlobalTool, &t.identity_key(), t.name.clone())
@@ -653,7 +733,8 @@ impl Scanner for ToolsScanner {
         let paths = ctx.paths.clone();
         let shell_for_probe = shell.clone();
         let cfg = config.clone();
-        let results = tokio::task::spawn_blocking(move || {
+        let home_for_probe = ctx.paths.home.clone();
+        let (results, project_index, history) = tokio::task::spawn_blocking(move || {
             let cx = ProbeCtx {
                 paths: &paths,
                 config: &cfg,
@@ -661,10 +742,19 @@ impl Scanner for ToolsScanner {
                 brew_prefix,
                 extra_npm_prefixes,
             };
-            run_probes(&cx)
+            let results = run_probes(&cx);
+            let index = projects::index(&cx);
+            let history = cfg.shell_history_evidence.then(|| {
+                let known: BTreeSet<String> = results
+                    .iter()
+                    .flat_map(|(_, r)| r.installs.iter().flat_map(|t| t.command_names()))
+                    .collect();
+                history::aggregate(&home_for_probe, &known)
+            });
+            (results, index, history)
         })
         .await
-        .unwrap_or_default();
+        .unwrap_or_else(|_| (Vec::new(), projects::ProjectIndex::default(), None));
         if ctx.cancelled() {
             return Ok(());
         }
@@ -674,12 +764,15 @@ impl Scanner for ToolsScanner {
             .collect();
         let installs: Vec<ToolInstall> =
             results.into_iter().flat_map(|(_, r)| r.installs).collect();
-        ctx.progress("command resolution", 2, None).await;
+        ctx.progress("command resolution + project evidence", 2, None)
+            .await;
         let shell_c = shell.clone();
-        let (assembled, views) = tokio::task::spawn_blocking(move || assemble(installs, &shell_c))
-            .await
-            .unwrap_or_else(|_| (Vec::new(), Vec::new()));
-        let project_coverage = json!(null);
+        let project_coverage = project_index.coverage_json();
+        let (assembled, views) = tokio::task::spawn_blocking(move || {
+            assemble(installs, &shell_c, &project_index, history.as_ref())
+        })
+        .await
+        .unwrap_or_else(|_| (Vec::new(), Vec::new()));
         let total = (assembled.len() + views.len()) as u64;
         let mut done = 0u64;
         let home = ctx.paths.home.clone();
@@ -742,6 +835,7 @@ mod tests {
             &prefix.join("opt/python@3.14/bin"),
         );
         python::tests::mk_brew_python(&prefix);
+        projects::tests::mk_projects(&home.join("dev"));
         // Cask-owned codex launcher shadowing npm's codex in the shell PATH.
         let cask_bin = prefix.join("Caskroom/codex/0.153.4/bin/codex");
         exe(&cask_bin);
@@ -793,7 +887,8 @@ mod tests {
             .into_iter()
             .flat_map(|(_, r)| r.installs)
             .collect();
-        let (assembled, views) = assemble(installs, &shell);
+        let idx = projects::index_roots(&[home.join("dev")], 4, Duration::from_secs(5));
+        let (assembled, views) = assemble(installs, &shell, &idx, None);
         let find = |m: Manager, n: &str| {
             assembled
                 .iter()
@@ -843,6 +938,12 @@ mod tests {
         assert_eq!(pipx_mp.resolution["mcp-proxy"].status, PathStatus::Shadowed);
         assert!(pipx_mp.resolution["mcp-proxy"].shadowed_by.is_some());
 
+        // Project evidence: cubby has knip installed locally → the (fake)
+        // global knip would be a project alternative; playwright is only
+        // declared. Checked via a synthetic npm install of each.
+        let ga_refs = &find(Manager::Pip, "google_auth").project_refs;
+        assert!(ga_refs.is_empty());
+
         // Homebrew-owned python package is required (by requests) and stays protected.
         let certifi = find(Manager::Pip, "certifi");
         assert!(matches!(
@@ -856,6 +957,72 @@ mod tests {
             ga.classifications[0],
             Classification::Review { .. }
         ));
+    }
+
+    #[test]
+    fn project_alternative_requires_an_installed_local_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dev = tmp.path().join("dev");
+        projects::tests::mk_projects(&dev);
+        let idx = projects::index_roots(std::slice::from_ref(&dev), 4, Duration::from_secs(5));
+        let mk = |name: &str, version: &str| {
+            let mut t = ToolInstall::new(
+                Manager::Npm,
+                tmp.path().join("prefix/lib/node_modules"),
+                name,
+            );
+            t.version = Some(version.into());
+            t.commands.push(DeclaredCommand {
+                name: name.into(),
+                declared_target: None,
+            });
+            t
+        };
+        let shell = ShellPath::default();
+        let (assembled, _) = assemble(
+            vec![mk("knip", "6.30.0"), mk("playwright", "1.62.1")],
+            &shell,
+            &idx,
+            None,
+        );
+        let knip = &assembled[0];
+        assert!(
+            matches!(&knip.classifications[0], Classification::ProjectAlternative { projects } if projects[0].ends_with("cubby"))
+        );
+        let dev_ref = knip
+            .project_refs
+            .iter()
+            .find(|r| r["kind"] == "dev_dependency")
+            .unwrap();
+        assert_eq!(dev_ref["installed_alternative"], true);
+        assert_eq!(dev_ref["local_binary"]["version"], "6.32.0");
+        // 6.30.0 does not satisfy ^6.32.0.
+        assert_eq!(dev_ref["global_satisfies_declaration"], false);
+
+        // playwright is declared but has no local binary: evidence only.
+        let pw = &assembled[1];
+        assert!(matches!(
+            pw.classifications[0],
+            Classification::Review { .. }
+        ));
+        assert!(!pw.project_refs.is_empty());
+        assert!(pw
+            .project_refs
+            .iter()
+            .all(|r| r["installed_alternative"] == false));
+        assert_eq!(
+            range_satisfied(Manager::Npm, Some("1.62.1"), Some("^1.62.1")),
+            Some(true)
+        );
+        assert_eq!(
+            range_satisfied(Manager::Cargo, Some("0.14.0"), Some("^0.13")),
+            Some(false)
+        );
+        assert_eq!(
+            range_satisfied(Manager::Pipx, Some("0.65.0"), Some("0.65.0")),
+            Some(true)
+        );
+        assert_eq!(range_satisfied(Manager::Pipx, None, Some("1")), None);
     }
 
     #[tokio::test]
