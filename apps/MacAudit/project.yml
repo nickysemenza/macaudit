@@ -17,13 +17,18 @@ settings:
     SWIFT_STRICT_CONCURRENCY: complete
     MACOSX_DEPLOYMENT_TARGET: "14.0"
     # No App Sandbox: the engine scans ~, runs brew/docker/xcrun and trashes
-    # files. Ad-hoc signed for local builds; hardened runtime is a
-    # notarization-time concern.
+    # files. Hardened runtime is a notarization-time concern.
     ENABLE_APP_SANDBOX: NO
     ENABLE_HARDENED_RUNTIME: NO
-    CODE_SIGN_STYLE: Manual
-    CODE_SIGN_IDENTITY: "-"
-    DEVELOPMENT_TEAM: ""
+    # Sign with a real development certificate, not ad-hoc: TCC keys its
+    # folder-access grants (Downloads, Desktop, ...) on the signing identity,
+    # and an ad-hoc signature is just the binary's hash, so every rebuild
+    # re-prompted. CI passes CODE_SIGNING_ALLOWED=NO; on a machine without
+    # this team's certificate, override DEVELOPMENT_TEAM or use
+    # CODE_SIGN_IDENTITY="-" on the xcodebuild command line.
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_IDENTITY: "Apple Development"
+    DEVELOPMENT_TEAM: Y9A97FXT63
 targets:
   MacAudit:
     type: application
