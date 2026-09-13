@@ -29,6 +29,59 @@ pub struct SnapshotDiff {
     pub removed: Vec<Finding>,
     /// Findings in both whose size increased: (finding, old_bytes, new_bytes).
     pub grown: Vec<(Finding, u64, u64)>,
+    /// Findings in both whose tracked facts changed (version, classification,
+    /// severity, Homebrew origin, command resolution). Only reported when
+    /// both snapshots recorded the fact — a snapshot from before a field
+    /// existed never produces a spurious change.
+    pub changed: Vec<FindingChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct FindingChange {
+    pub finding: Finding,
+    pub field: String,
+    pub old: String,
+    pub new: String,
+}
+
+/// The meta/severity facts `diff` tracks, as (label, JSON pointer).
+const TRACKED_FIELDS: &[(&str, &str)] = &[
+    ("version", "/version"),
+    ("classification", "/primary_classification"),
+    ("origin", "/install_reason"),
+    ("autoremove candidate", "/autoremove_candidate"),
+    ("shell resolution", "/user_resolution"),
+];
+
+fn detect_changes(prev: &Finding, f: &Finding) -> Vec<FindingChange> {
+    let mut out = Vec::new();
+    for (label, pointer) in TRACKED_FIELDS {
+        let (Some(o), Some(n)) = (prev.meta.pointer(pointer), f.meta.pointer(pointer)) else {
+            continue;
+        };
+        if o.is_null() || n.is_null() || o == n {
+            continue;
+        }
+        let show = |v: &serde_json::Value| match v.as_str() {
+            Some(s) => s.to_string(),
+            None => v.to_string(),
+        };
+        out.push(FindingChange {
+            finding: f.clone(),
+            field: label.to_string(),
+            old: show(o),
+            new: show(n),
+        });
+    }
+    if prev.severity != f.severity {
+        out.push(FindingChange {
+            finding: f.clone(),
+            field: "severity".into(),
+            old: prev.severity_label().into(),
+            new: f.severity_label().into(),
+        });
+    }
+    out
 }
 
 /// Best-effort machine name for snapshot provenance. Shared by the CLI and the
@@ -202,6 +255,7 @@ impl SnapshotStore {
                             diff.grown.push((f.clone(), o, n));
                         }
                     }
+                    diff.changed.extend(detect_changes(prev, f));
                 }
             }
         }
@@ -276,5 +330,35 @@ mod tests {
         assert_eq!(d.grown.len(), 1);
         assert_eq!(d.grown[0].1, 100);
         assert_eq!(d.grown[0].2, 250);
+    }
+
+    #[test]
+    fn diff_reports_tracked_changes_only_when_both_sides_know() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let mut store = SnapshotStore::open(db.path()).unwrap();
+        // Legacy-shaped brew finding (no origin flag) → enriched one.
+        let legacy = Finding::new(FindingKind::BrewFormula, "wget", "wget").meta(serde_json::json!({
+            "name": "wget", "version": "1.21.3", "is_leaf": true, "dependencies": [], "dependents": []
+        }));
+        let enriched = Finding::new(FindingKind::BrewFormula, "wget", "wget").meta(serde_json::json!({
+            "name": "wget", "version": "1.24.5", "install_reason": "requested", "autoremove_candidate": false
+        }));
+        let mut a = BTreeMap::new();
+        a.insert(legacy.id, legacy);
+        let mut b = BTreeMap::new();
+        b.insert(enriched.id, enriched);
+        let ia = store.save("m", &a).unwrap();
+        let ib = store.save("m", &b).unwrap();
+        let d = store.diff(ia, ib).unwrap();
+        assert!(d.added.is_empty() && d.removed.is_empty());
+        assert_eq!(d.changed.len(), 1, "{:?}", d.changed);
+        assert_eq!(d.changed[0].field, "version");
+        assert_eq!(
+            (d.changed[0].old.as_str(), d.changed[0].new.as_str()),
+            ("1.21.3", "1.24.5")
+        );
+        // Same snapshot twice: nothing changed.
+        let ic = store.save("m", &b).unwrap();
+        assert!(store.diff(ib, ic).unwrap().changed.is_empty());
     }
 }

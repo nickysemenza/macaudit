@@ -6,7 +6,9 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::Parser;
 
-use macaudit::cli::{CleanArgs, Cli, Command, ConfigCmd, ScanArgs, SnapshotCmd};
+use macaudit::cli::{
+    BrewCmd, CleanArgs, Cli, Command, ConfigCmd, ScanArgs, SnapshotCmd, ToolsArgs, ToolsCmd,
+};
 use macaudit::config::{Config, DeleteMode, Paths};
 use macaudit::engine::{Mode, ScannerManager};
 use macaudit::model::ScannerId;
@@ -48,6 +50,8 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Scan(args)) => run_scan(&manager, &args).await,
         Some(Command::Clean(args)) => run_clean(&manager, &args).await,
+        Some(Command::Tools(args)) => run_tools(&manager, &args).await,
+        Some(Command::Brew(cmd)) => run_brew(&manager, cmd).await,
         Some(Command::Snapshot(cmd)) => run_snapshot(&manager, &paths, cmd).await,
         Some(Command::Config(cmd)) => run_config(&paths, cmd),
     }
@@ -86,10 +90,172 @@ async fn run_clean(manager: &ScannerManager, args: &CleanArgs) -> anyhow::Result
     let sections = args.sections()?;
     let outcome = manager.run_to_completion(&sections).await;
     warn_failures(&outcome.failures);
-    print!(
-        "{}",
-        output::dry_run_report(&outcome.findings, manager.delete_mode())
-    );
+    if args.json {
+        println!(
+            "{}",
+            output::dry_run_json(&outcome.findings, manager.delete_mode(), &args.select)?
+        );
+    } else {
+        print!(
+            "{}",
+            output::dry_run_report_selected(&outcome.findings, manager.delete_mode(), &args.select)
+        );
+    }
+    Ok(())
+}
+
+async fn run_tools(manager: &ScannerManager, args: &ToolsArgs) -> anyhow::Result<()> {
+    let outcome = manager.run_to_completion(&[ScannerId::Tools]).await;
+    warn_failures(&outcome.failures);
+    match &args.cmd {
+        Some(ToolsCmd::Verify { json, limit }) => {
+            let results = verify_tools(manager, &outcome.findings, *limit).await;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&results)?);
+            } else {
+                for r in &results {
+                    println!(
+                        "{:<10} {:<28} {}  {}",
+                        r["status"].as_str().unwrap_or("?"),
+                        r["command"].as_str().unwrap_or("?"),
+                        r["path"].as_str().unwrap_or("?"),
+                        r["output"].as_str().or(r["error"].as_str()).unwrap_or("")
+                    );
+                }
+                println!("\n{} probe(s)", results.len());
+            }
+            Ok(())
+        }
+        None => {
+            let tools: Vec<&macaudit::model::Finding> = outcome
+                .findings
+                .values()
+                .filter(|f| f.kind == macaudit::model::FindingKind::GlobalTool)
+                .filter(|f| {
+                    args.manager.is_empty()
+                        || args.manager.iter().any(|m| {
+                            f.meta.get("manager").and_then(|v| v.as_str()) == Some(m.as_str())
+                        })
+                })
+                .filter(|f| {
+                    args.class.is_empty()
+                        || args.class.iter().any(|c| {
+                            f.meta
+                                .get("primary_classification")
+                                .and_then(|v| v.as_str())
+                                == Some(c.replace('-', "_").as_str())
+                        })
+                })
+                .collect();
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&tools)?);
+            } else {
+                print!("{}", output::tools_table(&tools));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Explicit, bounded `--version` probes of every tool launcher whose target
+/// exists. Never part of a scan.
+async fn verify_tools(
+    manager: &ScannerManager,
+    findings: &std::collections::BTreeMap<macaudit::model::FindingId, macaudit::model::Finding>,
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    let runner = manager.runner();
+    let timeout = std::time::Duration::from_secs(manager.config().tools.verify_timeout_secs);
+    let token = tokio_util::sync::CancellationToken::new();
+    let mut out = Vec::new();
+    for f in findings
+        .values()
+        .filter(|f| f.kind == macaudit::model::FindingKind::GlobalTool)
+    {
+        for r in &f.remedies {
+            if out.len() >= limit {
+                break;
+            }
+            let macaudit::model::RemedyCommand::Probe { program, args, .. } = &r.command else {
+                continue;
+            };
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let started = std::time::Instant::now();
+            let result =
+                tokio::time::timeout(timeout, runner.run(program, &arg_refs, &token)).await;
+            let (status, output, error) = match result {
+                Err(_) => (
+                    "timeout",
+                    None,
+                    Some(format!("no answer within {}s", timeout.as_secs())),
+                ),
+                Ok(Err(e)) => ("failed", None, Some(e.to_string())),
+                Ok(Ok(o)) if o.success() => (
+                    "ok",
+                    Some(
+                        o.stdout_str()
+                            .lines()
+                            .find(|l| !l.trim().is_empty())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string(),
+                    ),
+                    None,
+                ),
+                Ok(Ok(o)) => (
+                    "failed",
+                    None,
+                    Some(format!("exit {}: {}", o.status, o.stderr_str().trim())),
+                ),
+            };
+            out.push(serde_json::json!({
+                "tool": f.meta.get("identity_key").cloned().unwrap_or(serde_json::Value::Null),
+                "command": program.rsplit('/').next().unwrap_or(program),
+                "path": program,
+                "status": status,
+                "output": output,
+                "error": error,
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+            }));
+        }
+    }
+    out
+}
+
+async fn run_brew(manager: &ScannerManager, cmd: BrewCmd) -> anyhow::Result<()> {
+    let outcome = manager.run_to_completion(&[ScannerId::Brew]).await;
+    warn_failures(&outcome.failures);
+    let graph = macaudit::brewgraph::BrewGraph::from_findings(outcome.findings.values());
+    let (name, dir, json, max_depth) = match cmd {
+        BrewCmd::Why {
+            name,
+            json,
+            max_depth,
+        } => (
+            name,
+            macaudit::brewgraph::Direction::Reverse,
+            json,
+            max_depth,
+        ),
+        BrewCmd::Deps {
+            name,
+            json,
+            max_depth,
+        } => (
+            name,
+            macaudit::brewgraph::Direction::Forward,
+            json,
+            max_depth,
+        ),
+    };
+    if graph.resolve(&name).is_none() {
+        anyhow::bail!("unknown or ambiguous package: {name}");
+    }
+    if json {
+        println!("{}", output::brew_tree_json(&graph, &name, dir, max_depth)?);
+    } else {
+        print!("{}", output::brew_tree_text(&graph, &name, dir, max_depth));
+    }
     Ok(())
 }
 
@@ -127,7 +293,7 @@ async fn run_snapshot(
                 );
             }
         }
-        SnapshotCmd::Diff { a, b } => {
+        SnapshotCmd::Diff { a, b, json } => {
             let list = store.list()?;
             let (a, b) = match (a, b) {
                 (Some(a), Some(b)) => (a, b),
@@ -138,12 +304,25 @@ async fn run_snapshot(
                 _ => anyhow::bail!("need at least two snapshots (or specify ids) to diff"),
             };
             let d = store.diff(a, b)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "a": a, "b": b,
+                        "added": d.added, "removed": d.removed,
+                        "grown": d.grown.iter().map(|(f, o, n)| serde_json::json!({ "finding": f, "old": o, "new": n })).collect::<Vec<_>>(),
+                        "changed": d.changed,
+                    }))?
+                );
+                return Ok(());
+            }
             println!("diff #{a} → #{b}:");
             println!(
-                "  {} added, {} removed, {} grown",
+                "  {} added, {} removed, {} grown, {} changed",
                 d.added.len(),
                 d.removed.len(),
-                d.grown.len()
+                d.grown.len(),
+                d.changed.len()
             );
             for f in &d.added {
                 println!("  + {}", f.title);
@@ -158,6 +337,9 @@ async fn run_snapshot(
                     humansize::format_size(*o, humansize::BINARY),
                     humansize::format_size(*n, humansize::BINARY)
                 );
+            }
+            for c in &d.changed {
+                println!("  ~ {} {}: {} → {}", c.finding.title, c.field, c.old, c.new);
             }
         }
     }

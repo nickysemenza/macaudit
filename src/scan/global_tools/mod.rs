@@ -483,7 +483,7 @@ fn remedies_for(a: &Assembled, config: &ToolsConfig) -> Vec<Remedy> {
         }
     }
     for l in &t.launchers {
-        if l.target_exists != Some(false) && l.kind != LauncherKind::Script {
+        if l.target_exists != Some(false) {
             out.push(
                 Remedy::new(
                     format!("Verify {} (--version)", util::file_name(&l.path)),

@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::brewgraph::{BrewGraph, Direction, Relation};
+use crate::brewgraph::{BrewGraph, Direction};
 use crate::model::{Finding, FindingKind, Severity};
 use crate::ui::rows::RenderRow;
 
@@ -137,23 +137,12 @@ pub fn build_explorer_rows<'a>(
     rows
 }
 
-/// Suffix shown after a node name.
-pub fn relation_suffix(relation: Relation, cycle: bool) -> &'static str {
-    if cycle {
-        return "↻ cycle";
-    }
-    match relation {
-        Relation::Root => "",
-        Relation::Direct => "direct",
-        Relation::Transitive => "transitive",
-        Relation::Unknown => "dependency data unavailable",
-        Relation::NotInstalled => "not installed",
-    }
-}
+pub use crate::brewgraph::relation_suffix;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::brewgraph::Relation;
     use std::collections::HashSet;
 
     fn formula(

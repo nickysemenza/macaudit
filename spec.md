@@ -129,13 +129,29 @@ Design notes:
   BrewScanner correlation): `brew install --cask --adopt <name>`.
 
 ### 3.2 BrewScanner
-- `brew list --formula --versions`, `brew list --cask --versions`,
-  `brew leaves`, `brew outdated --json=v2`, `brew deps --installed --json=v2`
-  (one call; build the dep tree in-process — do NOT shell `brew deps` per formula,
-  brew's ruby startup is ~1s each).
-- Emits: leaves vs dependency-only formulae (dep tree for the UI), outdated
-  items with `brew upgrade <x>` remedies, casks correlated to .app paths via
-  `brew info --json=v2 --installed --cask` artifacts.
+- Three bounded calls: `brew info --json=v2 --installed` (formulae + casks in
+  one process: versions, aliases, each install receipt's
+  `runtime_dependencies` with `declared_directly`, `installed_on_request`,
+  cask `depends_on`/`artifacts`), `brew outdated --json=v2`, and
+  `brew autoremove --dry-run` (read-only; the confirmed-orphan signal).
+  Never shell per formula (brew's ruby startup is ~1s each); never `brew
+  leaves` — a leaf is structural, not "user-requested".
+- `brewgraph.rs` builds the graph in-process: receipt edges preferred, the
+  formula's current declarations only as a flagged fallback, aliases/old
+  names/tap-qualified resolution that refuses ambiguity, stubs for
+  dependencies missing from the inventory, cycle-safe closures, "why
+  installed" chains up to requested roots, and `removal_preview(set)` →
+  removable / blocked (still-needed) / predicted orphans / brew-confirmed
+  orphans / unknown-origin orphans, set-based sizes, dependents-first order.
+- Emits: one finding per formula (meta: origin, direct + transitive
+  dependencies/dependents, cask dependents, dependency source, why
+  installed, autoremove candidate, single-package removal preview, graph
+  caveats, `group` by origin) and per cask (app paths, binary artifacts,
+  depends_on), plus the `__autoremove__` summary. Remedies: `brew upgrade`
+  when outdated; guarded `brew uninstall` only when nothing installed still
+  needs it (never `--ignore-dependencies`); `brew autoremove` on the summary.
+- Degrades: `brew info` failure → partial inventory from `brew list`
+  (origin unknown, no graph); no brew → one Info finding.
 - v1.1: hit `https://formulae.brew.sh/api/cask.json` (cached to disk, ETag) to
   match Unmanaged apps to available casks by bundle id/name.
 
@@ -173,10 +189,46 @@ Design notes:
   remedy is a two-step: `launchctl bootout` then Trash).
 
 ### 3.5 ShellEnvScanner
-- Parse `$PATH` from a login shell (`zsh -ilc 'echo $PATH'`): duplicates,
-  entries pointing at nonexistent dirs, ordering surprises (e.g. system bin
-  shadowing brew).
-- Shell startup time: `time zsh -i -c exit` (3 runs, median). > 500ms → Attention.
+- Find the login shell via `dscl . -read /Users/<user> UserShell` (fallback
+  `$SHELL`) and read its `$PATH` with the right invocation (`fish -lc
+  'string join : $PATH'`, `zsh -ilc 'echo $PATH'`, `bash -ilc 'echo
+  $PATH'`); unsupported shells fall back to the process PATH with a note.
+  Never read rc files. Flag duplicates, dead entries, system bin shadowing
+  brew, and (`__path_diff__`) entries only the shell or only this process
+  has — agents and apps launch MacAudit with a different environment.
+- Shell startup time: `<shell> -i -c exit` (3 runs, median). > 500ms → Attention.
+
+### 3.13 ToolsScanner (Global Tools)
+- Filesystem-metadata probes per manager (`scan/global_tools/*`), each
+  degrading independently (absent / partial / failed): npm prefixes
+  (Homebrew, /usr/local, `~/.npm-global`, version-manager nodes, configured
+  extras, plus `npm prefix -g` as one more candidate), pnpm `global/v<N>`
+  (hash symlink = identity root) and legacy `global/<N>` (`.modules.yaml`
+  store/virtual-store/packageManager; same-major pnpm from `.tools` for
+  removal), cargo `.crates2.json`/`.crates.toml` (rustup proxies excluded),
+  bun, pipx (`pipx_metadata.json`, interpreter validity via the venv's
+  python symlink chain + `pyvenv.cfg`), uv (`uv-receipt.toml` entrypoints;
+  a missing launcher is "may be recreated", not broken), pip site-packages
+  (dist-info `INSTALLER`/`RECORD`/`Requires-Dist`; Cellar-linked or
+  brew-installed → owned by a formula and protected; Homebrew's
+  pip/setuptools/wheel bootstrap protected; Apple sites inventory-only;
+  manual installs get a per-package `--break-system-packages` uninstall).
+- Cross-installation analysis: command resolution against the login-shell
+  PATH and the process PATH (`which`), duplicate/shadow detection,
+  ownership of every PATH candidate (installation, cask, formula, rustup),
+  project correlation (manifests, lockfiles, pins, bootstrap `X_VERSION=`,
+  CI tokens; "project alternative" only when the local binary exists,
+  range satisfaction via node-semver/semver), opt-in aggregated shell
+  history. Classification precedence: broken > required > orphan >
+  duplicate > shadowed > project alternative > review.
+- Emits `GlobalTool` (key `{manager}:{root}:{name}`, no version),
+  `CommandResolution` (per command name) and `ToolCoverage` findings.
+  Remedies: manager-native uninstall (guarded `ToolInstall`/`PipPackage`),
+  launcher-only Trash of launchers this installation owns (guarded
+  `Launcher`, an alternative while a native remedy exists, primary when the
+  package is already gone), copy-to-clipboard for inferred-interpreter
+  sites, and explicit `--version` probes. Never executes discovered
+  binaries during a scan; never imports Python modules.
 
 ### 3.6 RuntimesScanner
 - Detect nvm/fnm/volta/mise/asdf/pyenv/rustup by their dirs; list installed
@@ -244,7 +296,10 @@ Design notes:
   header), `z` fold/unfold, `p` toggle detail pane, `x` execute remedies on
   marked (confirm dialog listing exact commands; destructive ones in red),
   `r` rescan section, `R` rescan all, `/` filter (`esc` clears it, else
-  quits), `s` cycle sort, `H` toggle System apps, `?` help, `q` quit.
+  quits), `s` cycle sort, `H` toggle System apps, `?` help, `q` quit;
+  `d` flips the Brew explorer direction, `e` cycles the selected row's
+  remedy, `v` previews the marked batch, `c` reopens the last cleanup
+  report (see §4.1).
 - **Mouse**: a click on a nav rail row switches section; a row click selects,
   a double-click opens detail or folds a group header; a column header click
   sorts; a statusbar hint click performs its action; wheel switches sections
@@ -264,6 +319,24 @@ Design notes:
   `Viewport`/`Hit`, the screen-geometry map recorded during `draw` that mouse
   handling and paging read back.
 
+### 4.1 Cleanup workflow
+- `x` opens the confirm dialog after an in-memory preflight
+  (`cleanup::preflight_static`): stale ids, duplicate targets and
+  still-needed Homebrew packages are listed as refused with reasons; the
+  dialog shows the exact commands in execution order, the Homebrew impact,
+  preserved launchers and follow-ups. `v` previews the same model without
+  confirming; `e` picks an alternative remedy for the selected row.
+- `y` spawns `cleanup::run_batch`: a refreshing preflight re-checks every
+  `Guard` against fresh data, then runs dependents-first (Homebrew per the
+  preview's order, then native uninstalls, launcher-only removals, `brew
+  autoremove` last). `Esc` cancels remaining actions between commands. After
+  execution: rescan of the touched sections, `brew autoremove --dry-run`
+  re-run when Homebrew changed, before/after inventory, bounded `--version`
+  probes of retained related tools (before *and* after), verification
+  verdicts (removed / still present / ok / pre-existing failure /
+  regression), JSON report under `<state_dir>/cleanup-reports/`. Marks whose
+  findings vanish on rescan are dropped and announced.
+
 ## 5. CLI surface (clap)
 
 ```
@@ -276,6 +349,14 @@ macaudit config path|edit
 
 `--json` output = `Vec<Finding>` (serde). This makes the core testable and
 scriptable independent of the TUI.
+
+Additional subcommands: `tools [--json] [--manager …] [--class …]`, `tools
+verify [--json] [--limit N]`, `brew why <name> [--json]`, `brew deps <name>
+[--json]`, `clean --dry-run [--select …] [--json]` (Brew/Tools rows listed
+only when evidence suggests removal unless selected; prints preflight
+refusals and Homebrew impact), `snapshot diff [--json]` (adds a `changed`
+list: version, classification, origin, autoremove, shell resolution,
+severity — only when both snapshots recorded the fact).
 
 ## 6. Config (`~/.config/macaudit/config.toml`)
 
@@ -293,6 +374,13 @@ extra = [{ dir = ".gradle", marker = "build.gradle" }]
 delete_mode = "trash"                  # "trash" | "rm"
 stale_after_days = 90                  # threshold for the staleness badge
 ```
+
+`[tools]` (see README for every knob): `shell_history_evidence` (opt-in,
+aggregated), `project_roots`/`project_max_depth`/`project_time_budget_secs`,
+`verify_after_cleanup`/`verify_limit`/`verify_timeout_secs`,
+`write_cleanup_reports`, manager homes (`pnpm_home`, `cargo_home`,
+`pipx_home`, `uv_tool_dir`, `bun_home`), `extra_npm_prefixes`,
+`python_sites`, `include_apple_python`, `homebrew_prefix`.
 
 ## 7. Crates
 
@@ -343,6 +431,10 @@ stale_after_days = 90                  # threshold for the staleness badge
 6. **M6 – history**: SQLite snapshots + diff + TUI badges.
 7. **M7 (v1.1) – network**: formulae.brew.sh cask matching for unmanaged apps;
    GitHub-releases latest-version checks for Sparkle/unmanaged apps.
+
+- M8 — developer-tool audit: Brew graph explorer, Global Tools section,
+  login-shell resolution, evidence-based classification, ownership-aware
+  cleanup with preflight/verification/reports. Done.
 
 ## 10. Testing notes
 
