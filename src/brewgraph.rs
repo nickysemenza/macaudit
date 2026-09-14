@@ -98,6 +98,9 @@ pub struct Node {
     pub pinned: bool,
     pub outdated: bool,
     pub current_version: Option<String>,
+    /// One-line description from `brew info` (`desc`), e.g. "PDF rendering
+    /// library (based on the xpdf-3.0 code base)".
+    pub description: Option<String>,
     pub size_bytes: Option<u64>,
     /// Referenced by an edge but absent from the installed inventory.
     pub stub: bool,
@@ -159,6 +162,8 @@ pub struct FormulaInfo {
     pub pinned: bool,
     #[serde(default)]
     pub outdated: bool,
+    #[serde(default)]
+    pub desc: Option<String>,
 }
 
 #[derive(Deserialize, Default, Debug, Clone)]
@@ -197,6 +202,8 @@ pub struct CaskInfo {
     pub installed: Option<String>,
     #[serde(default)]
     pub outdated: bool,
+    #[serde(default)]
+    pub desc: Option<String>,
     #[serde(default)]
     pub depends_on: Value,
     #[serde(default)]
@@ -419,6 +426,7 @@ impl BrewGraph {
                         pinned: false,
                         outdated: false,
                         current_version: None,
+                        description: None,
                         size_bytes: None,
                         stub: true,
                         dependency_source: None,
@@ -479,6 +487,7 @@ impl BrewGraph {
                 pinned: f.pinned,
                 outdated: f.outdated,
                 current_version: None,
+                description: f.desc.clone().filter(|d| !d.is_empty()),
                 size_bytes: None,
                 stub: false,
                 dependency_source: Some(if has_runtime {
@@ -504,6 +513,7 @@ impl BrewGraph {
                 pinned: false,
                 outdated: c.outdated,
                 current_version: None,
+                description: c.desc.clone().filter(|d| !d.is_empty()),
                 size_bytes: None,
                 stub: false,
                 dependency_source: Some(EdgeSource::CaskDependsOn),
@@ -631,6 +641,10 @@ impl BrewGraph {
                             .get("current_version")
                             .and_then(|v| v.as_str())
                             .map(str::to_string),
+                        description: m
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
                         size_bytes: f.size_bytes,
                         stub: false,
                         dependency_source: direct.as_ref().map(|_| {
@@ -666,6 +680,10 @@ impl BrewGraph {
                         outdated: m.get("outdated").and_then(|v| v.as_bool()).unwrap_or(false),
                         current_version: m
                             .get("current_version")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        description: m
+                            .get("description")
                             .and_then(|v| v.as_str())
                             .map(str::to_string),
                         size_bytes: f.size_bytes,

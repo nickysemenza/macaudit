@@ -176,6 +176,9 @@ fn formula_finding(graph: &BrewGraph, id: &str, prefix: Option<&Path>) -> Findin
             detail.push_str(&format!(" · {cur} available"));
         }
     }
+    if let Some(desc) = &node.description {
+        detail.push_str(&format!(" · {desc}"));
+    }
 
     let severity = if auto == Some(true) {
         Severity::Reclaimable
@@ -196,6 +199,7 @@ fn formula_finding(graph: &BrewGraph, id: &str, prefix: Option<&Path>) -> Findin
             "tap": node.tap,
             "aliases": node.aliases,
             "version": node.version,
+            "description": node.description,
             "install_reason": reason.label(),
             "installed_on_request": node.installed_on_request,
             "installed_as_dependency": node.installed_as_dependency,
@@ -295,6 +299,9 @@ fn cask_finding(graph: &BrewGraph, info: &InfoRoot, id: &str) -> Finding {
             detail.push_str(&format!(" · {cur} available"));
         }
     }
+    if let Some(desc) = &node.description {
+        detail.push_str(&format!(" · {desc}"));
+    }
     let mut f = Finding::new(FindingKind::BrewCask, &token, token.clone())
         .detail(detail)
         .severity(if node.outdated {
@@ -307,6 +314,7 @@ fn cask_finding(graph: &BrewGraph, info: &InfoRoot, id: &str) -> Finding {
             "token": token,
             "name": token,
             "version": node.version,
+            "description": node.description,
             "app_paths": app_paths,
             "binaries": binaries,
             "depends_on": { "formula": formula_deps, "cask": cask_deps },
@@ -630,6 +638,7 @@ mod tests {
     pub(crate) const INFO_JSON: &str = r#"{
       "formulae": [
         {"name": "wget", "full_name": "wget", "tap": "homebrew/core", "aliases": [], "oldnames": [],
+         "desc": "Internet file retriever",
          "dependencies": ["libidn2", "openssl@3"], "pinned": false, "outdated": true, "linked_keg": "1.21.3",
          "installed": [{"version": "1.21.3", "installed_on_request": true,
            "runtime_dependencies": [
@@ -659,6 +668,7 @@ mod tests {
          "installed": "1.85.0", "outdated": false, "depends_on": {},
          "artifacts": [{"app": ["Visual Studio Code.app"]}, {"binary": ["bin/code", {"target": "/opt/homebrew/bin/code"}]}]},
         {"token": "slack", "full_token": "slack", "name": ["Slack"], "installed": "4.35.0", "outdated": true,
+         "desc": "Team communication and collaboration software",
          "depends_on": {}, "artifacts": [{"app": ["Slack.app"]}]},
         {"token": "pdftk-java", "full_token": "pdftk-java", "name": ["PDFtk"], "installed": "3.3.3", "outdated": false,
          "depends_on": {"formula": ["openjdk"]}, "artifacts": []}
@@ -758,6 +768,33 @@ mod tests {
         assert!(oldlib.meta["installed_on_request"].is_null());
         assert_eq!(oldlib.meta["group"], "Unknown origin");
         assert_eq!(oldlib.meta["dependency_source"], "formula_declaration");
+    }
+
+    #[tokio::test]
+    async fn description_from_brew_info_lands_in_detail_and_meta() {
+        let findings = run_scan(Arc::new(mock_full())).await;
+        let wget = by_title(&findings, "wget");
+        assert_eq!(wget.meta["description"], "Internet file retriever");
+        assert!(
+            wget.detail.ends_with(" · Internet file retriever"),
+            "{}",
+            wget.detail
+        );
+        let slack = by_title(&findings, "slack");
+        assert_eq!(
+            slack.meta["description"],
+            "Team communication and collaboration software"
+        );
+        assert!(slack.detail.contains("Team communication"));
+        // Absent desc ⇒ null, detail unchanged.
+        let libidn2 = by_title(&findings, "libidn2");
+        assert!(libidn2.meta["description"].is_null());
+        assert_eq!(
+            libidn2.detail.matches(" · ").count(),
+            0,
+            "{}",
+            libidn2.detail
+        );
     }
 
     #[tokio::test]
