@@ -323,6 +323,29 @@ fn brew_fixtures() -> Vec<Finding> {
         used_by_t: &'a [&'a str],
         auto: bool,
     }
+    /// The one-line `desc` Homebrew publishes for each package.
+    fn brew_desc(name: &str) -> Option<&'static str> {
+        Some(match name {
+            "wget" => "Internet file retriever",
+            "ripgrep" => "Search tool like grep and The Silver Searcher",
+            "jq" => "Lightweight and flexible command-line JSON processor",
+            "python@3.14" => "Interpreted, interactive, object-oriented programming language",
+            "pgcli" => "CLI for Postgres with auto-completion and syntax highlighting",
+            "pre-commit" => "Framework for managing multi-language pre-commit hooks",
+            "yt-dlp" => "Feature-rich command-line audio/video downloader",
+            "openssl@3" => "Cryptography and SSL/TLS Toolkit",
+            "libidn2" => "International domain name library (IDNA2008, Punycode and TR46)",
+            "libunistring" => "C string library for manipulating Unicode strings",
+            "pcre2" => "Perl compatible regular expressions library with a new API",
+            "oniguruma" => "Regular expressions library",
+            "libevent" => "Asynchronous event library",
+            "docker" => "App to build and share containerised applications and microservices",
+            "visual-studio-code" => "Open-source code editor",
+            "pdftk-java" => "Command-line tool for working with PDFs",
+            _ => return None,
+        })
+    }
+
     fn formula(f: F<'_>) -> Finding {
         let F {
             name,
@@ -351,6 +374,10 @@ fn brew_fixtures() -> Vec<Finding> {
         if auto {
             detail.push_str(" · brew autoremove candidate");
         }
+        let description = brew_desc(name);
+        if let Some(d) = description {
+            detail.push_str(&format!(" · {d}"));
+        }
         let on_request = match reason {
             "requested" => json!(true),
             "dependency" => json!(false),
@@ -363,7 +390,7 @@ fn brew_fixtures() -> Vec<Finding> {
             .provenance("brew info --json=v2 --installed (install receipt runtime_dependencies); brew autoremove --dry-run")
             .meta(json!({
                 "name": name, "full_name": name, "tap": "homebrew/core", "aliases": [],
-                "version": version, "install_reason": reason, "installed_on_request": on_request,
+                "version": version, "description": description, "install_reason": reason, "installed_on_request": on_request,
                 "installed_as_dependency": null, "is_leaf": leaf, "pinned": false,
                 "outdated": false, "current_version": null,
                 "dependencies": deps, "dependents": used_by,
@@ -406,12 +433,17 @@ fn brew_fixtures() -> Vec<Finding> {
             }
             None => json!([]),
         };
+        let description = brew_desc(token);
+        let mut detail = format!("cask — {version}");
+        if let Some(d) = description {
+            detail.push_str(&format!(" · {d}"));
+        }
         Finding::new(FindingKind::BrewCask, token, token)
-            .detail(format!("cask — {version}"))
+            .detail(detail)
             .severity(Severity::Info)
             .provenance("brew info --json=v2 --installed")
             .meta(json!({
-                "token": token, "name": token, "version": version,
+                "token": token, "name": token, "version": version, "description": description,
                 "app_paths": [format!("/Applications/{app}")], "binaries": binaries,
                 "depends_on": { "formula": formula_deps, "cask": [] }, "cask_dependents": [],
                 "outdated": false, "current_version": null, "completeness": "full", "group": "Casks",
@@ -874,6 +906,19 @@ fn fs_fixtures() -> Vec<Finding> {
         .meta(json!({ "group": "Large files" }))
         .remedy(trash("/Users/dev/Downloads/backup.dmg", Some(15 * GIB)))
         .remedy(reveal("/Users/dev/Downloads/backup.dmg")),
+        // A macOS package sized whole: never listed file-by-file, Reveal only.
+        Finding::new(
+            FindingKind::LargeFile,
+            "/Users/dev/Pictures/Photos Library.photoslibrary",
+            "Large package — Photos Library.photoslibrary",
+        )
+        .path("/Users/dev/Pictures/Photos Library.photoslibrary")
+        .detail("Photos library (63.9 GiB); a macOS package managed by its app — shown for size only, not a cleanup candidate")
+        .size(63 * GIB + 900 * MIB)
+        .severity(Severity::Info)
+        .provenance("du over the whole package; contents never listed individually")
+        .meta(json!({ "group": "Data libraries", "package": "photoslibrary", "package_label": "Photos library" }))
+        .remedy(reveal("/Users/dev/Pictures/Photos Library.photoslibrary")),
         Finding::new(
             FindingKind::CacheDir,
             "/Users/dev/Library/Developer/Xcode/DerivedData",

@@ -171,6 +171,12 @@ extension Finding {
         kind == .diskCategory ? (meta.string("category") ?? title) : nil
     }
 
+    /// A macOS data library (Photos, Music, VM bundle…) sized as one item:
+    /// context for where the disk went, never a cleanup candidate.
+    public var isDataLibraryPackage: Bool {
+        kind == .largeFile && meta.has("package")
+    }
+
     /// Build artifacts older than the configured staleness window.
     public var isStaleArtifact: Bool {
         kind == .buildArtifact && meta.bool("stale") == true

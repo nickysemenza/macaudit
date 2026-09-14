@@ -51,6 +51,9 @@ struct Hit {
     last_used: Option<SystemTime>,
     stale: bool,
     ctx: ArtifactCtx,
+    /// `Some(label)` for a data-library package (Photos library, VM bundle…)
+    /// sized as one opaque item; `None` for a build artifact.
+    package: Option<&'static str>,
 }
 
 /// What we know about an artifact beyond its path: which marker justified
@@ -227,6 +230,7 @@ impl Scanner for FsScanner {
             let token_sz = token.clone();
             let fresh_sz = fresh_entries.clone();
             let ttl_hours = config.scan.size_cache_ttl_hours;
+            let large_file_threshold_sz = config.large_file_threshold_bytes();
 
             // Load the on-disk size cache before the walk starts. An
             // unopenable/corrupt db (or any load failure) degrades to an empty
@@ -253,6 +257,44 @@ impl Scanner for FsScanner {
                         .get(&hit.path)
                         .copied()
                         .filter(|c| is_fresh(c, root_mtime, now_secs, ttl_hours));
+
+                    // A package bundle: size it whole and report it as one
+                    // opaque large item (Reveal only) when over the threshold.
+                    if let Some(label) = hit.package {
+                        let size = match cached {
+                            Some(c) if c.size > 0 => c.size,
+                            _ => {
+                                let size = du_blocks(&hit.path, &|| token_sz.is_cancelled());
+                                if token_sz.is_cancelled() {
+                                    return;
+                                }
+                                // Libraries are TCC-protected: a process without
+                                // access sees an empty package. Never cache that
+                                // zero — the cache is shared with the app, which
+                                // may have access and would inherit the wrong size.
+                                if size > 0 {
+                                    fresh_sz.lock().unwrap().push((
+                                        hit.path.clone(),
+                                        CachedSize {
+                                            size,
+                                            computed_at: now_secs,
+                                            root_mtime,
+                                        },
+                                    ));
+                                }
+                                size
+                            }
+                        };
+                        if size > large_file_threshold_sz {
+                            let f = large_package_finding(&hit.path, label, size);
+                            let _ = tx_sz.blocking_send(ScanEvent::Finding {
+                                scanner: ScannerId::Fs,
+                                gen,
+                                finding: Box::new(f),
+                            });
+                        }
+                        return;
+                    }
 
                     // pnpm-linked node_modules: also learn how much is
                     // hard-linked from the store (cached under a sibling key).
@@ -565,6 +607,25 @@ fn visit(shared: &WalkShared, result: Result<ignore::DirEntry, ignore::Error>) -
             return WalkState::Skip;
         }
 
+        // A macOS package (app, project, Photos/Music library, VM bundle) is
+        // opaque: nothing inside it is a loose file or a project of its own.
+        // Data libraries are sized whole and surfaced as one large item.
+        if let Some(ext) = package_extension(name) {
+            if !shared.discovery_only {
+                if let Some(label) = data_library_label(ext) {
+                    let _ = shared.hit_tx.send(Hit {
+                        path: path.to_path_buf(),
+                        label: name.to_string(),
+                        last_used: None,
+                        stale: false,
+                        ctx: ArtifactCtx::default(),
+                        package: Some(label),
+                    });
+                }
+            }
+            return WalkState::Skip;
+        }
+
         if is_artifact(name, path, &shared.config) {
             if !shared.discovery_only {
                 let last_used = path.parent().and_then(parent_max_mtime);
@@ -584,6 +645,7 @@ fn visit(shared: &WalkShared, result: Result<ignore::DirEntry, ignore::Error>) -
                     last_used,
                     stale,
                     ctx,
+                    package: None,
                 });
             }
             // Whether or not we emit, do NOT descend into an artifact subtree.
@@ -609,6 +671,117 @@ fn visit(shared: &WalkShared, result: Result<ignore::DirEntry, ignore::Error>) -
         }
     }
     WalkState::Continue
+}
+
+/// Directory extensions macOS treats as packages. The walk never descends
+/// into one: a file inside a package is part of the package, never a "loose"
+/// large file (deleting `Photos.sqlite` out of a Photos library corrupts it),
+/// and a project inside an `.xcodeproj` or `.app` is not a project of ours.
+const PACKAGE_EXTENSIONS: &[&str] = &[
+    // apps & code
+    "app",
+    "appex",
+    "framework",
+    "bundle",
+    "plugin",
+    "kext",
+    "xpc",
+    "prefpane",
+    "qlgenerator",
+    "mdimporter",
+    "saver",
+    "xcodeproj",
+    "xcworkspace",
+    "playground",
+    "docset",
+    "dsym",
+    "pkg",
+    "mpkg",
+    // user data libraries — see `data_library_label`
+    "photoslibrary",
+    "migratedphotolibrary",
+    "aplibrary",
+    "musiclibrary",
+    "tvlibrary",
+    "imovielibrary",
+    "fcpbundle",
+    "logicx",
+    "band",
+    "abbu",
+    "lrlibrary",
+    "vmwarevm",
+    "pvm",
+    "utm",
+    "sparsebundle",
+    "rtfd",
+    "scriv",
+    "keynote",
+    "pages",
+    "numbers",
+];
+
+/// The package extension of a directory name (lower-cased), if it is one.
+fn package_extension(name: &str) -> Option<&'static str> {
+    let (_, ext) = name.rsplit_once('.')?;
+    let ext = ext.to_ascii_lowercase();
+    PACKAGE_EXTENSIONS.iter().copied().find(|e| *e == ext)
+}
+
+/// Packages worth surfacing as one opaque large item: user data that grows
+/// (the Storage pane's "Photos 63 GB"), as opposed to apps and projects.
+fn data_library_label(ext: &str) -> Option<&'static str> {
+    Some(match ext {
+        "photoslibrary" | "migratedphotolibrary" => "Photos library",
+        "aplibrary" => "Aperture library",
+        "musiclibrary" => "Music library",
+        "tvlibrary" => "TV library",
+        "imovielibrary" => "iMovie library",
+        "fcpbundle" => "Final Cut Pro library",
+        "logicx" => "Logic Pro project",
+        "band" => "GarageBand project",
+        "lrlibrary" => "Lightroom library",
+        "vmwarevm" => "VMware virtual machine",
+        "pvm" => "Parallels virtual machine",
+        "utm" => "UTM virtual machine",
+        "sparsebundle" => "sparse bundle disk image",
+        _ => return None,
+    })
+}
+
+/// A large data-library package, sized whole by the sizing pool. `Info`, in
+/// its own group, Reveal only: it is context for where the disk went, never
+/// a cleanup candidate — a library is managed by its app.
+fn large_package_finding(path: &Path, label: &str, size: u64) -> Finding {
+    let key = path.to_string_lossy();
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = package_extension(&name).unwrap_or("");
+    Finding::new(
+        FindingKind::LargeFile,
+        &key,
+        format!("Large package — {name}"),
+    )
+    .path(path.to_path_buf())
+    .detail(format!(
+        "{label} ({}); a macOS package managed by its app — shown for size only, not a cleanup candidate",
+        humansize::format_size(size, humansize::BINARY)
+    ))
+    .size(size)
+    .severity(Severity::Info)
+    .provenance("du over the whole package; contents never listed individually")
+    .meta(json!({ "group": "Data libraries", "package": ext, "package_label": label }))
+    .remedy(Remedy {
+        label: "Reveal in Finder".into(),
+        command: RemedyCommand::RevealInFinder {
+            path: path.to_path_buf(),
+        },
+        reclaims_bytes: None,
+        destructive: false,
+        alternative: false,
+        guard: None,
+    })
 }
 
 /// Is `name` (a directory) a recognized build artifact, given its marker? The
@@ -1687,6 +1860,126 @@ mod tests {
             "an expired cache entry must be re-du'd"
         );
         assert!(hit.meta.get("size_cached").is_none());
+    }
+
+    /// `ctx_for` with a ~100-byte large-file threshold so small fixtures count.
+    fn ctx_tiny_threshold(home: &Path) -> (ScanCtx, mpsc::Receiver<ScanEvent>) {
+        let (mut ctx, rx, _) = ctx_for(home, false, false, vec![]);
+        let mut config = (*ctx.config).clone();
+        config.scan.large_file_threshold_gb = 1e-7;
+        ctx.config = Arc::new(config);
+        (ctx, rx)
+    }
+
+    fn big_file(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, vec![0u8; 64 * 1024]).unwrap();
+    }
+
+    #[tokio::test]
+    async fn files_inside_packages_are_never_loose_large_files() {
+        let home = tempfile::tempdir().unwrap();
+        let sqlite = home
+            .path()
+            .join("Pictures/Photos Library.photoslibrary/database/Photos.sqlite");
+        big_file(&sqlite);
+        let app_bin = home.path().join("Applications/Foo.app/Contents/MacOS/Foo");
+        big_file(&app_bin);
+        let loose = home.path().join("Movies/huge.mkv");
+        big_file(&loose);
+
+        let (ctx, rx) = ctx_tiny_threshold(home.path());
+        FsScanner.scan(ctx).await.unwrap();
+        let findings = drain(rx);
+        let large: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.kind == FindingKind::LargeFile)
+            .collect();
+        assert!(
+            !large
+                .iter()
+                .any(|f| f.path.as_deref() == Some(sqlite.as_path())),
+            "Photos.sqlite must not be a loose large file: {large:?}"
+        );
+        assert!(!large
+            .iter()
+            .any(|f| f.path.as_deref() == Some(app_bin.as_path())));
+        assert!(large
+            .iter()
+            .any(|f| f.path.as_deref() == Some(loose.as_path())));
+    }
+
+    #[tokio::test]
+    async fn data_library_package_is_one_opaque_reveal_only_item() {
+        let home = tempfile::tempdir().unwrap();
+        let lib = home.path().join("Pictures/Photos Library.photoslibrary");
+        big_file(&lib.join("database/Photos.sqlite"));
+        big_file(&lib.join("originals/1/IMG_0001.HEIC"));
+
+        let (ctx, rx) = ctx_tiny_threshold(home.path());
+        FsScanner.scan(ctx).await.unwrap();
+        let findings = drain(rx);
+        // (The tiny threshold also catches the scanner's own size cache under
+        // the temp home; only Pictures matters here.)
+        let pictures = home.path().join("Pictures");
+        let pkgs: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.kind == FindingKind::LargeFile)
+            .filter(|f| f.path.as_ref().unwrap().starts_with(&pictures))
+            .collect();
+        assert_eq!(pkgs.len(), 1, "{pkgs:?}");
+        let f = pkgs[0];
+        assert_eq!(f.path.as_deref(), Some(lib.as_path()));
+        assert_eq!(f.title, "Large package — Photos Library.photoslibrary");
+        assert_eq!(f.meta["package_label"], "Photos library");
+        assert_eq!(f.meta["group"], "Data libraries");
+        // Context, not a cleanup candidate.
+        assert_eq!(f.severity, Severity::Info);
+        assert!(f.size_bytes.unwrap() >= 2 * 64 * 1024);
+        assert_eq!(f.remedies.len(), 1);
+        assert!(matches!(
+            f.remedies[0].command,
+            RemedyCommand::RevealInFinder { .. }
+        ));
+        assert!(!f.remedies[0].destructive);
+    }
+
+    #[tokio::test]
+    async fn code_packages_are_skipped_silently() {
+        let home = tempfile::tempdir().unwrap();
+        let app = home.path().join("Applications/Foo.APP");
+        big_file(&app.join("Contents/MacOS/Foo"));
+        let proj = home.path().join("code/Foo.xcodeproj");
+        fs::create_dir_all(proj.join("node_modules/x")).unwrap();
+        fs::write(proj.join("package.json"), "{}").unwrap();
+
+        let (ctx, rx) = ctx_tiny_threshold(home.path());
+        FsScanner.scan(ctx).await.unwrap();
+        let findings = drain(rx);
+        assert!(
+            findings
+                .iter()
+                .all(|f| !f.path.as_ref().unwrap().starts_with(&app)
+                    && !f.path.as_ref().unwrap().starts_with(&proj)),
+            "nothing inside a code package may be reported: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn package_extension_matches_case_insensitively_and_exactly() {
+        assert_eq!(package_extension("Foo.app"), Some("app"));
+        assert_eq!(package_extension("Foo.APP"), Some("app"));
+        assert_eq!(
+            package_extension("Photos Library.photoslibrary"),
+            Some("photoslibrary")
+        );
+        assert_eq!(package_extension("foo.appdata"), None);
+        assert_eq!(package_extension("app"), None);
+        assert_eq!(data_library_label("app"), None);
+        assert_eq!(
+            data_library_label("vmwarevm"),
+            Some("VMware virtual machine")
+        );
     }
 
     #[test]

@@ -34,6 +34,13 @@ enum Palette {
         "Other": .gray,
         "Purgeable": .gray.opacity(0.6),
         "Free": .clear,
+        // Reclaimable breakdown.
+        "Stale build artifacts": .orange,
+        "Recent build artifacts": .orange.opacity(0.55),
+        "Caches": .teal,
+        "Time Machine snapshots": .indigo,
+        "Orphaned tools": .cyan,
+        "Rust toolchains": .red,
         // Brew install reasons / app classifications.
         "requested": .blue, "dependency": .teal, "autoremove": .orange, "unknown": .gray,
         "system": .gray, "user": .blue, "app_store": .cyan, "unmanaged": .orange, "cask": .brown,
