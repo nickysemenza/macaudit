@@ -66,7 +66,7 @@ struct FindingRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            MarkToggle(id: finding.id)
+            MarkToggle(store: store, id: finding.id)
             VStack(alignment: .leading, spacing: 2) {
                 Text(finding.title).lineLimit(1)
                 if !finding.detail.isEmpty {
@@ -80,6 +80,6 @@ struct FindingRow: View {
             SeverityBadge(severity: finding.severity)
         }
         .padding(.vertical, 2)
-        .contextMenu { RowContextMenu(finding: finding) }
+        .contextMenu { RowContextMenu(store: store, finding: finding) }
     }
 }

@@ -83,8 +83,16 @@ struct SeverityBadge: View {
     }
 }
 
+/// Checkbox that marks a finding for cleanup.
+///
+/// Takes the store as a parameter instead of reading `@Environment(AuditStore.self)`:
+/// this view is placed in `Table` cells, which AppKit hosts in per-cell
+/// `NSHostingView`s. On macOS 26 a cell inserted into an already-visible table
+/// (rows streaming in from a scan) is built without the Observable environment,
+/// and the environment read traps with "No Observable object of type AuditStore
+/// found". Observation still tracks `store.marked` through the passed reference.
 struct MarkToggle: View {
-    @Environment(AuditStore.self) private var store
+    let store: AuditStore
     let id: UInt64
 
     var body: some View {

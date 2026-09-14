@@ -36,7 +36,7 @@ struct FindingInspector: View {
                 SeverityBadge(severity: f.severity)
             }
             HStack {
-                MarkToggle(id: f.id)
+                MarkToggle(store: store, id: f.id)
                 Text(store.marked.contains(f.id) ? "Marked for cleanup" : "Mark for cleanup")
                     .font(.caption)
                     .foregroundStyle(.secondary)
