@@ -44,9 +44,9 @@ extension AuditStore {
         add("ios-backups", "iOS backups",
             "Device backups kept by Finder; each one is a full copy.",
             "iphone.and.arrow.forward", .fs, fs.filter { $0.kind == .iosBackup })
-        add("large-files", "Large files and libraries",
-            "Loose files over the size threshold, plus data libraries (Photos, Music, VMs) sized as one item. Review before deleting; libraries are reveal-only.",
-            "doc.zipper", .fs, fs.filter { $0.kind == .largeFile }, markable: false)
+        add("large-files", "Large files",
+            "Loose files over the configured size threshold. Review before deleting.",
+            "doc.zipper", .fs, fs.filter { $0.kind == .largeFile && !$0.isDataLibraryPackage }, markable: false)
         add("brew-autoremove", "Homebrew autoremove candidates",
             "Formulae installed only as dependencies that nothing needs any more (`brew autoremove`).",
             "mug", .brew, brew.filter(\.isBrewAutoremoveCandidate))
@@ -166,7 +166,7 @@ private struct ReclaimableBreakdown: View {
                 }
                 SegmentedBar(segments: segments, capacity: total)
                 if skipped.bytes > 0 {
-                    Text("Not counted: \(Formatting.bytes(skipped.bytes)) in \(skipped.count) large files, packages and iOS backups — they need a look before anything is deleted.")
+                    Text("Not counted: \(Formatting.bytes(skipped.bytes)) in \(skipped.count) large files and iOS backups — they need a look before anything is deleted.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

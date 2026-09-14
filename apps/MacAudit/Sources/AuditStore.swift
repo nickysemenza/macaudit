@@ -185,6 +185,7 @@ final class AuditStore {
     var attentionNotCounted: (bytes: UInt64, count: Int) {
         let items = findings.values.flatMap(\.values)
             .filter { ($0.kind == .largeFile || $0.kind == .iosBackup) && $0.severity != .reclaimable }
+            .filter { !$0.isDataLibraryPackage }
         return (items.reduce(0) { $0 + ($1.sizeBytes ?? 0) }, items.count)
     }
 

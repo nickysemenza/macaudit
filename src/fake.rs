@@ -881,11 +881,11 @@ fn fs_fixtures() -> Vec<Finding> {
             "Large package — Photos Library.photoslibrary",
         )
         .path("/Users/dev/Pictures/Photos Library.photoslibrary")
-        .detail("Photos library (63.9 GiB); a macOS package — manage it from its app, not by deleting files inside it")
+        .detail("Photos library (63.9 GiB); a macOS package managed by its app — shown for size only, not a cleanup candidate")
         .size(63 * GIB + 900 * MIB)
-        .severity(Severity::Attention)
+        .severity(Severity::Info)
         .provenance("du over the whole package; contents never listed individually")
-        .meta(json!({ "group": "Large files", "package": "photoslibrary", "package_label": "Photos library" }))
+        .meta(json!({ "group": "Data libraries", "package": "photoslibrary", "package_label": "Photos library" }))
         .remedy(reveal("/Users/dev/Pictures/Photos Library.photoslibrary")),
         Finding::new(
             FindingKind::CacheDir,

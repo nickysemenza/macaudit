@@ -748,8 +748,9 @@ fn data_library_label(ext: &str) -> Option<&'static str> {
     })
 }
 
-/// A large data-library package, sized whole by the sizing pool. Reveal only:
-/// a package is managed by its app, never by deleting it (or its files) here.
+/// A large data-library package, sized whole by the sizing pool. `Info`, in
+/// its own group, Reveal only: it is context for where the disk went, never
+/// a cleanup candidate — a library is managed by its app.
 fn large_package_finding(path: &Path, label: &str, size: u64) -> Finding {
     let key = path.to_string_lossy();
     let name = path
@@ -764,13 +765,13 @@ fn large_package_finding(path: &Path, label: &str, size: u64) -> Finding {
     )
     .path(path.to_path_buf())
     .detail(format!(
-        "{label} ({}); a macOS package — manage it from its app, not by deleting files inside it",
+        "{label} ({}); a macOS package managed by its app — shown for size only, not a cleanup candidate",
         humansize::format_size(size, humansize::BINARY)
     ))
     .size(size)
-    .severity(Severity::Attention)
+    .severity(Severity::Info)
     .provenance("du over the whole package; contents never listed individually")
-    .meta(json!({ "group": "Large files", "package": ext, "package_label": label }))
+    .meta(json!({ "group": "Data libraries", "package": ext, "package_label": label }))
     .remedy(Remedy {
         label: "Reveal in Finder".into(),
         command: RemedyCommand::RevealInFinder {
@@ -1931,8 +1932,9 @@ mod tests {
         assert_eq!(f.path.as_deref(), Some(lib.as_path()));
         assert_eq!(f.title, "Large package — Photos Library.photoslibrary");
         assert_eq!(f.meta["package_label"], "Photos library");
-        assert_eq!(f.meta["group"], "Large files");
-        assert_eq!(f.severity, Severity::Attention);
+        assert_eq!(f.meta["group"], "Data libraries");
+        // Context, not a cleanup candidate.
+        assert_eq!(f.severity, Severity::Info);
         assert!(f.size_bytes.unwrap() >= 2 * 64 * 1024);
         assert_eq!(f.remedies.len(), 1);
         assert!(matches!(
