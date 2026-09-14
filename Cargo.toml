@@ -3,7 +3,7 @@ members = ["crates/macaudit-ffi", "crates/uniffi-bindgen"]
 
 [package]
 name = "macaudit"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.93"
 description = "A 'why is my Mac like this' audit TUI"

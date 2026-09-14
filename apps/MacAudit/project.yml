@@ -26,7 +26,7 @@ settings:
     # source of truth, and what `macaudit --version` prints): release.yml
     # asserts the tag matches Cargo.toml and passes both settings on the
     # xcodebuild command line, CURRENT_PROJECT_VERSION being the run number.
-    MARKETING_VERSION: "0.1.0"
+    MARKETING_VERSION: "0.1.1"
     CURRENT_PROJECT_VERSION: "1"
     # Sign with a real development certificate, not ad-hoc: TCC keys its
     # folder-access grants (Downloads, Desktop, ...) on the signing identity,
