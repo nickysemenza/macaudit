@@ -59,9 +59,9 @@ extension AuditStore {
         add("simulators", "Unused simulators",
             "Unavailable runtimes and devices Xcode no longer uses.",
             "iphone", .simulator, findings(in: .simulator).filter(reclaimable))
-        add("tm-snapshots", "Local Time Machine snapshots",
-            "APFS snapshots macOS keeps on the internal disk between backups.",
-            "clock.arrow.2.circlepath", .tmSnapshots, findings(in: .tmSnapshots).filter(reclaimable))
+        add("time-machine", "Local Time Machine snapshots",
+            "APFS snapshots macOS keeps on the internal disk between backups (Time Machine section).",
+            "clock.arrow.2.circlepath", .timeMachine, findings(in: .timeMachine).filter(reclaimable))
         add("intel-apps", "Intel-only apps",
             "Run under Rosetta on this Mac; check for Apple silicon builds.",
             "cpu", .apps, findings(in: .apps).filter(\.isIntelOnlyApp), markable: false)

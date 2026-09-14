@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>AutoBackup</key>
+	<integer>1</integer>
+	<key>AutoBackupInterval</key>
+	<integer>86400</integer>
+	<key>Destinations</key>
+	<array>
+		<dict>
+			<key>AttemptDates</key>
+			<array/>
+			<key>BytesAvailable</key>
+			<integer>900000000000</integer>
+			<key>BytesUsed</key>
+			<integer>1100000000000</integer>
+			<key>DestinationID</key>
+			<string>3F2B9C1A-7E4D-4A6B-9C2E-1D8F5A0B6C3D</string>
+			<key>LastKnownVolumeName</key>
+			<string>Backup HD</string>
+			<key>RESULT</key>
+			<integer>0</integer>
+			<key>SnapshotDates</key>
+			<array>
+				<date>2026-08-14T20:00:00Z</date>
+				<date>2026-08-21T20:00:00Z</date>
+				<date>2026-08-28T20:00:00Z</date>
+				<date>2026-09-06T20:00:00Z</date>
+				<date>2026-09-13T20:00:00Z</date>
+			</array>
+		</dict>
+	</array>
+	<key>LastBackupActivity</key>
+	<string>2026-09-13-200000</string>
+	<key>LastDestinationID</key>
+	<string>3F2B9C1A-7E4D-4A6B-9C2E-1D8F5A0B6C3D</string>
+	<key>SkipPaths</key>
+	<array>
+		<string>/Users/fixture/dev</string>
+		<string>/Users/fixture/.cache</string>
+	</array>
+</dict>
+</plist>

@@ -32,7 +32,7 @@ pub enum SectionId {
     Git,
     Simulator,
     SshKeys,
-    TmSnapshots,
+    TimeMachine,
 }
 
 impl From<ScannerId> for SectionId {
@@ -51,7 +51,7 @@ impl From<ScannerId> for SectionId {
             ScannerId::Git => SectionId::Git,
             ScannerId::Simulator => SectionId::Simulator,
             ScannerId::SshKeys => SectionId::SshKeys,
-            ScannerId::TmSnapshots => SectionId::TmSnapshots,
+            ScannerId::TimeMachine => SectionId::TimeMachine,
         }
     }
 }
@@ -72,7 +72,7 @@ impl From<SectionId> for ScannerId {
             SectionId::Git => ScannerId::Git,
             SectionId::Simulator => ScannerId::Simulator,
             SectionId::SshKeys => ScannerId::SshKeys,
-            SectionId::TmSnapshots => ScannerId::TmSnapshots,
+            SectionId::TimeMachine => ScannerId::TimeMachine,
         }
     }
 }
@@ -161,6 +161,12 @@ pub enum FindingKind {
     IosBackup,
     LocalSnapshot,
     LargeFile,
+    TmDestination,
+    TmExclusion,
+    TmExclusionCandidate,
+    TmBackupEstimate,
+    TmStaleMount,
+    TmPurgeable,
 }
 
 impl From<model::FindingKind> for FindingKind {
@@ -189,6 +195,12 @@ impl From<model::FindingKind> for FindingKind {
             K::IosBackup => FindingKind::IosBackup,
             K::LocalSnapshot => FindingKind::LocalSnapshot,
             K::LargeFile => FindingKind::LargeFile,
+            K::TmDestination => FindingKind::TmDestination,
+            K::TmExclusion => FindingKind::TmExclusion,
+            K::TmExclusionCandidate => FindingKind::TmExclusionCandidate,
+            K::TmBackupEstimate => FindingKind::TmBackupEstimate,
+            K::TmStaleMount => FindingKind::TmStaleMount,
+            K::TmPurgeable => FindingKind::TmPurgeable,
         }
     }
 }

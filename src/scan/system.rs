@@ -12,14 +12,11 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use crate::model::{Finding, FindingKind, ScannerId, Severity};
+use crate::scan::volume;
 use crate::scan::{ScanCtx, Scanner};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const PROCESS_LIMIT: usize = 12;
-/// Native macOS storage availability includes reclaimable space, such as local
-/// Time Machine snapshots. JXA/osascript ships with macOS and avoids compiling
-/// Swift on each manual scan.
-const VOLUME_CAPACITY_SCRIPT: &str = r#"ObjC.import("Foundation"); const url = $.NSURL.fileURLWithPath("/"); function value(key) { const out = Ref(); url.getResourceValueForKeyError(out, key, null); return ObjC.unwrap(out[0]); } JSON.stringify({total:value($.NSURLVolumeTotalCapacityKey), physical:value($.NSURLVolumeAvailableCapacityKey), important:value($.NSURLVolumeAvailableCapacityForImportantUsageKey)});"#;
 
 #[derive(Default)]
 pub struct SystemScanner;
@@ -126,18 +123,12 @@ impl Scanner for SystemScanner {
         }
         ctx.progress("sampling disk", 2, Some(5)).await;
 
-        let disk = command(&ctx, "diskutil", &["info", "-plist", "/"]).await;
-        let macos_capacity = command(
-            &ctx,
-            "osascript",
-            &["-l", "JavaScript", "-e", VOLUME_CAPACITY_SCRIPT],
-        )
-        .await
-        .and_then(|output| parse_macos_capacity(&output));
+        let disk = volume::diskutil_info(&ctx, "/", COMMAND_TIMEOUT).await;
+        let macos_capacity = volume::macos_capacity(&ctx, COMMAND_TIMEOUT).await;
         let local_snapshot_count = command(&ctx, "tmutil", &["listlocalsnapshots", "/"])
             .await
             .map(|output| count_local_snapshots(&output));
-        if let Some(disk) = disk.as_deref().and_then(parse_diskutil_info) {
+        if let Some(disk) = disk {
             let available = macos_capacity
                 .map(|capacity| capacity.important)
                 .filter(|available| *available >= disk.free);
@@ -364,41 +355,6 @@ fn parse_binary_size(input: &str) -> Option<u64> {
     Some((number.parse::<f64>().ok()? * multiplier) as u64)
 }
 
-#[derive(Debug, Clone, Copy)]
-struct DiskUsage {
-    capacity: u64,
-    used: u64,
-    free: u64,
-}
-
-fn parse_diskutil_info(input: &str) -> Option<DiskUsage> {
-    let value = plist::Value::from_reader_xml(input.as_bytes()).ok()?;
-    let dict = value.as_dictionary()?;
-    let capacity = dict.get("TotalSize")?.as_unsigned_integer()?;
-    let free = dict
-        .get("APFSContainerFree")
-        .or_else(|| dict.get("VolumeFreeSpace"))?
-        .as_unsigned_integer()?;
-    Some(DiskUsage {
-        capacity,
-        used: capacity.saturating_sub(free),
-        free,
-    })
-}
-
-#[derive(Debug, Clone, Copy)]
-struct MacosCapacity {
-    important: u64,
-}
-
-fn parse_macos_capacity(input: &str) -> Option<MacosCapacity> {
-    let value: serde_json::Value = serde_json::from_str(input.trim()).ok()?;
-    let total = value.get("total")?.as_u64()?;
-    let physical = value.get("physical")?.as_u64()?;
-    let important = value.get("important")?.as_u64()?;
-    (important >= physical && total >= important).then_some(MacosCapacity { important })
-}
-
 fn count_local_snapshots(input: &str) -> u64 {
     input
         .lines()
@@ -537,22 +493,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_diskutil_plist_and_rejects_bad_data() {
-        let xml = r#"<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>TotalSize</key><integer>1000</integer><key>APFSContainerFree</key><integer>250</integer></dict></plist>"#;
-        let disk = parse_diskutil_info(xml).unwrap();
-        assert_eq!(disk.used, 750);
-        assert!(parse_diskutil_info("nope").is_none());
-    }
-
-    #[test]
-    fn parses_native_macos_available_capacity() {
-        let capacity =
-            parse_macos_capacity(r#"{"total":1000,"physical":40,"important":330}"#).unwrap();
-        assert_eq!(capacity.important, 330);
-        assert!(parse_macos_capacity(r#"{"total":1000,"physical":40,"important":1200}"#).is_none());
-    }
-
-    #[test]
     fn counts_time_machine_local_snapshots_without_assuming_sizes() {
         assert_eq!(
             count_local_snapshots(
@@ -575,7 +515,7 @@ mod tests {
             .on("diskutil", &["info", "-plist", "/"], disk_xml)
             .on(
                 "osascript",
-                &["-l", "JavaScript", "-e", VOLUME_CAPACITY_SCRIPT],
+                &["-l", "JavaScript", "-e", volume::VOLUME_CAPACITY_SCRIPT],
                 r#"{"total":1000,"physical":250,"important":500}"#,
             )
             .on(

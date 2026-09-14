@@ -128,7 +128,7 @@ private struct SectionRow: View {
         case .git: "arrow.triangle.branch"
         case .simulator: "iphone"
         case .sshKeys: "key"
-        case .tmSnapshots: "clock.arrow.2.circlepath"
+        case .timeMachine: "clock.arrow.2.circlepath"
         }
     }
 }

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Destinations</key>
+	<array>
+		<dict>
+			<key>Kind</key>
+			<string>Network</string>
+			<key>URL</key>
+			<string>smb://fixture@nas._smb._tcp.local./Time%20Machine</string>
+			<key>Name</key>
+			<string>Time Machine</string>
+			<key>ID</key>
+			<string>146E01E3-B311-4132-9E56-918AA1A95509</string>
+			<key>LastDestination</key>
+			<integer>1</integer>
+			<key>QuotaGB</key>
+			<integer>499</integer>
+		</dict>
+	</array>
+</dict>
+</plist>

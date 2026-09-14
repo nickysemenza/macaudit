@@ -73,7 +73,7 @@ pub fn fixtures(id: ScannerId) -> Vec<Finding> {
         ScannerId::Git => git_fixtures(),
         ScannerId::Simulator => simulator_fixtures(),
         ScannerId::SshKeys => ssh_keys_fixtures(),
-        ScannerId::TmSnapshots => tm_snapshots_fixtures(),
+        ScannerId::TimeMachine => time_machine_fixtures(),
         ScannerId::Tools => tools_fixtures(),
     }
 }
@@ -1822,48 +1822,311 @@ fn ssh_keys_fixtures() -> Vec<Finding> {
     ]
 }
 
-/// Mirrors `src/scan/tm_snapshots.rs`: title `"Local snapshot {date}"`, meta
-/// name/date, Reclaimable with a `tmutil deletelocalsnapshots` remedy.
-fn tm_snapshots_fixtures() -> Vec<Finding> {
+/// Mirrors `src/scan/time_machine.rs`: one `TmDestination` (a failed, full
+/// network destination), one `TmStaleMount` (an unmounted backup disk), one
+/// `TmPurgeable` (upper-bound purgeable space), one `TmBackupEstimate`
+/// (complete, fits quota but tight), three `TmExclusion` (fixed-path and
+/// macOS-default), two `TmExclusionCandidate` (regenerable cache and cloud
+/// sync), and three `LocalSnapshot`. Every finding carries `meta.group`
+/// ("Backup" / "Backup set" / "Exclusions" / "Suggested exclusions" /
+/// "Local snapshots") so the section's tree view groups them correctly.
+fn time_machine_fixtures() -> Vec<Finding> {
     let dates = [
         ("2026-09-13-060000", "2026-09-13 06:00:00"),
         ("2026-09-12-060000", "2026-09-12 06:00:00"),
         ("2026-09-11-060000", "2026-09-11 06:00:00"),
-        ("2026-09-10-060000", "2026-09-10 06:00:00"),
-        ("2026-09-09-060000", "2026-09-09 06:00:00"),
-        ("2026-09-08-060000", "2026-09-08 06:00:00"),
     ];
 
-    dates
-        .into_iter()
-        .map(|(date, humanized)| {
-            let name = format!("com.apple.TimeMachine.{date}.local");
-            Finding::new(
-                FindingKind::LocalSnapshot,
-                &name,
-                format!("Local snapshot {humanized}"),
+    let snapshots = dates.into_iter().map(|(date, humanized)| {
+        let name = format!("com.apple.TimeMachine.{date}.local");
+        Finding::new(
+            FindingKind::LocalSnapshot,
+            &name,
+            format!("Local snapshot {humanized}"),
+        )
+        .detail(format!(
+            "Time Machine local snapshot {name}; macOS manages its purgeable space and \
+                 does not report a reliable per-snapshot reclaimable size.",
+        ))
+        .severity(Severity::Reclaimable)
+        .provenance("tmutil listlocalsnapshots /")
+        .coverage("Presence is measured; reclaimable bytes are intentionally not estimated.")
+        .meta(json!({
+            "name": name, "date": date, "status": humanized, "group": "Local snapshots",
+        }))
+        .remedy(Remedy {
+            label: "Delete local snapshot".to_string(),
+            command: RemedyCommand::Shell {
+                program: "tmutil".to_string(),
+                args: vec!["deletelocalsnapshots".to_string(), date.to_string()],
+            },
+            reclaims_bytes: None,
+            destructive: true,
+            alternative: false,
+            guard: None,
+        })
+    });
+
+    vec![
+        Finding::new(
+            FindingKind::TmDestination,
+            "146E01E3-B311-4132-9E56-918AA1A95509",
+            "Time Machine – cantaloupe.local",
+        )
+        .path("/Volumes/Time Machine")
+        .detail(
+            "Backup failed with error 56 (destination full): cantaloupe.local has 50.0 GB \
+             free of its 499 GB quota and hasn't completed a backup in 27 days.",
+        )
+        .size(449_101_406_208)
+        .severity(Severity::Warning)
+        .provenance("tmutil destinationinfo -X; defaults export com.apple.TimeMachine")
+        .meta(json!({
+            "status": "Failed (destination full) · 27d ago",
+            "destination_id": "146E01E3-B311-4132-9E56-918AA1A95509",
+            "kind": "Network",
+            "network_url": "smb://user@cantaloupe._smb._tcp.local./Time%20Machine",
+            "quota_bytes": 499_000_000_000u64,
+            "bytes_used": 449_101_406_208u64,
+            "bytes_available": 50_029_150_208u64,
+            "result": 56,
+            "result_label": "destination full",
+            "last_backup": "2026-08-17 19:19",
+            "last_backup_days": 27,
+            "oldest_backup": "2026-08-17 09:47",
+            "backup_count": 3,
+            "attempt_count": 12,
+            "last_attempt": "2026-09-12 18:37",
+            "auto_backup": true,
+            "auto_backup_interval_secs": 86_400,
+            "mounted": true,
+            "prefs_readable": true,
+            "group": "Backup",
+        }))
+        .remedy(reveal("/Volumes/Time Machine")),
+        Finding::new(
+            FindingKind::TmStaleMount,
+            "/Volumes/Backups of Fixture’s MacBook Air 2",
+            "Backups of Fixture’s MacBook Air 2",
+        )
+        .path("/Volumes/Backups of Fixture’s MacBook Air 2")
+        .detail(
+            "A Time Machine backup disk that isn't currently mounted; its old backups are \
+             inaccessible until it's reconnected.",
+        )
+        .severity(Severity::Attention)
+        .meta(json!({ "status": "Not mounted", "group": "Backup" }))
+        .remedy(Remedy {
+            label: "Copy removal command".to_string(),
+            command: RemedyCommand::CopyToClipboard {
+                text: "sudo rmdir '/Volumes/Backups of Fixture’s MacBook Air 2'".to_string(),
+            },
+            reclaims_bytes: None,
+            destructive: false,
+            alternative: false,
+            guard: None,
+        })
+        .remedy(Remedy {
+            alternative: true,
+            ..reveal("/Volumes/Backups of Fixture’s MacBook Air 2")
+        }),
+        Finding::new(FindingKind::TmPurgeable, "purgeable", "Purgeable space")
+            .detail(
+                "Upper bound on reclaimable local-snapshot and other macOS-managed purgeable \
+                 space; the OS may reclaim some of this automatically before you ever need to.",
             )
-            .detail(format!(
-                "Time Machine local snapshot {name}; macOS manages its purgeable space and \
-                     does not report a reliable per-snapshot reclaimable size.",
-            ))
-            .severity(Severity::Reclaimable)
-            .provenance("tmutil listlocalsnapshots /")
-            .coverage("Presence is measured; reclaimable bytes are intentionally not estimated.")
-            .meta(json!({ "name": name, "date": date }))
+            .size(72_608_670_088)
+            .severity(Severity::Info)
+            .provenance("NSURLVolumeAvailableCapacityForImportantUsageKey minus real free space (osascript, Foundation only)")
+            .meta(json!({
+                "status": "upper bound",
+                "macos_available_bytes": 241_009_959_304u64,
+                "apfs_free_bytes": 168_401_289_216u64,
+                "snapshot_count": 3,
+                "group": "Local snapshots",
+            }))
             .remedy(Remedy {
-                label: "Delete local snapshot".to_string(),
+                label: "Thin local snapshots (aggressive)".to_string(),
                 command: RemedyCommand::Shell {
                     program: "tmutil".to_string(),
-                    args: vec!["deletelocalsnapshots".to_string(), date.to_string()],
+                    args: vec![
+                        "thinlocalsnapshots".to_string(),
+                        "/".to_string(),
+                        "9999999999999".to_string(),
+                        "4".to_string(),
+                    ],
                 },
-                reclaims_bytes: None,
+                reclaims_bytes: Some(72_608_670_088),
                 destructive: true,
                 alternative: false,
                 guard: None,
-            })
+            }),
+        Finding::new(
+            FindingKind::TmBackupEstimate,
+            "estimate",
+            "Estimated backup set",
+        )
+        .path("/Users/dev")
+        .detail(
+            "412 GB would be backed up (213 GB excluded); quota 499 GB → fits, but leaves \
+                 under 20% headroom for history",
+        )
+        .size(412_000_000_000)
+        .severity(Severity::Warning)
+        .coverage("39 of 41 backup roots measured completely; 2 skipped (protected paths).")
+        .meta(json!({
+            "status": "complete",
+            "included_bytes": 412_000_000_000u64,
+            "excluded_bytes": 213_000_000_000u64,
+            "data_used_bytes": 792_000_000_000u64,
+            "quota_bytes": 499_000_000_000u64,
+            "roots_total": 41,
+            "roots_measured": 39,
+            "roots_partial": 0,
+            "roots_skipped": 2,
+            "skipped_paths": ["~/Library/Mail", "~/Library/Safari"],
+            "complete": true,
+            "fits_quota": true,
+            "group": "Backup set",
+        })),
+        Finding::new(FindingKind::TmExclusion, "/Users/dev/dev", "~/dev")
+            .path("/Users/dev/dev")
+            .detail("saves 108.0 GB on disk from backups")
+            .size(108 * GIB)
+            .severity(Severity::Info)
+            .meta(json!({
+                "status": "Excluded",
+                "exclusion_kind": "fixed_path",
+                "in_system_settings": true,
+                "exists": true,
+                "complete": true,
+                "entries": 21_400,
+                "size_cached": false,
+                "group": "Exclusions",
+            })),
+        Finding::new(FindingKind::TmExclusion, "/Users/dev/.cache", "~/.cache")
+            .path("/Users/dev/.cache")
+            .detail("saves 23.0 GB on disk from backups")
+            .size(23 * GIB)
+            .severity(Severity::Info)
+            .meta(json!({
+                "status": "Excluded",
+                "exclusion_kind": "fixed_path",
+                "in_system_settings": true,
+                "exists": true,
+                "complete": true,
+                "entries": 3_200,
+                "size_cached": false,
+                "group": "Exclusions",
+            })),
+        Finding::new(
+            FindingKind::TmExclusion,
+            "/Users/dev/Library/Caches",
+            "~/Library/Caches",
+        )
+        .path("/Users/dev/Library/Caches")
+        .detail("saves 20.0 GB on disk from backups")
+        .size(20 * GIB)
+        .severity(Severity::Info)
+        .meta(json!({
+            "status": "Excluded",
+            "exclusion_kind": "macos_default",
+            "in_system_settings": false,
+            "exists": true,
+            "complete": true,
+            "entries": 58_000,
+            "size_cached": false,
+            "group": "Exclusions",
+        })),
+        Finding::new(
+            FindingKind::TmExclusionCandidate,
+            "/Users/dev/.cargo",
+            "~/.cargo",
+        )
+        .path("/Users/dev/.cargo")
+        .detail(
+            "Rust toolchain and registry cache — regenerable by re-running `cargo build`; \
+                 safe to exclude from backups",
+        )
+        .size(2 * GIB + 100 * MIB)
+        .severity(Severity::Attention)
+        .meta(json!({
+            "status": "Included",
+            "reason": "regenerable_cache",
+            "complete": true,
+            "entries": 9_800,
+            "size_cached": false,
+            "group": "Suggested exclusions",
+        }))
+        .remedy(Remedy {
+            label: "Exclude from Time Machine".to_string(),
+            command: RemedyCommand::Shell {
+                program: "tmutil".to_string(),
+                args: vec!["addexclusion".to_string(), "/Users/dev/.cargo".to_string()],
+            },
+            reclaims_bytes: None,
+            destructive: false,
+            alternative: false,
+            guard: None,
         })
-        .collect()
+        .remedy(Remedy {
+            label: "Copy fixed-path exclusion command (shows in System Settings, needs admin)"
+                .to_string(),
+            command: RemedyCommand::CopyToClipboard {
+                text: "sudo tmutil addexclusion -p '/Users/dev/.cargo'".to_string(),
+            },
+            reclaims_bytes: None,
+            destructive: false,
+            alternative: true,
+            guard: None,
+        }),
+        Finding::new(
+            FindingKind::TmExclusionCandidate,
+            "/Users/dev/Library/Mobile Documents",
+            "~/Library/Mobile Documents",
+        )
+        .path("/Users/dev/Library/Mobile Documents")
+        .detail("synced to a cloud provider — your call")
+        .size(24 * GIB)
+        .severity(Severity::Info)
+        .meta(json!({
+            "status": "Included",
+            "reason": "cloud_synced",
+            "complete": true,
+            "entries": 15_200,
+            "size_cached": false,
+            "group": "Suggested exclusions",
+        }))
+        .remedy(Remedy {
+            label: "Exclude from Time Machine".to_string(),
+            command: RemedyCommand::Shell {
+                program: "tmutil".to_string(),
+                args: vec![
+                    "addexclusion".to_string(),
+                    "/Users/dev/Library/Mobile Documents".to_string(),
+                ],
+            },
+            reclaims_bytes: None,
+            destructive: false,
+            alternative: false,
+            guard: None,
+        })
+        .remedy(Remedy {
+            label: "Copy fixed-path exclusion command (shows in System Settings, needs admin)"
+                .to_string(),
+            command: RemedyCommand::CopyToClipboard {
+                text: "sudo tmutil addexclusion -p '/Users/dev/Library/Mobile Documents'"
+                    .to_string(),
+            },
+            reclaims_bytes: None,
+            destructive: false,
+            alternative: true,
+            guard: None,
+        }),
+    ]
+    .into_iter()
+    .chain(snapshots)
+    .collect()
 }
 
 /// Streams a section's [`fixtures`] with a believable cadence: ~120ms between

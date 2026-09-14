@@ -10,7 +10,7 @@ dev-environment sprawl, with safe, explicit remediation.
 - **Resource Health overview + 13 audit sections**: a manual point-in-time
   CPU/memory/swap/disk/process summary, plus Apps, Brew, Global Tools, Disk,
   Daemons, Shell, Runtimes, Docker, Ports, Git, Simulators, Keys, and
-  Snapshots — see the [sections tour](#sections-tour) below.
+  Time Machine — see the [sections tour](#sections-tour) below.
 - **Developer-tool audit.** Every global installation across npm, pnpm
   (current *and* legacy layouts), cargo, pipx, uv, pip site-packages and bun,
   with the manager that owns it, the launchers it exports, which copy your
@@ -47,7 +47,8 @@ packages touched, no settings changed. Honest fine print on what a scan
 *does* do:
 
 - **Read-only inspection commands are executed** (`system_profiler`, `brew`,
-  `git status`, `lsof`, …). Worth knowing about: `brew` is always run with
+  `git status`, `lsof`, `tmutil`, `defaults export`, `diskutil`, `osascript`,
+  …). Worth knowing about: `brew` is always run with
   `HOMEBREW_NO_AUTO_UPDATE=1` so it can't trigger Homebrew's auto-update
   (`brew autoremove --dry-run` is read-only), and the Shell and Global Tools
   sections start your *login shell* (fish, zsh or bash, found via directory
@@ -55,7 +56,18 @@ packages touched, no settings changed. Honest fine print on what a scan
   definition, executes your own shell configuration files. No rc file is
   ever read or displayed. The Global Tools scan otherwise reads manager
   metadata from disk only (optionally `npm prefix -g`): it never executes
-  the tools it finds and never imports Python modules.
+  the tools it finds and never imports Python modules. The Time Machine
+  section only ever queries `tmutil` (`listlocalsnapshots`,
+  `destinationinfo`, `isexcluded`) and reads Time Machine's own preferences
+  via `defaults export` (backed by `cfprefsd`, not direct file access) and
+  volume info via `diskutil info`; the one `osascript` call is a JXA read of
+  Foundation's `NSURL` volume-capacity key, never AppleEvents automation of
+  another app. Scanning never changes Time Machine settings; the section's
+  remedies (`tmutil deletelocalsnapshots`, `tmutil thinlocalsnapshots`, the
+  sticky `tmutil addexclusion <path>`) run only when you confirm them, and
+  anything that would need admin rights (`tmutil addexclusion -p`, removing
+  a stale `/Volumes/Backups of …` directory) is offered as a command to
+  copy, since macaudit never elevates.
 - **Health probes are explicit and bounded.** `--version` checks run only
   when you ask (`macaudit tools verify`, or the `Verify` alternative remedy
   on a tool), and after a cleanup for retained tools related to the batch —
@@ -113,6 +125,12 @@ The same engine, as a native macOS app. The Rust engine is linked in-process
 through [UniFFI](https://mozilla.github.io/uniffi-rs/) (`crates/macaudit-ffi`);
 `swift/MacAuditKit` wraps the generated bindings and `apps/MacAudit` is the
 app. Requires Xcode 16+ and [xcodegen](https://github.com/yonaskolb/XcodeGen).
+
+```sh
+scripts/run-app.sh                        # all of the below, then launches the signed app (--release, --fake, --no-open, --no-ffi)
+```
+
+Or step by step:
 
 ```sh
 scripts/build-ffi.sh                      # engine .a → xcframework + Swift bindings (debug; --release, --universal)
@@ -287,7 +305,7 @@ include_apple_python = true      # /Library/Python sites: inventory only, never 
 | Git | Local repos with uncommitted work, unpushed commits (including branches with no upstream), stashes, and working-tree sizes; package-manager checkouts are filtered out. |
 | Simulators | iOS Simulator devices and runtimes, with targeted delete remedies for unavailable ones. |
 | Keys | SSH keys in `~/.ssh`, flagging old or weak ones. |
-| Snapshots | Time Machine local disk snapshots, which silently consume disk space. |
+| Time Machine | Backup health per destination (last backup, failures, quota), an exclusion-aware estimate of what the backup set would contain, exclusions and how much each saves, suggested exclusions with one-click `tmutil addexclusion`, stale `/Volumes/Backups of …` mount points, and local snapshots with the purgeable-space upper bound. |
 
 ## Global tools
 

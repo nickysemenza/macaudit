@@ -1,6 +1,6 @@
 //! The manual Resource Health overview. It summarizes actual scanner findings
 //! without manufacturing cleanup actions: every recommendation points back to
-//! the existing Disk/Docker/Simulators/Snapshots source sections in the sidebar.
+//! the existing Disk/Docker/Simulators/Time Machine source sections in the sidebar.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -121,7 +121,7 @@ fn draw_sources(app: &AppState, frame: &mut Frame, area: Rect, vp: &mut Viewport
         (ScannerId::Fs, "Disk allocation"),
         (ScannerId::Docker, "Docker"),
         (ScannerId::Simulator, "Simulators"),
-        (ScannerId::TmSnapshots, "Snapshots"),
+        (ScannerId::TimeMachine, "Time Machine"),
     ]
     .into_iter()
     .enumerate()
@@ -150,15 +150,15 @@ fn draw_sources(app: &AppState, frame: &mut Frame, area: Rect, vp: &mut Viewport
         } else {
             String::new()
         };
+        let size_text = tm_destination_status(&findings).unwrap_or_else(|| fmt::bytes(bytes));
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{label:<18}"),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(
-                "{state} · {} findings · {}{suffix}",
+                "{state} · {} findings · {size_text}{suffix}",
                 findings.len(),
-                fmt::bytes(bytes)
             )),
         ]));
     }
@@ -183,6 +183,32 @@ fn draw_sources(app: &AppState, frame: &mut Frame, area: Rect, vp: &mut Viewport
         }
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+}
+
+/// The Time Machine row's status text, when the section has a `TmDestination`
+/// finding to report on: "not configured" for the unconfigured destination
+/// (`meta.destination_id == "none"`), otherwise "last backup {N}d ago"
+/// ("today" for 0), flagged with " ⚠" when that finding is a `Warning`.
+/// `None` for every other section, or a `TmDestination` with neither shape,
+/// so the caller falls back to the generic bytes text.
+fn tm_destination_status(findings: &[&Finding]) -> Option<String> {
+    let dest = findings
+        .iter()
+        .copied()
+        .find(|f| f.kind == FindingKind::TmDestination)?;
+    if dest.meta.get("destination_id").and_then(|v| v.as_str()) == Some("none") {
+        return Some("not configured".to_string());
+    }
+    let days = dest.meta.get("last_backup_days").and_then(|v| v.as_u64())?;
+    let mut text = if days == 0 {
+        "last backup today".to_string()
+    } else {
+        format!("last backup {days}d ago")
+    };
+    if dest.severity == Severity::Warning {
+        text.push_str(" ⚠");
+    }
+    Some(text)
 }
 
 fn metric<'a>(findings: &'a [&Finding], role: &str) -> Option<&'a Finding> {

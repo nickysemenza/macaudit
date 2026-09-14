@@ -200,6 +200,7 @@ pub struct Config {
     pub behavior: BehaviorConfig,
     pub network: NetworkConfig,
     pub tools: ToolsConfig,
+    pub time_machine: TimeMachineConfig,
 }
 
 /// Global developer-tool audit (`[tools]`). Every path is tilde-expanded at
@@ -262,6 +263,35 @@ impl Default for ToolsConfig {
             python_sites: Vec::new(),
             include_apple_python: true,
             homebrew_prefix: None,
+        }
+    }
+}
+
+/// Time Machine backup audit (`[time_machine]`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TimeMachineConfig {
+    /// Days since the last successful backup before a destination is flagged.
+    pub stale_backup_days: u64,
+    /// Wall-clock budget, in seconds, for each of the two sizing phases
+    /// (exclusions/candidates first, then the backup-set hubs).
+    pub estimate_budget_secs: u64,
+    /// Per-root entry cap for the bounded directory walk.
+    pub estimate_max_entries_per_root: u64,
+    /// Suggested exclusions smaller than this are not shown (MiB).
+    pub candidate_min_mb: u64,
+    /// Extra "~/…" or absolute roots to consider as exclusion candidates.
+    pub extra_candidates: Vec<String>,
+}
+
+impl Default for TimeMachineConfig {
+    fn default() -> Self {
+        TimeMachineConfig {
+            stale_backup_days: 7,
+            estimate_budget_secs: 60,
+            estimate_max_entries_per_root: 5_000_000,
+            candidate_min_mb: 100,
+            extra_candidates: Vec::new(),
         }
     }
 }
@@ -413,6 +443,22 @@ mod tests {
         let c: Config = toml::from_str(text).unwrap();
         assert_eq!(c.behavior.delete_mode, DeleteMode::Rm);
         assert_eq!(c.behavior.stale_after_days, 90); // default preserved
+    }
+
+    #[test]
+    fn partial_time_machine_config_merges_defaults() {
+        let text = r#"
+            [time_machine]
+            stale_backup_days = 3
+        "#;
+        let c: Config = toml::from_str(text).unwrap();
+        assert_eq!(c.time_machine.stale_backup_days, 3);
+        assert_eq!(c.time_machine.estimate_budget_secs, 60);
+        assert_eq!(c.time_machine.estimate_max_entries_per_root, 5_000_000);
+        assert_eq!(c.time_machine.candidate_min_mb, 100);
+        assert!(c.time_machine.extra_candidates.is_empty());
+
+        assert_eq!(Config::default().time_machine.candidate_min_mb, 100);
     }
 
     /// A stub "zsh" that prints a fixed PATH regardless of its arguments.

@@ -66,7 +66,7 @@ pub enum ScannerId {
     Git,
     Simulator,
     SshKeys,
-    TmSnapshots,
+    TimeMachine,
 }
 
 impl ScannerId {
@@ -85,7 +85,7 @@ impl ScannerId {
         ScannerId::Git,
         ScannerId::Simulator,
         ScannerId::SshKeys,
-        ScannerId::TmSnapshots,
+        ScannerId::TimeMachine,
     ];
 
     /// Lowercase slug used for `--section` parsing and serde.
@@ -104,7 +104,7 @@ impl ScannerId {
             ScannerId::Git => "git",
             ScannerId::Simulator => "simulator",
             ScannerId::SshKeys => "ssh_keys",
-            ScannerId::TmSnapshots => "tm_snapshots",
+            ScannerId::TimeMachine => "time_machine",
         }
     }
 
@@ -125,7 +125,7 @@ impl ScannerId {
             "git" => ScannerId::Git,
             "simulator" | "sim" | "simulators" => ScannerId::Simulator,
             "ssh_keys" | "ssh" | "keys" => ScannerId::SshKeys,
-            "tm_snapshots" | "snapshots" | "tmutil" => ScannerId::TmSnapshots,
+            "time_machine" | "tm" | "snapshots" | "tmutil" => ScannerId::TimeMachine,
             _ => return None,
         })
     }
@@ -163,9 +163,24 @@ pub enum FindingKind {
     Simulator,
     SshKey,
     IosBackup,
+    /// A Time Machine local (APFS) snapshot on the boot volume.
     LocalSnapshot,
     /// A single loose file over the configured size threshold.
     LargeFile,
+    /// One configured Time Machine backup destination and its health.
+    TmDestination,
+    /// A path Time Machine skips (System Settings list, sticky attribute, or
+    /// macOS default), sized so the saving is visible.
+    TmExclusion,
+    /// A regenerable or cloud-synced directory that is still being backed up.
+    TmExclusionCandidate,
+    /// The measured, exclusion-aware estimate of the whole backup set (one).
+    TmBackupEstimate,
+    /// A leftover `/Volumes/Backups of …` directory that is not a mount point.
+    TmStaleMount,
+    /// Purgeable space on the boot volume — the upper bound held by local
+    /// snapshots (one).
+    TmPurgeable,
 }
 
 impl FindingKind {
@@ -194,7 +209,13 @@ impl FindingKind {
             FindingKind::GitRepo => ScannerId::Git,
             FindingKind::Simulator => ScannerId::Simulator,
             FindingKind::SshKey => ScannerId::SshKeys,
-            FindingKind::LocalSnapshot => ScannerId::TmSnapshots,
+            FindingKind::LocalSnapshot
+            | FindingKind::TmDestination
+            | FindingKind::TmExclusion
+            | FindingKind::TmExclusionCandidate
+            | FindingKind::TmBackupEstimate
+            | FindingKind::TmStaleMount
+            | FindingKind::TmPurgeable => ScannerId::TimeMachine,
         }
     }
 
@@ -222,6 +243,12 @@ impl FindingKind {
         FindingKind::IosBackup,
         FindingKind::LocalSnapshot,
         FindingKind::LargeFile,
+        FindingKind::TmDestination,
+        FindingKind::TmExclusion,
+        FindingKind::TmExclusionCandidate,
+        FindingKind::TmBackupEstimate,
+        FindingKind::TmStaleMount,
+        FindingKind::TmPurgeable,
     ];
 
     /// Inverse of `tag()` — how the snapshot store's `kind` column maps back.
@@ -254,6 +281,12 @@ impl FindingKind {
             FindingKind::IosBackup => "ios_backup",
             FindingKind::LocalSnapshot => "local_snapshot",
             FindingKind::LargeFile => "large_file",
+            FindingKind::TmDestination => "tm_destination",
+            FindingKind::TmExclusion => "tm_exclusion",
+            FindingKind::TmExclusionCandidate => "tm_exclusion_candidate",
+            FindingKind::TmBackupEstimate => "tm_backup_estimate",
+            FindingKind::TmStaleMount => "tm_stale_mount",
+            FindingKind::TmPurgeable => "tm_purgeable",
         }
     }
 }

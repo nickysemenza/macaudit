@@ -1,0 +1,8 @@
+[Excluded]  /Users/fixture/dev
+[Included]  /Users/fixture/Documents
+[Excluded]  /Users/fixture/Library/Caches
+[Included]  /Users/fixture/Library/Developer
+[UNKNOWN]   /Users/fixture/nope
+[Included]  /Users/fixture/.cargo
+[Excluded]  /Users/fixture/Pictures/Photos Library.photoslibrary
+[Included]  /Users/fixture/Desktop

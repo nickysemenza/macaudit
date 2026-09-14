@@ -75,6 +75,8 @@ pub enum FindingKind {
     App, BrewFormula, BrewCask, BuildArtifact, CacheDir, LaunchdItem,
     PathEntry, RuntimeVersion, DockerObject, PortListener, GitRepo,
     Simulator, SshKey, IosBackup, LocalSnapshot,
+    TmDestination, TmExclusion, TmExclusionCandidate, TmBackupEstimate,
+    TmStaleMount, TmPurgeable,
 }
 
 pub struct Remedy {
@@ -263,15 +265,36 @@ Design notes:
 - `~/.ssh`: key files, type/bits (parse pubkey), mtime as age proxy, keys with
   no matching entry in `config`. Old RSA-2048 or > 5y old → Attention. Info only.
 
-### 3.12 SnapshotsScanner (small but lucrative)
-- `tmutil listlocalsnapshots /` — Time Machine local snapshots silently eat
-  tens of GB. Remedy: `tmutil deletelocalsnapshots <date>` (destructive).
+### 3.12 TimeMachineScanner
+- Sources: `tmutil destinationinfo -X` (per-destination health: last backup,
+  `RESULT` code, quota vs. used); `defaults export
+  /Library/Preferences/com.apple.TimeMachine -` for `SkipPaths` and backup
+  history (TCC-protected plist, but `cfprefsd` serves the export anyway);
+  `tmutil isexcluded <paths…>` batched over a shallow enumeration of `/`,
+  home and `~/Library` hubs to prune excluded directories, size exclusions
+  and find candidates (regenerable caches/toolchains, cloud-synced folders) — a batch aborts at the first privacy-protected
+  path, so the scanner pre-filters known-FDA paths and resumes past them;
+  `diskutil info -plist /System/Volumes/Data`; one `osascript` JXA read of
+  `NSURLVolumeAvailableCapacityForImportantUsageKey` for purgeable space;
+  `tmutil listlocalsnapshots /` for local snapshots. No **Full Disk Access**
+  → `isexcluded`/estimate findings degrade to destination-only, FDA-limited
+  rather than silently empty.
+- Emits `TmDestination`, `TmExclusion` (per `SkipPaths` entry, sized),
+  `TmExclusionCandidate` (`tmutil addexclusion` remedy), `TmBackupEstimate`
+  (exclusion-aware measured estimate of the next backup), `TmStaleMount`
+  (orphaned `/Volumes/Backups of …` mounts), `TmPurgeable` (purgeable-space
+  upper bound — no per-snapshot size without root) and `LocalSnapshot`.
+  `TmExclusion` is always `Info` and `TmExclusionCandidate` at most
+  `Attention` — never `Reclaimable`, because excluding a path shrinks future
+  backups, not current disk usage. Root-only remedies (`tmutil addexclusion -p`, `rmdir` on a stale
+  mount) are `CopyToClipboard`; `tmutil deletelocalsnapshots <date>` remains
+  a direct, destructive remedy.
 
 ## 4. TUI layout (ratatui + crossterm)
 
 - **Nav rail** (left, adaptive width): one row per section (Overview, Apps,
   Brew, Disk, Daemons, Shell, Runtimes, Docker, Ports, Git, Simulators, Keys,
-  Snapshots) — a map, not a focusable list. `←/→`, `h/l`, `Tab`/`Shift-Tab`,
+  Time Machine) — a map, not a focusable list. `←/→`, `h/l`, `Tab`/`Shift-Tab`,
   digits `1`-`9`/`0`, or a click always switch sections; row movement never
   touches it. Full rows (≥100 cols) show a status glyph (spinner / ⚠),
   finding count, compact reclaimable size, and a `Δ±` badge vs. the last
@@ -427,7 +450,7 @@ aggregated), `project_roots`/`project_max_depth`/`project_time_budget_secs`,
 4. **M4 – remediation**: Remedy execution engine, confirm dialog, Trash
    default, activity log, post-remedy targeted rescan.
 5. **M5 – the long tail**: Launchd, ShellEnv, Runtimes, Docker, Ports, Git,
-   Simulators, SshKeys, Snapshots(tmutil).
+   Simulators, SshKeys, Time Machine(tmutil).
 6. **M6 – history**: SQLite snapshots + diff + TUI badges.
 7. **M7 (v1.1) – network**: formulae.brew.sh cask matching for unmanaged apps;
    GitHub-releases latest-version checks for Sparkle/unmanaged apps.

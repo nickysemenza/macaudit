@@ -27,7 +27,7 @@ extension SectionId: CaseIterable {
     /// Sidebar order — the same order as `Engine.sections()`.
     public static let allCases: [SectionId] = [
         .system, .apps, .brew, .tools, .fs, .launchd, .shellEnv, .runtimes,
-        .docker, .ports, .git, .simulator, .sshKeys, .tmSnapshots,
+        .docker, .ports, .git, .simulator, .sshKeys, .timeMachine,
     ]
 }
 
@@ -55,7 +55,7 @@ extension SectionId {
         case .git: "git"
         case .simulator: "simulator"
         case .sshKeys: "ssh_keys"
-        case .tmSnapshots: "tm_snapshots"
+        case .timeMachine: "time_machine"
         }
     }
 }

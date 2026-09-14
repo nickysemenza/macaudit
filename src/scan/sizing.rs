@@ -12,7 +12,8 @@
 //! findings that hard-link the same file each still report it, which is the
 //! honest per-tree number.)
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Result from a deliberately bounded directory measurement. `complete` is
@@ -48,8 +49,22 @@ pub fn du_blocks_bounded(
     deadline: Instant,
     cancelled: &dyn Fn() -> bool,
 ) -> BoundedSize {
+    du_blocks_bounded_except(root, &HashSet::new(), max_entries, deadline, cancelled)
+}
+
+/// `du_blocks_bounded` that does not descend into any directory in `skip`
+/// (compared by exact path). Lets a caller size "everything under here except
+/// these children" in one pass — the Time Machine estimate walks a hub while
+/// leaving out its excluded, unreadable, and separately-measured children.
+pub fn du_blocks_bounded_except(
+    root: &Path,
+    skip: &HashSet<PathBuf>,
+    max_entries: u64,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> BoundedSize {
     #[cfg(unix)]
-    let mut seen_links: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+    let mut seen_links: HashSet<(u64, u64)> = HashSet::new();
 
     let mut total: u64 = 0;
     let mut entries_seen = 0u64;
@@ -86,7 +101,10 @@ pub fn du_blocks_bounded(
                 continue;
             }
             if meta.is_dir() {
-                stack.push(entry.path());
+                let path = entry.path();
+                if skip.is_empty() || !skip.contains(&path) {
+                    stack.push(path);
+                }
             } else {
                 // A file with multiple hard links must only count once no
                 // matter how many of its links live under this root.

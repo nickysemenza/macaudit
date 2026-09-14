@@ -17,7 +17,7 @@ use crate::scan::shell_env::ShellEnvScanner;
 use crate::scan::simulator::SimulatorScanner;
 use crate::scan::ssh_keys::SshKeysScanner;
 use crate::scan::system::SystemScanner;
-use crate::scan::tm_snapshots::TmSnapshotsScanner;
+use crate::scan::time_machine::TimeMachineScanner;
 use crate::scan::Scanner;
 
 /// How a section's findings are primarily presented.
@@ -139,11 +139,11 @@ pub const REGISTRY: &[SectionMeta] = &[
         build: || Box::new(SshKeysScanner),
     },
     SectionMeta {
-        id: ScannerId::TmSnapshots,
-        title: "Snapshots",
-        short_title: "Snapshots",
-        view: ViewKind::Table,
-        build: || Box::new(TmSnapshotsScanner),
+        id: ScannerId::TimeMachine,
+        title: "Time Machine",
+        short_title: "TimeMach",
+        view: ViewKind::Tree,
+        build: || Box::new(TimeMachineScanner::default()),
     },
 ];
 

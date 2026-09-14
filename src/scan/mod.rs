@@ -23,7 +23,8 @@ pub mod shell_env;
 pub mod simulator;
 pub mod ssh_keys;
 pub mod system;
-pub mod tm_snapshots;
+pub mod time_machine;
+pub mod volume;
 
 use std::sync::Arc;
 

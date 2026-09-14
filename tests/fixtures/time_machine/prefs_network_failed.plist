@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>AutoBackup</key>
+	<integer>1</integer>
+	<key>AutoBackupInterval</key>
+	<integer>86400</integer>
+	<key>Destinations</key>
+	<array>
+		<dict>
+			<key>AttemptDates</key>
+			<array>
+				<date>2026-09-13T23:33:42Z</date>
+				<date>2026-09-14T00:57:38Z</date>
+				<date>2026-09-14T01:45:16Z</date>
+			</array>
+			<key>BytesAvailable</key>
+			<integer>49915244544</integer>
+			<key>BytesUsed</key>
+			<integer>449101406208</integer>
+			<key>ConsistencyScanDate</key>
+			<date>2026-06-19T21:44:54Z</date>
+			<key>DestinationID</key>
+			<string>146E01E3-B311-4132-9E56-918AA1A95509</string>
+			<key>DestinationUUIDs</key>
+			<array>
+				<string>886375CB-68A9-4BD2-A2A2-9B0BB4F28EFD</string>
+			</array>
+			<key>DestinationVersion</key>
+			<integer>23</integer>
+			<key>DiskImageCreatedByBuild</key>
+			<string>25F80</string>
+			<key>FilesystemTypeName</key>
+			<string>apfs</string>
+			<key>HealthCheckDecision</key>
+			<integer>0</integer>
+			<key>InheritanceDecision</key>
+			<integer>0</integer>
+			<key>LastKnownVolumeName</key>
+			<string>Time Machine</string>
+			<key>NetworkURL</key>
+			<string>smb://fixture@nas._smb._tcp.local./Time%20Machine</string>
+			<key>QuotaGB</key>
+			<integer>499</integer>
+			<key>RESULT</key>
+			<integer>56</integer>
+			<key>ReferenceLocalSnapshotDate</key>
+			<date>2026-08-17T21:34:38Z</date>
+			<key>SMBConversionState</key>
+			<integer>0</integer>
+			<key>SnapshotDates</key>
+			<array>
+				<date>2026-08-17T16:47:49Z</date>
+				<date>2026-08-17T20:04:25Z</date>
+				<date>2026-08-18T02:19:41Z</date>
+			</array>
+			<key>StableLocalSnapshotDate</key>
+			<date>2026-09-14T01:45:53Z</date>
+		</dict>
+	</array>
+	<key>HostUUIDs</key>
+	<array>
+		<string>0A8F395C-D5E1-5E9A-A036-9CE1923A7FA7</string>
+	</array>
+	<key>LastBackupActivity</key>
+	<string>2026-09-13-184445</string>
+	<key>LastDestinationID</key>
+	<string>146E01E3-B311-4132-9E56-918AA1A95509</string>
+	<key>LocalizedDiskImageVolumeName</key>
+	<string>Backups of Fixture’s MacBook Air</string>
+	<key>PreferencesVersion</key>
+	<integer>6</integer>
+	<key>RequiresACPower</key>
+	<false/>
+	<key>SkipPaths</key>
+	<array>
+		<string>/Applications</string>
+		<string>/Users/fixture/dev</string>
+		<string>/Users/fixture/.cache</string>
+		<string>/Users/fixture/Library/Application Support/Google</string>
+		<string>/Users/fixture/Pictures/Photos Library.photoslibrary</string>
+		<string>/Users/fixture/.codex</string>
+		<string>/Users/fixture/Library/Application Support/Claude</string>
+		<string>/Users/fixture/My Drive</string>
+		<string>/Users/fixture/Library/Developer</string>
+	</array>
+</dict>
+</plist>

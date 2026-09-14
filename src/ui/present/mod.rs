@@ -18,7 +18,7 @@ mod runtimes;
 mod shell;
 mod simulator;
 mod ssh_keys;
-mod tm_snapshots;
+mod time_machine;
 mod tools;
 
 use std::borrow::Cow;
@@ -484,7 +484,7 @@ pub fn presenter(id: ScannerId) -> &'static SectionPresenter {
         ScannerId::Git => &git::PRESENTER,
         ScannerId::Simulator => &simulator::PRESENTER,
         ScannerId::SshKeys => &ssh_keys::PRESENTER,
-        ScannerId::TmSnapshots => &tm_snapshots::PRESENTER,
+        ScannerId::TimeMachine => &time_machine::PRESENTER,
         ScannerId::Tools => &tools::PRESENTER,
     }
 }
