@@ -87,7 +87,21 @@ packages touched, no settings changed. Honest fine print on what a scan
 
 ## Install
 
-Requires macOS and a stable Rust toolchain.
+**Homebrew** (Apple Silicon, macOS 14+) — one cask installs both the
+`macaudit` CLI and MacAudit.app:
+
+```sh
+brew install --cask nickysemenza/tap/macaudit
+```
+
+The cask lives in [nickysemenza/homebrew-tap](https://github.com/nickysemenza/homebrew-tap)
+and downloads the zip from [Releases](https://github.com/nickysemenza/macaudit/releases);
+`brew upgrade` picks up new releases because the release workflow bumps the
+cask there. Releases are signed with a Developer ID certificate and
+notarized by Apple, so the app opens with a plain double-click and the CLI
+runs without a Gatekeeper "killed" — no right-click → Open dance.
+
+**From source** — the CLI needs a stable Rust toolchain:
 
 ```sh
 cargo install --path .
@@ -113,12 +127,14 @@ static library carry matching checksums and are always rebuilt together
 synthetic `--fake` findings; `MACAUDIT_HOME` works as for the CLI.
 
 The app is not sandboxed — it scans `~`, runs `brew`/`docker`/`xcrun` and
-moves files to the Trash, none of which the App Sandbox allows. Local builds
-are signed with an Apple Development certificate (team in `project.yml`;
-override `DEVELOPMENT_TEAM`, or pass `CODE_SIGN_IDENTITY=-` for an ad-hoc
-build) — macOS keys its folder-access grants on the signing identity, and an
-ad-hoc signature changes with every rebuild, so it would re-prompt each
-time. Because a Finder-launched app inherits launchd's
+moves files to the Trash, none of which the App Sandbox allows. It does run
+with the hardened runtime, in every configuration, because notarization
+requires it. Local builds are signed with an Apple Development certificate
+(team in `project.yml`; override `DEVELOPMENT_TEAM`, or pass
+`CODE_SIGN_IDENTITY=-` for an ad-hoc build) — macOS keys its folder-access
+grants on the signing identity, and an ad-hoc signature changes with every
+rebuild, so it would re-prompt each time. Because a Finder-launched app
+inherits launchd's
 minimal `PATH`, the engine adopts the login shell's `PATH` at startup (the
 same disclosure as the Shell scanner: this starts your shell once). Mail,
 Messages, Safari and Time Machine data need **Full Disk Access** granted to
@@ -365,6 +381,49 @@ confirm dialog is rebuilt so it can never reference a stale target.
 - Snapshots written by this version carry new finding kinds and remedy
   fields; older MacAudit binaries cannot read them (older snapshots still
   load here).
+
+## Cutting a release
+
+1. Bump `version` in `Cargo.toml` (what `macaudit --version` prints) and
+   `MARKETING_VERSION` in `apps/MacAudit/project.yml` to the same value.
+2. `git tag v0.1.0 && git push --tags`.
+
+That's it — [release.yml](.github/workflows/release.yml) builds the CLI and
+the app for arm64, signs both with the Developer ID certificate, notarizes
+them, staples the app, uploads `MacAudit-<version>.zip` (containing
+`MacAudit.app` and `macaudit` side by side) to a GitHub Release, and
+triggers `bump.yml` in the tap, which rewrites the cask's `version`/`sha256`
+with `brew bump-cask-pr`. The workflow refuses a tag that doesn't match
+`Cargo.toml`. Running it by hand from the Actions tab (workflow_dispatch)
+does everything except the release and the bump and uploads the zip as a
+workflow artifact — use that to prove the secrets work before tagging.
+
+The same two scripts run locally when the Developer ID certificate is in
+your keychain:
+
+```sh
+scripts/package.sh 0.1.0 build/dist          # build + sign into build/dist (SIGN_IDENTITY=- for ad-hoc)
+NOTARY_KEY_PATH=AuthKey.p8 NOTARY_KEY_ID=… NOTARY_ISSUER_ID=… \
+  scripts/notarize.sh build/dist MacAudit-0.1.0.zip
+```
+
+### Release signing
+
+`release.yml` needs six repository secrets, the same set (and the same
+certificate, notary key and team `Y9A97FXT63`) as
+[overboard](https://github.com/nickysemenza/overboard#release-signing),
+whose README walks through generating each:
+
+| Secret | Value |
+|---|---|
+| `DEVELOPER_ID_P12_BASE64` | `base64 -i cert.p12` of the exported Developer ID Application cert + key |
+| `DEVELOPER_ID_P12_PASSWORD` | the `.p12` export password |
+| `APP_STORE_CONNECT_API_KEY_P8` | contents of the App Store Connect API key's `.p8` |
+| `APP_STORE_CONNECT_KEY_ID` | that key's ID |
+| `APP_STORE_CONNECT_ISSUER_ID` | the key's issuer ID |
+| `HOMEBREW_TAP_TOKEN` | fine-grained PAT with Actions read/write on `nickysemenza/homebrew-tap` only |
+
+Set each with `gh secret set <NAME> --repo nickysemenza/macaudit`.
 
 ## License
 
