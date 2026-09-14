@@ -46,6 +46,13 @@ targets:
     platform: macOS
     sources:
       - path: Sources
+      - path: Resources/Assets.xcassets
+      # Icon Composer document (macOS 26 layered icon). actool compiles it
+      # into the Assets.car and also renders the flat .icns fallback that
+      # macOS 14/15 display, so there is no AppIcon.appiconset to maintain.
+      - path: Resources/AppIcon.icon
+        type: file
+        buildPhase: resources
     dependencies:
       - package: MacAuditKit
     postBuildScripts:

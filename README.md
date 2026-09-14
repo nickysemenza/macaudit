@@ -142,7 +142,9 @@ cargo install --path .
 The same engine, as a native macOS app. The Rust engine is linked in-process
 through [UniFFI](https://mozilla.github.io/uniffi-rs/) (`crates/macaudit-ffi`);
 `swift/MacAuditKit` wraps the generated bindings and `apps/MacAudit` is the
-app. Requires Xcode 16+ and [xcodegen](https://github.com/yonaskolb/XcodeGen).
+app. Requires Xcode 26+ (the app icon is an Icon Composer document,
+`apps/MacAudit/Resources/AppIcon.icon`, which older `actool`s can't compile)
+and [xcodegen](https://github.com/yonaskolb/XcodeGen).
 
 ```sh
 scripts/run-app.sh                        # all of the below, then launches the signed app (--release, --fake, --no-open, --no-ffi)

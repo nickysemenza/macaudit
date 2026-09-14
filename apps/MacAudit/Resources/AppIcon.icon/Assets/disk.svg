@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- disk-usage pie, minus the wedge that lives on its own layer -->
+  <path d="M356 458 L484.2 478.8 A130 130 0 1 1 356 328 Z" fill="#fff"/>
+</svg>

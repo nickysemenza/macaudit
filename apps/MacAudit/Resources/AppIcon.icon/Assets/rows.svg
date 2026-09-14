@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- audit finding rows beside the pie -->
+  <g fill="#fff"><rect x="540" y="368" width="230" height="40" rx="20"/><rect x="540" y="438" width="170" height="40" rx="20"/><rect x="540" y="508" width="120" height="40" rx="20"/></g>
+</svg>
