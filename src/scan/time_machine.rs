@@ -754,7 +754,7 @@ fn destination_finding(
             }
             if let (Some(used), Some(avail)) = (p.bytes_used, p.bytes_available) {
                 let total = used.saturating_add(avail);
-                let pct = if total > 0 { used * 100 / total } else { 0 };
+                let pct = (used * 100).checked_div(total).unwrap_or(0);
                 parts.push(format!(
                     "{} used, {} free ({pct}% full)",
                     human(used),
