@@ -13,7 +13,7 @@ struct TableView: View {
     var body: some View {
         @Bindable var store = store
         Table(findings.sorted(using: sortOrder), selection: $store.selectedFinding, sortOrder: $sortOrder) {
-            TableColumn("") { f in MarkToggle(id: f.id) }
+            TableColumn("") { f in MarkToggle(store: store, id: f.id) }
                 .width(24)
             TableColumn("Name", value: \.title) { f in
                 VStack(alignment: .leading, spacing: 1) {
@@ -40,7 +40,7 @@ struct TableView: View {
         }
         .contextMenu(forSelectionType: UInt64.self) { ids in
             if let id = ids.first, let finding = store.finding(id) {
-                RowContextMenu(finding: finding)
+                RowContextMenu(store: store, finding: finding)
             }
         }
     }
@@ -61,8 +61,12 @@ extension Finding {
 }
 
 /// Shared row context menu (Table uses the selection-typed variant).
+///
+/// `store` is passed in rather than read from the environment for the same
+/// reason as `MarkToggle`: menu content built for a `Table` row is hosted
+/// outside the main view graph and may not carry the Observable environment.
 struct RowContextMenu: View {
-    @Environment(AuditStore.self) private var store
+    let store: AuditStore
     let finding: Finding
 
     var body: some View {
