@@ -10,6 +10,7 @@ use crate::scan::docker::DockerScanner;
 use crate::scan::fs::FsScanner;
 use crate::scan::git::GitScanner;
 use crate::scan::global_tools::ToolsScanner;
+use crate::scan::ios::IosScanner;
 use crate::scan::launchd::LaunchdScanner;
 use crate::scan::ports::PortsScanner;
 use crate::scan::runtimes::RuntimesScanner;
@@ -130,6 +131,13 @@ pub const REGISTRY: &[SectionMeta] = &[
         short_title: "Simulators",
         view: ViewKind::Table,
         build: || Box::new(SimulatorScanner),
+    },
+    SectionMeta {
+        id: ScannerId::Ios,
+        title: "iOS Devices",
+        short_title: "iOS",
+        view: ViewKind::Table,
+        build: || Box::new(IosScanner),
     },
     SectionMeta {
         id: ScannerId::SshKeys,

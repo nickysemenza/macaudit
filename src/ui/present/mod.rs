@@ -12,6 +12,7 @@ mod brew;
 mod disk;
 mod docker;
 mod git;
+mod ios;
 mod launchd;
 mod ports;
 mod runtimes;
@@ -67,6 +68,10 @@ pub enum ColumnId {
     Bits,
     Config,
     Date,
+    /// iOS app bundle size.
+    AppBytes,
+    /// iOS app data (documents, caches, downloads) size.
+    DataBytes,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -483,6 +488,7 @@ pub fn presenter(id: ScannerId) -> &'static SectionPresenter {
         ScannerId::Ports => &ports::PRESENTER,
         ScannerId::Git => &git::PRESENTER,
         ScannerId::Simulator => &simulator::PRESENTER,
+        ScannerId::Ios => &ios::PRESENTER,
         ScannerId::SshKeys => &ssh_keys::PRESENTER,
         ScannerId::TimeMachine => &time_machine::PRESENTER,
         ScannerId::Tools => &tools::PRESENTER,

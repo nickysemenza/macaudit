@@ -7,10 +7,17 @@ dev-environment sprawl, with safe, explicit remediation.
 
 ## Features
 
-- **Resource Health overview + 13 audit sections**: a manual point-in-time
+- **Resource Health overview + 14 audit sections**: a manual point-in-time
   CPU/memory/swap/disk/process summary, plus Apps, Brew, Global Tools, Disk,
-  Daemons, Shell, Runtimes, Docker, Ports, Git, Simulators, Keys, and
-  Time Machine — see the [sections tour](#sections-tour) below.
+  Daemons, Shell, Runtimes, Docker, Ports, Git, Simulators, iOS Devices,
+  Keys, and Time Machine — see the [sections tour](#sections-tour) below.
+- **iPhone storage, from the Mac.** Plug in an iPhone or iPad and the iOS
+  Devices section reads what Settings › iPhone Storage won't tell you: how
+  much is *purgeable* (on one 256 GB phone, 146 GB hiding behind "19 GB
+  free"), and a sortable per-app table splitting each app's bundle from its
+  data — the Spotify-with-38-GB-of-downloads kind of finding. Needs the
+  optional `libimobiledevice` and `ideviceinstaller` formulae; the section
+  says so when they're missing.
 - **Developer-tool audit.** Every global installation across npm, pnpm
   (current *and* legacy layouts), cargo, pipx, uv, pip site-packages and bun,
   with the manager that owns it, the launchers it exports, which copy your
@@ -68,6 +75,17 @@ packages touched, no settings changed. Honest fine print on what a scan
   anything that would need admin rights (`tmutil addexclusion -p`, removing
   a stale `/Volumes/Backups of …` directory) is offered as a command to
   copy, since macaudit never elevates.
+- **The iOS Devices section talks to a physically connected, paired
+  device** — a step beyond commands run on this Mac, so spelled out: it runs
+  `idevice_id -l`, `ideviceinfo -x`, `ideviceinfo -q com.apple.disk_usage -x`
+  and `ideviceinstaller list --all --xml` (with an explicit attribute list),
+  all reads through the same lockdown services Finder uses. Nothing is ever
+  executed *against* the phone: the only remedy is an `ideviceinstaller
+  uninstall` command copied to the clipboard for you to run yourself. The
+  tools are optional (`brew install libimobiledevice ideviceinstaller`);
+  without them, or without a phone, the section shows one row saying so. One
+  known wart: a scan with the phone unplugged saves a snapshot with no iOS
+  rows, so the next `snapshot diff` reports them all removed, then added.
 - **Health probes are explicit and bounded.** `--version` checks run only
   when you ask (`macaudit tools verify`, or the `Verify` alternative remedy
   on a tool), and after a cleanup for retained tools related to the batch —
@@ -304,6 +322,7 @@ include_apple_python = true      # /Library/Python sites: inventory only, never 
 | Ports | Listening TCP ports with the owning process and PID. |
 | Git | Local repos with uncommitted work, unpushed commits (including branches with no upstream), stashes, and working-tree sizes; package-manager checkouts are filtered out. |
 | Simulators | iOS Simulator devices and runtimes, with targeted delete remedies for unavailable ones. |
+| iOS Devices | A USB-connected iPhone/iPad's capacity, free, purgeable and committed space via `ideviceinfo`, plus every installed app's bundle and data size via `ideviceinstaller`; apps whose data dwarfs the app (offline downloads, caches) are flagged for attention. Read-only — remedies are copy-to-clipboard commands. |
 | Keys | SSH keys in `~/.ssh`, flagging old or weak ones. |
 | Time Machine | Backup health per destination (last backup, failures, quota), an exclusion-aware estimate of what the backup set would contain, exclusions and how much each saves, suggested exclusions with one-click `tmutil addexclusion`, stale `/Volumes/Backups of …` mount points, and local snapshots with the purgeable-space upper bound. |
 

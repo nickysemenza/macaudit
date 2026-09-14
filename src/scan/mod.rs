@@ -16,6 +16,7 @@ pub mod docker;
 pub mod fs;
 pub mod git;
 pub mod global_tools;
+pub mod ios;
 pub mod launchd;
 pub mod ports;
 pub mod runtimes;
@@ -112,6 +113,33 @@ pub async fn run_with_timeout(
     match tokio::time::timeout(timeout, ctx.runner.run(program, args, &ctx.token)).await {
         Ok(Ok(out)) if out.success() => Some(out),
         _ => None,
+    }
+}
+
+/// Outcome of a bounded command run, for scanners that must tell "the tool
+/// is not installed" (offer an install hint) apart from "it ran and failed"
+/// (show its stderr) — `run_with_timeout` folds both into `None`.
+#[derive(Debug)]
+pub enum CmdOutcome {
+    Ok(crate::runner::CmdOutput),
+    /// Could not be spawned — in practice, the binary is not on `$PATH`.
+    NotInstalled(String),
+    /// Ran and exited non-zero.
+    Failed(crate::runner::CmdOutput),
+    TimedOut,
+}
+
+pub async fn run_classified(
+    ctx: &ScanCtx,
+    program: &str,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> CmdOutcome {
+    match tokio::time::timeout(timeout, ctx.runner.run(program, args, &ctx.token)).await {
+        Err(_) => CmdOutcome::TimedOut,
+        Ok(Err(e)) => CmdOutcome::NotInstalled(e.to_string()),
+        Ok(Ok(out)) if out.success() => CmdOutcome::Ok(out),
+        Ok(Ok(out)) => CmdOutcome::Failed(out),
     }
 }
 

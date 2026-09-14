@@ -65,6 +65,8 @@ pub enum ScannerId {
     Ports,
     Git,
     Simulator,
+    /// USB-connected iPhones/iPads (libimobiledevice).
+    Ios,
     SshKeys,
     TimeMachine,
 }
@@ -84,6 +86,7 @@ impl ScannerId {
         ScannerId::Ports,
         ScannerId::Git,
         ScannerId::Simulator,
+        ScannerId::Ios,
         ScannerId::SshKeys,
         ScannerId::TimeMachine,
     ];
@@ -103,6 +106,7 @@ impl ScannerId {
             ScannerId::Ports => "ports",
             ScannerId::Git => "git",
             ScannerId::Simulator => "simulator",
+            ScannerId::Ios => "ios",
             ScannerId::SshKeys => "ssh_keys",
             ScannerId::TimeMachine => "time_machine",
         }
@@ -124,6 +128,7 @@ impl ScannerId {
             "ports" | "port" => ScannerId::Ports,
             "git" => ScannerId::Git,
             "simulator" | "sim" | "simulators" => ScannerId::Simulator,
+            "ios" | "idevice" | "iphone" | "ipad" => ScannerId::Ios,
             "ssh_keys" | "ssh" | "keys" => ScannerId::SshKeys,
             "time_machine" | "tm" | "snapshots" | "tmutil" => ScannerId::TimeMachine,
             _ => return None,
@@ -161,6 +166,10 @@ pub enum FindingKind {
     PortListener,
     GitRepo,
     Simulator,
+    /// A USB-connected iOS device: capacity, free, purgeable, app totals.
+    IosDevice,
+    /// One app installed on a connected iOS device, with bundle and data size.
+    IosApp,
     SshKey,
     IosBackup,
     /// A Time Machine local (APFS) snapshot on the boot volume.
@@ -208,6 +217,7 @@ impl FindingKind {
             FindingKind::PortListener => ScannerId::Ports,
             FindingKind::GitRepo => ScannerId::Git,
             FindingKind::Simulator => ScannerId::Simulator,
+            FindingKind::IosDevice | FindingKind::IosApp => ScannerId::Ios,
             FindingKind::SshKey => ScannerId::SshKeys,
             FindingKind::LocalSnapshot
             | FindingKind::TmDestination
@@ -239,6 +249,8 @@ impl FindingKind {
         FindingKind::PortListener,
         FindingKind::GitRepo,
         FindingKind::Simulator,
+        FindingKind::IosDevice,
+        FindingKind::IosApp,
         FindingKind::SshKey,
         FindingKind::IosBackup,
         FindingKind::LocalSnapshot,
@@ -277,6 +289,8 @@ impl FindingKind {
             FindingKind::PortListener => "port_listener",
             FindingKind::GitRepo => "git_repo",
             FindingKind::Simulator => "simulator",
+            FindingKind::IosDevice => "ios_device",
+            FindingKind::IosApp => "ios_app",
             FindingKind::SshKey => "ssh_key",
             FindingKind::IosBackup => "ios_backup",
             FindingKind::LocalSnapshot => "local_snapshot",

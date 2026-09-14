@@ -72,6 +72,7 @@ pub fn fixtures(id: ScannerId) -> Vec<Finding> {
         ScannerId::Ports => ports_fixtures(),
         ScannerId::Git => git_fixtures(),
         ScannerId::Simulator => simulator_fixtures(),
+        ScannerId::Ios => ios_fixtures(),
         ScannerId::SshKeys => ssh_keys_fixtures(),
         ScannerId::TimeMachine => time_machine_fixtures(),
         ScannerId::Tools => tools_fixtures(),
@@ -1586,6 +1587,111 @@ fn git_fixtures() -> Vec<Finding> {
             25 * MIB,
         ),
     ]
+}
+
+/// Mirrors `src/scan/ios.rs` by construction — the findings come from the
+/// scanner's own builders. Numbers are from a real 256 GB iPhone: 146 GB
+/// purgeable behind 19.6 GB "free", and Spotify holding 38 GB of downloads.
+fn ios_fixtures() -> Vec<Finding> {
+    use crate::scan::ios::{app_finding, device_finding, AppUsage, DeviceInfo, DiskUsage};
+    const UDID: &str = "00008150-001915442138401C";
+    let info = DeviceInfo {
+        name: "Nicky iPhone".to_string(),
+        product_type: "iPhone18,1".to_string(),
+        ios_version: "27.0".to_string(),
+    };
+    let usage = DiskUsage {
+        capacity: 246_266_159_104,
+        free: 19_632_939_008,
+        available: 166_055_415_808,
+    };
+    let app =
+        |bundle_id: &str, title: &str, app_type: &str, version: &str, s: u64, d: u64| AppUsage {
+            bundle_id: bundle_id.to_string(),
+            title: title.to_string(),
+            app_type: app_type.to_string(),
+            version: Some(version.to_string()),
+            static_bytes: s,
+            dynamic_bytes: d,
+        };
+    let apps = vec![
+        app(
+            "com.spotify.client",
+            "Spotify",
+            "User",
+            "9.0.86",
+            260_000_000,
+            38_290_000_000,
+        ),
+        app(
+            "com.zhiliaoapp.musically",
+            "TikTok",
+            "User",
+            "41.2.0",
+            990_000_000,
+            3_270_000_000,
+        ),
+        app(
+            "com.google.photos",
+            "Google Photos",
+            "User",
+            "7.40",
+            420_000_000,
+            1_640_000_000,
+        ),
+        app(
+            "com.burbn.instagram",
+            "Instagram",
+            "User",
+            "389.0",
+            590_000_000,
+            1_390_000_000,
+        ),
+        app(
+            "ai.polycam.polycam",
+            "Polycam",
+            "User",
+            "7.0.0",
+            510_000_000,
+            1_330_000_000,
+        ),
+        app(
+            "com.apple.mobilenotes",
+            "Notes",
+            "System",
+            "4.11",
+            20_000_000,
+            1_640_000_000,
+        ),
+        app(
+            "com.google.chrome.ios",
+            "Chrome",
+            "User",
+            "140.0",
+            390_000_000,
+            900_000_000,
+        ),
+        app(
+            "com.google.Maps",
+            "Google Maps",
+            "User",
+            "25.36",
+            460_000_000,
+            780_000_000,
+        ),
+        app(
+            "com.apple.mobilesafari",
+            "Safari",
+            "System",
+            "27.0",
+            2_000_000,
+            690_000_000,
+        ),
+        app("com.tmobile.tlife", "T-Life", "User", "6.5", 650_000_000, 0),
+    ];
+    let mut out: Vec<Finding> = apps.iter().map(|a| app_finding(UDID, &info, a)).collect();
+    out.push(device_finding(UDID, &info, usage, &apps));
+    out
 }
 
 /// Mirrors `src/scan/simulator.rs`: `kind:"runtime"` (identifier/version/

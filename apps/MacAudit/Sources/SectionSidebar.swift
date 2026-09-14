@@ -127,6 +127,7 @@ private struct SectionRow: View {
         case .ports: "network"
         case .git: "arrow.triangle.branch"
         case .simulator: "iphone"
+        case .ios: "iphone.gen3"
         case .sshKeys: "key"
         case .timeMachine: "clock.arrow.2.circlepath"
         }

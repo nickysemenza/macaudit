@@ -15,6 +15,8 @@ struct FindingInspector: View {
                         Text(f.detail).font(.callout).textSelection(.enabled)
                     }
                     facts(f)
+                    if let d = IosDeviceStorage(f) { iosStorage(d) }
+                    if let a = IosAppUsage(f) { iosApp(a) }
                     if !f.remedies.isEmpty { remedies(f) }
                     if let text = f.coverage { note("Coverage", text) }
                     if let text = f.provenance { note("Provenance", text) }
@@ -127,6 +129,62 @@ struct FindingInspector: View {
             Text("No radio selected: the batch runs every primary destructive remedy, else the first primary command.")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
+        }
+    }
+
+    /// The raw meta grid would print `capacity_bytes 246266159104`; this is
+    /// the same data with units and the one sentence each number needs.
+    private func iosStorage(_ d: IosDeviceStorage) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Storage").font(.headline)
+            Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 10, verticalSpacing: 3) {
+                let rows: [(String, String, String?)] = [
+                    ("Capacity", Formatting.bytes(d.capacityBytes), nil),
+                    ("Used", Formatting.bytes(d.usedBytes), "what Settings shows; includes purgeable"),
+                    ("Free", Formatting.bytes(d.freeBytes), nil),
+                    ("Purgeable", Formatting.bytes(d.purgeableBytes), "caches iOS frees on demand — Settings never shows this"),
+                    ("Committed", Formatting.bytes(d.committedBytes), "stays used after iOS purges everything it can"),
+                    ("Apps", "\(Formatting.bytes(d.appsBytes)) across \(d.appCount) apps", "bundle + data"),
+                    ("Not attributed", Formatting.bytes(d.unattributedBytes), "media, Messages, system, purgeable caches"),
+                ]
+                ForEach(rows, id: \.0) { label, value, hint in
+                    GridRow {
+                        Text(label).foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 0) {
+                            Text(value).monospacedDigit()
+                            if let hint { Text(hint).font(.caption2).foregroundStyle(.tertiary) }
+                        }
+                    }
+                }
+            }
+            .font(.callout)
+        }
+    }
+
+    private func iosApp(_ a: IosAppUsage) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Storage").font(.headline)
+            Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 10, verticalSpacing: 3) {
+                GridRow {
+                    Text("App").foregroundStyle(.secondary)
+                    Text(Formatting.bytes(a.staticBytes)).monospacedDigit()
+                }
+                GridRow {
+                    Text("Data").foregroundStyle(.secondary)
+                    Text(Formatting.bytes(a.dynamicBytes)).monospacedDigit()
+                }
+                GridRow {
+                    Text("Bundle ID").foregroundStyle(.secondary)
+                    Text(a.bundleId).textSelection(.enabled)
+                }
+                if let v = a.version {
+                    GridRow {
+                        Text("Version").foregroundStyle(.secondary)
+                        Text(v)
+                    }
+                }
+            }
+            .font(.callout)
         }
     }
 

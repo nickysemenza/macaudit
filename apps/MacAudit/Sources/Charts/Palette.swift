@@ -34,6 +34,11 @@ enum Palette {
         "Other": .gray,
         "Purgeable": .gray.opacity(0.6),
         "Free": .clear,
+        // iOS device storage bars.
+        "Apps": .blue,
+        "Not attributed": .gray,
+        "Committed": .indigo,
+        "app": .blue.opacity(0.55), "data": .blue,
         // Reclaimable breakdown.
         "Stale build artifacts": .orange,
         "Recent build artifacts": .orange.opacity(0.55),
