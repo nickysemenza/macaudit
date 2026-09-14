@@ -35,23 +35,24 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags, for git describe
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       - run: brew install xcodegen
 
-      # The tag names the version and must match Cargo.toml (package.sh
-      # checks); a manual run just packages whatever Cargo.toml says.
+      # The tag names the version (package.sh stamps it into the CLI and the
+      # app); a manual run packages under the nearest tag on the ref.
       - name: Compute version
         id: version
         run: |
           if [ "$GITHUB_REF_TYPE" = tag ]; then
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           else
-            cargo metadata --no-deps --format-version 1 \
-              | jq -r '.packages[] | select(.name == "macaudit") | "version=\(.version)"' \
-              >> "$GITHUB_OUTPUT"
+            tag=$(git describe --tags --abbrev=0)
+            echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
           fi
 
       # Imports the Developer ID Application cert+key into a temporary

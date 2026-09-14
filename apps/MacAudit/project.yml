@@ -22,12 +22,15 @@ settings:
     # still debugs because Xcode injects get-task-allow there.
     ENABLE_APP_SANDBOX: NO
     ENABLE_HARDENED_RUNTIME: YES
-    # Keep MARKETING_VERSION equal to `version` in the root Cargo.toml (the
-    # source of truth, and what `macaudit --version` prints): release.yml
-    # asserts the tag matches Cargo.toml and passes both settings on the
-    # xcodebuild command line, CURRENT_PROJECT_VERSION being the run number.
-    MARKETING_VERSION: "0.1.1"
+    # Floor only — the "Embed git version" post-build phase raises this to
+    # the nearest git tag, and scripts/package.sh passes the release tag
+    # explicitly on the xcodebuild line (CURRENT_PROJECT_VERSION being the CI
+    # run number). The tag is the source of truth; nothing here gets bumped.
+    MARKETING_VERSION: "0.0.0"
     CURRENT_PROJECT_VERSION: "1"
+    # scripts/embed-git-version.sh shells out to git and rewrites the built
+    # Info.plist, both of which the user-script sandbox blocks.
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
     # Sign with a real development certificate, not ad-hoc: TCC keys its
     # folder-access grants (Downloads, Desktop, ...) on the signing identity,
     # and an ad-hoc signature is just the binary's hash, so every rebuild
@@ -45,6 +48,10 @@ targets:
       - path: Sources
     dependencies:
       - package: MacAuditKit
+    postBuildScripts:
+      - name: Embed git version
+        script: '"${SRCROOT}/../../scripts/embed-git-version.sh"'
+        basedOnDependencyAnalysis: false
     info:
       path: Resources/Info.plist
       properties:

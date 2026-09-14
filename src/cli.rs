@@ -8,7 +8,7 @@ use crate::model::ScannerId;
 #[derive(Parser, Debug)]
 #[command(
     name = "macaudit",
-    version,
+    version = env!("MACAUDIT_VERSION"),
     about = "A 'why is my Mac like this' audit TUI"
 )]
 pub struct Cli {

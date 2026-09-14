@@ -402,19 +402,29 @@ confirm dialog is rebuilt so it can never reference a stale target.
 
 ## Cutting a release
 
-1. Bump `version` in `Cargo.toml` (what `macaudit --version` prints) and
-   `MARKETING_VERSION` in `apps/MacAudit/project.yml` to the same value.
-2. `git tag v0.1.0 && git push --tags`.
+```sh
+git tag v0.1.0 && git push --tags
+```
 
-That's it — [release.yml](.github/workflows/release.yml) builds the CLI and
-the app for arm64, signs both with the Developer ID certificate, notarizes
-them, staples the app, uploads `MacAudit-<version>.zip` (containing
-`MacAudit.app` and `macaudit` side by side) to a GitHub Release, and
-triggers `bump.yml` in the tap, which rewrites the cask's `version`/`sha256`
-with `brew bump-cask-pr`. The workflow refuses a tag that doesn't match
-`Cargo.toml`. Running it by hand from the Actions tab (workflow_dispatch)
-does everything except the release and the bump and uploads the zip as a
-workflow artifact — use that to prove the secrets work before tagging.
+That's it — there is no version to bump. The tag is the only version
+source: `version` in `Cargo.toml` and `MARKETING_VERSION` in
+`apps/MacAudit/project.yml` are `0.0.0` floors that
+[build.rs](build.rs) and
+[scripts/embed-git-version.sh](scripts/embed-git-version.sh) raise to the
+nearest git tag at build time (a dev build of the CLI reports the full
+`git describe`, e.g. `0.1.1-3-gabc1234-dirty`), and `scripts/package.sh`
+passes the release version explicitly to both, then checks that the built
+CLI and app report it.
+
+[release.yml](.github/workflows/release.yml) builds the CLI and the app for
+arm64, signs both with the Developer ID certificate, notarizes them, staples
+the app, uploads `MacAudit-<version>.zip` (containing `MacAudit.app` and
+`macaudit` side by side) to a GitHub Release, and triggers `bump.yml` in the
+tap, which rewrites the cask's `version`/`sha256` with `brew bump-cask-pr`.
+Running it by hand from the Actions tab (workflow_dispatch) does everything
+except the release and the bump, under the nearest tag's version, and
+uploads the zip as a workflow artifact — use that to prove the secrets work
+before tagging.
 
 The same two scripts run locally when the Developer ID certificate is in
 your keychain:

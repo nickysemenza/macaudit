@@ -59,7 +59,7 @@ impl ReqwestFetcher {
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(30))
-            .user_agent(concat!("macaudit/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("macaudit/", env!("MACAUDIT_VERSION")))
             .build()
             .expect("reqwest client construction cannot fail with static config");
         ReqwestFetcher { client }

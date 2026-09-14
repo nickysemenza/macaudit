@@ -3,7 +3,10 @@ members = ["crates/macaudit-ffi", "crates/uniffi-bindgen"]
 
 [package]
 name = "macaudit"
-version = "0.1.1"
+# Floor only — build.rs raises this to the nearest git tag (or to
+# MACAUDIT_VERSION, which scripts/package.sh sets from the release tag), so
+# `macaudit --version` follows the tag and this line never needs bumping.
+version = "0.0.0"
 edition = "2021"
 rust-version = "1.93"
 description = "A 'why is my Mac like this' audit TUI"

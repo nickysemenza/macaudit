@@ -33,14 +33,10 @@ cd "$(dirname "$0")/.."
 ROOT=$(pwd)
 case "$STAGE" in /*) ;; *) STAGE="$ROOT/$STAGE" ;; esac
 
-# The version lives in the root Cargo.toml (it is what `macaudit --version`
-# prints); the tag, MARKETING_VERSION and the cask URL must all agree.
-CARGO_VERSION=$(cargo metadata --no-deps --format-version 1 \
-  | jq -r '.packages[] | select(.name == "macaudit") | .version')
-if [ "$VERSION" != "$CARGO_VERSION" ]; then
-  echo "error: version $VERSION does not match Cargo.toml version $CARGO_VERSION" >&2
-  exit 1
-fi
+# The tag is the only version source: build.rs bakes MACAUDIT_VERSION into
+# `macaudit --version` and the User-Agent, and the xcodebuild line below
+# passes the same value as MARKETING_VERSION. Verified after the build.
+export MACAUDIT_VERSION="$VERSION"
 
 # Same floor as the app so the CLI runs on the same macOS versions.
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
