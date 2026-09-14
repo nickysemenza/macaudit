@@ -59,6 +59,12 @@ extension AuditStore {
         add("simulators", "Unused simulators",
             "Unavailable runtimes and devices Xcode no longer uses.",
             "iphone", .simulator, findings(in: .simulator).filter(reclaimable))
+        let heavy = findings(in: .ios)
+            .filter { $0.kind == .iosApp && $0.severity == .attention }
+            .sorted { (IosAppUsage($0)?.dynamicBytes ?? 0) > (IosAppUsage($1)?.dynamicBytes ?? 0) }
+        add("ios-data-heavy", "Data-heavy iPhone apps",
+            "Apps on the connected iPhone whose data dwarfs the app itself (offline downloads, caches). Clear it in Settings › General › iPhone Storage.",
+            "iphone.gen3", .ios, heavy, markable: false)
         add("time-machine", "Local Time Machine snapshots",
             "APFS snapshots macOS keeps on the internal disk between backups (Time Machine section).",
             "clock.arrow.2.circlepath", .timeMachine, findings(in: .timeMachine).filter(reclaimable))

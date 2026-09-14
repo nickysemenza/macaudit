@@ -31,6 +31,7 @@ pub enum SectionId {
     Ports,
     Git,
     Simulator,
+    Ios,
     SshKeys,
     TimeMachine,
 }
@@ -50,6 +51,7 @@ impl From<ScannerId> for SectionId {
             ScannerId::Ports => SectionId::Ports,
             ScannerId::Git => SectionId::Git,
             ScannerId::Simulator => SectionId::Simulator,
+            ScannerId::Ios => SectionId::Ios,
             ScannerId::SshKeys => SectionId::SshKeys,
             ScannerId::TimeMachine => SectionId::TimeMachine,
         }
@@ -71,6 +73,7 @@ impl From<SectionId> for ScannerId {
             SectionId::Ports => ScannerId::Ports,
             SectionId::Git => ScannerId::Git,
             SectionId::Simulator => ScannerId::Simulator,
+            SectionId::Ios => ScannerId::Ios,
             SectionId::SshKeys => ScannerId::SshKeys,
             SectionId::TimeMachine => ScannerId::TimeMachine,
         }
@@ -157,6 +160,8 @@ pub enum FindingKind {
     PortListener,
     GitRepo,
     Simulator,
+    IosDevice,
+    IosApp,
     SshKey,
     IosBackup,
     LocalSnapshot,
@@ -191,6 +196,8 @@ impl From<model::FindingKind> for FindingKind {
             K::PortListener => FindingKind::PortListener,
             K::GitRepo => FindingKind::GitRepo,
             K::Simulator => FindingKind::Simulator,
+            K::IosDevice => FindingKind::IosDevice,
+            K::IosApp => FindingKind::IosApp,
             K::SshKey => FindingKind::SshKey,
             K::IosBackup => FindingKind::IosBackup,
             K::LocalSnapshot => FindingKind::LocalSnapshot,

@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<array>
+	<dict>
+		<key>ApplicationType</key>
+		<string>User</string>
+		<key>CFBundleDisplayName</key>
+		<string>Spotify</string>
+		<key>CFBundleIdentifier</key>
+		<string>com.spotify.client</string>
+		<key>CFBundleName</key>
+		<string>Spotify</string>
+		<key>CFBundleShortVersionString</key>
+		<string>9.0.86</string>
+		<key>DynamicDiskUsage</key>
+		<integer>38290000000</integer>
+		<key>StaticDiskUsage</key>
+		<integer>260000000</integer>
+	</dict>
+	<dict>
+		<key>ApplicationType</key>
+		<string>User</string>
+		<key>CFBundleDisplayName</key>
+		<string>Big Game</string>
+		<key>CFBundleIdentifier</key>
+		<string>com.example.biggame</string>
+		<key>CFBundleName</key>
+		<string>BigGame</string>
+		<key>CFBundleShortVersionString</key>
+		<string>2.1</string>
+		<key>DynamicDiskUsage</key>
+		<integer>1500000000</integer>
+		<key>StaticDiskUsage</key>
+		<integer>3000000000</integer>
+	</dict>
+	<dict>
+		<key>ApplicationType</key>
+		<string>User</string>
+		<key>CFBundleIdentifier</key>
+		<string>com.example.nameless</string>
+		<key>CFBundleName</key>
+		<string>Nameless</string>
+		<key>DynamicDiskUsage</key>
+		<integer>1000</integer>
+		<key>StaticDiskUsage</key>
+		<integer>2000</integer>
+	</dict>
+	<dict>
+		<key>ApplicationType</key>
+		<string>System</string>
+		<key>CFBundleDisplayName</key>
+		<string>Notes</string>
+		<key>CFBundleIdentifier</key>
+		<string>com.apple.mobilenotes</string>
+		<key>CFBundleName</key>
+		<string>MobileNotes</string>
+		<key>CFBundleShortVersionString</key>
+		<string>4.11</string>
+		<key>DynamicDiskUsage</key>
+		<integer>1640000000</integer>
+		<key>StaticDiskUsage</key>
+		<integer>20000000</integer>
+	</dict>
+	<dict>
+		<key>ApplicationType</key>
+		<string>System</string>
+		<key>CFBundleIdentifier</key>
+		<string>com.apple.WebKit.Networking</string>
+		<key>CFBundleName</key>
+		<string>com.apple.WebKit.Networking</string>
+	</dict>
+</array>
+</plist>

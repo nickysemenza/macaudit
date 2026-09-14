@@ -7,6 +7,7 @@ final class TerminalWaiter: ScanListener, @unchecked Sendable {
     private let lock = NSLock()
     private var terminal = 0
     private var findingIds = Set<UInt64>()
+    private var byId: [UInt64: Finding] = [:]
     private let expected: Int
     private var continuation: CheckedContinuation<Void, Never>?
 
@@ -17,7 +18,10 @@ final class TerminalWaiter: ScanListener, @unchecked Sendable {
         defer { lock.unlock() }
         switch event {
         case .findings(_, _, let findings):
-            for f in findings { findingIds.insert(f.id) }
+            for f in findings {
+                findingIds.insert(f.id)
+                byId[f.id] = f
+            }
         case .sectionFinished, .sectionFailed:
             terminal += 1
             if terminal == expected, let c = continuation {
@@ -45,6 +49,12 @@ final class TerminalWaiter: ScanListener, @unchecked Sendable {
     var seen: Set<UInt64> {
         lock.lock(); defer { lock.unlock() }
         return findingIds
+    }
+
+    /// Latest version of every finding (re-emits upsert by id).
+    var findings: [Finding] {
+        lock.lock(); defer { lock.unlock() }
+        return Array(byId.values)
     }
 }
 
@@ -95,4 +105,23 @@ final class TerminalWaiter: ScanListener, @unchecked Sendable {
     #expect(m.has("n") == false)
     #expect(m.string("name") == "x")
     #expect(FindingMeta(json: "not json").isEmpty)
+}
+
+@Test func iosFixturesExposeTypedStorage() async throws {
+    let home = FileManager.default.temporaryDirectory.appendingPathComponent("macaudit-ios-\(UUID())")
+    let engine = try Engine(opts: EngineOptions(
+        homeOverride: home.path, fake: true, offline: true, rmMode: false))
+    let waiter = TerminalWaiter(expected: 1)
+    engine.startScan(sections: [.ios], listener: waiter)
+    await waiter.wait()
+    let findings = waiter.findings
+    let devices = findings.compactMap(IosDeviceStorage.init)
+    #expect(devices.count == 1)
+    let d = try #require(devices.first)
+    // Both tilings cover the whole capacity exactly.
+    #expect(d.appsBytes + d.unattributedBytes + d.freeBytes == d.capacityBytes)
+    #expect(d.committedBytes + d.purgeableBytes + d.freeBytes == d.capacityBytes)
+    let apps = findings.compactMap(IosAppUsage.init)
+    #expect(apps.count == d.appCount)
+    #expect(apps.contains { $0.bundleId == "com.spotify.client" && $0.dynamicBytes > $0.staticBytes * 4 })
 }

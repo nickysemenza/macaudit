@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>AmountDataAvailable</key>
+	<integer>19632939008</integer>
+	<key>AmountDataReserved</key>
+	<integer>209715200</integer>
+	<key>AmountRestoreAvailable</key>
+	<integer>28918992896</integer>
+	<key>CalculateDiskUsage</key>
+	<string>OkilyDokily</string>
+	<key>NANDInfo</key>
+	<data>
+	AQAAAAEAAAABAAAAAAAAgKUCAAA=
+	</data>
+	<key>TotalDataAvailable</key>
+	<integer>166055415808</integer>
+	<key>TotalDataCapacity</key>
+	<integer>246266159104</integer>
+	<key>TotalDiskCapacity</key>
+	<integer>256000000000</integer>
+	<key>TotalSystemAvailable</key>
+	<integer>0</integer>
+	<key>TotalSystemCapacity</key>
+	<integer>9076338688</integer>
+</dict>
+</plist>

@@ -38,6 +38,8 @@ struct SectionChartHeader: View {
         case .fs: f.diskCategory ?? f.group
         case .brew: f.brewInstallReason ?? f.group
         case .apps: f.appClassification ?? f.group
+        // Bars are per app, so a click must land on that app, not the device.
+        case .ios: f.kind == .iosApp ? f.title : f.group
         default: f.group
         }
     }
@@ -48,6 +50,7 @@ struct SectionChartHeader: View {
         case .fs: AnyView(diskCharts)
         case .brew: AnyView(brewCharts)
         case .apps: AnyView(appsCharts)
+        case .ios: iosCharts
         default: nil as AnyView?
         }
     }
@@ -141,5 +144,60 @@ struct SectionChartHeader: View {
             }
             Spacer()
         }
+    }
+
+    // MARK: iOS Devices
+
+    /// Nil when the section holds only status rows (no device, tools
+    /// missing) — the table row already says why.
+    private var iosCharts: AnyView? {
+        let devices = findings.compactMap(IosDeviceStorage.init).sorted { $0.name < $1.name }
+        guard !devices.isEmpty else { return nil }
+        let apps = findings.compactMap { f in IosAppUsage(f).map { (finding: f, usage: $0) } }
+        let titles = Dictionary(grouping: apps, by: \.finding.title)
+        let top = apps
+            .sorted { $0.usage.staticBytes + $0.usage.dynamicBytes > $1.usage.staticBytes + $1.usage.dynamicBytes }
+            .prefix(12)
+            .map { app -> BarRow in
+                // BarRow is keyed by name; two apps with one display name
+                // (e.g. across devices) would collapse into a single bar.
+                let name = (titles[app.finding.title]?.count ?? 1) > 1
+                    ? "\(app.finding.title) (\(app.usage.bundleId))" : app.finding.title
+                return BarRow(name: name, parts: [("app", Double(app.usage.staticBytes)), ("data", Double(app.usage.dynamicBytes))])
+            }
+        return AnyView(HStack(alignment: .top, spacing: 24) {
+            VStack(alignment: .leading, spacing: 14) {
+                ForEach(devices, id: \.udid) { d in
+                    VStack(alignment: .leading, spacing: 6) {
+                        // The trailing "free" label vanishes when free space is
+                        // a sliver of the bar, so the number lives up here too.
+                        Text("\(d.name) · \(Formatting.bytes(d.capacityBytes)) · \(Formatting.bytes(d.freeBytes)) free")
+                            .font(.subheadline.weight(.semibold))
+                        // Two exact tilings of the capacity. Apps and purgeable
+                        // never share a bar: app data overlaps purgeable.
+                        Text("Where it is").font(.caption).foregroundStyle(.secondary)
+                        SegmentedBar(
+                            segments: [BarSegment(name: "Apps", bytes: d.appsBytes),
+                                       BarSegment(name: "Not attributed", bytes: d.unattributedBytes)],
+                            capacity: d.capacityBytes,
+                            trailingLabel: "\(Formatting.bytes(d.freeBytes)) free")
+                        Text("What iOS can free on its own").font(.caption).foregroundStyle(.secondary)
+                        SegmentedBar(
+                            segments: [BarSegment(name: "Committed", bytes: d.committedBytes),
+                                       BarSegment(name: "Purgeable", bytes: d.purgeableBytes)],
+                            capacity: d.capacityBytes,
+                            trailingLabel: "\(Formatting.bytes(d.freeBytes)) free")
+                    }
+                }
+            }
+            .frame(maxWidth: 420)
+            if !top.isEmpty {
+                BarBreakdown(rows: Array(top), title: "Largest apps (light = app, dark = data)",
+                             format: { Formatting.bytes(UInt64($0)) },
+                             partColor: { label, _ in Palette.color(for: label) },
+                             selected: $selectedGroup)
+                    .frame(maxWidth: .infinity)
+            }
+        })
     }
 }

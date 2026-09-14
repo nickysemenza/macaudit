@@ -209,3 +209,71 @@ extension Finding {
         kind == .app && meta.bool("rosetta_or_intel_only") == true
     }
 }
+
+// MARK: - iOS Devices
+
+/// The storage numbers on one USB-connected iPhone/iPad (`IosDevice`
+/// findings with numbers; status rows — no device, tools missing — carry
+/// none and produce nil). All from `ideviceinfo -q com.apple.disk_usage`.
+///
+/// Two consistent tilings of `capacityBytes`, never mixed: apps + unattributed
+/// + free (where the bytes are), and committed + purgeable + free (what iOS
+/// can free on its own). App data overlaps purgeable by an unknown amount,
+/// which is why "apps" and "purgeable" must not share a bar.
+public struct IosDeviceStorage: Sendable {
+    public let name: String
+    public let productType: String
+    public let iosVersion: String
+    public let udid: String
+    public let capacityBytes: UInt64
+    public let usedBytes: UInt64
+    public let freeBytes: UInt64
+    /// What iOS could free on demand beyond `freeBytes`.
+    public let purgeableBytes: UInt64
+    /// Stays used after iOS purges everything it can.
+    public let committedBytes: UInt64
+    public let appsBytes: UInt64
+    public let appCount: Int
+    /// Media, Messages, system, purgeable caches — what USB can't split.
+    public let unattributedBytes: UInt64
+
+    public init?(_ f: Finding) {
+        let m = f.meta
+        guard f.kind == .iosDevice, let cap = m.uint64("capacity_bytes"), let used = m.uint64("used_bytes")
+        else { return nil }
+        name = m.string("device") ?? f.title
+        productType = m.string("product_type") ?? ""
+        iosVersion = m.string("ios_version") ?? ""
+        udid = m.string("udid") ?? ""
+        capacityBytes = cap
+        usedBytes = used
+        freeBytes = m.uint64("free_bytes") ?? cap - min(cap, used)
+        purgeableBytes = m.uint64("purgeable_bytes") ?? 0
+        committedBytes = m.uint64("committed_bytes") ?? used
+        appsBytes = m.uint64("apps_bytes") ?? 0
+        appCount = Int(m.uint64("app_count") ?? 0)
+        unattributedBytes = m.uint64("unattributed_bytes") ?? used - min(used, appsBytes)
+    }
+}
+
+/// One app on a connected iOS device: bundle size vs. its data.
+public struct IosAppUsage: Sendable {
+    public let bundleId: String
+    public let device: String
+    /// `User` or `System`.
+    public let appType: String
+    public let version: String?
+    public let staticBytes: UInt64
+    public let dynamicBytes: UInt64
+
+    public init?(_ f: Finding) {
+        let m = f.meta
+        guard f.kind == .iosApp, let bundleId = m.string("bundle_id") else { return nil }
+        self.bundleId = bundleId
+        device = m.string("device") ?? ""
+        appType = m.string("app_type") ?? "User"
+        version = m.string("app_version")
+        staticBytes = m.uint64("static_bytes") ?? 0
+        dynamicBytes = m.uint64("dynamic_bytes") ?? 0
+    }
+}
