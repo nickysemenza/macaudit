@@ -1,0 +1,124 @@
+name: Release
+
+# Tag pushes (v0.1.0) build the CLI and the app, sign both with the
+# Developer ID certificate, notarize them (scripts/package.sh and
+# scripts/notarize.sh — the same scripts run locally), attach the zip to a
+# GitHub Release, and bump the cask in nickysemenza/homebrew-tap. A manual
+# run (workflow_dispatch) does everything up to the zip and uploads it as a
+# workflow artifact only — the dry run to verify the secrets before the
+# first tag. Requires six repo secrets (README.md § Release signing):
+#   DEVELOPER_ID_P12_BASE64      base64 of the exported .p12 (cert + key)
+#   DEVELOPER_ID_P12_PASSWORD    that .p12's export password
+#   APP_STORE_CONNECT_API_KEY_P8 contents of the notary API key's .p8
+#   APP_STORE_CONNECT_KEY_ID     that key's ID
+#   APP_STORE_CONNECT_ISSUER_ID  the API key's issuer ID
+#   HOMEBREW_TAP_TOKEN           fine-grained PAT, Actions read/write on
+#                                nickysemenza/homebrew-tap only
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# cancel-in-progress is deliberately false: notarization runs inside this
+# job, and killing it mid-flight would leave the tag's release build
+# half-notarized with no automatic retry.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build, sign, notarize, publish
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: brew install xcodegen
+
+      # The tag names the version and must match Cargo.toml (package.sh
+      # checks); a manual run just packages whatever Cargo.toml says.
+      - name: Compute version
+        id: version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            cargo metadata --no-deps --format-version 1 \
+              | jq -r '.packages[] | select(.name == "macaudit") | "version=\(.version)"' \
+              >> "$GITHUB_OUTPUT"
+          fi
+
+      # Imports the Developer ID Application cert+key into a temporary
+      # keychain for this run; the action deletes that keychain in its
+      # post-step regardless of how the job ends. Pinned to a full commit SHA
+      # (not the mutable `v7` tag) since this action handles the signing
+      # certificate secret.
+      - uses: apple-actions/import-codesign-certs@5142e029c445c10ffc7149d172e540235a065466 # v7
+        with:
+          p12-file-base64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          p12-password: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+
+      - name: Build and sign
+        run: scripts/package.sh "$VERSION" build/dist
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          BUILD_NUMBER: ${{ github.run_number }}
+
+      - name: Write notary API key
+        # Written from an `env:` var, never inlined in the script, so the key
+        # material never appears in the run log even under debug logging.
+        run: printf '%s' "$API_KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
+        env:
+          API_KEY_P8: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
+
+      - name: Notarize and staple
+        run: scripts/notarize.sh build/dist "MacAudit-$VERSION.zip"
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          NOTARY_KEY_PATH: ${{ runner.temp }}/AuthKey.p8
+          NOTARY_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+
+      - name: Remove notary API key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/AuthKey.p8"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MacAudit-${{ steps.version.outputs.version }}
+          path: MacAudit-${{ steps.version.outputs.version }}.zip
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: github.ref_type == 'tag'
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "MacAudit ${GITHUB_REF_NAME#v}" \
+            --generate-notes \
+            "MacAudit-${GITHUB_REF_NAME#v}.zip"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      # The cask lives in nickysemenza/homebrew-tap so `brew install --cask
+      # nickysemenza/tap/macaudit` works cold and main here never receives a
+      # post-release commit. The tap's bump.yml does the real work with
+      # Homebrew's own `brew bump-cask-pr` (downloads the zip just published,
+      # rewrites version/sha256, audits, commits, pushes); this step only
+      # kicks it off, so it needs a token with Actions: write on the tap and
+      # nothing else. Fire-and-forget: a failed bump shows up in the tap's
+      # Actions tab and can be re-run there by hand.
+      - name: Bump the cask in nickysemenza/homebrew-tap
+        if: github.ref_type == 'tag'
+        run: |
+          gh workflow run bump.yml \
+            --repo nickysemenza/homebrew-tap \
+            --field cask=macaudit \
+            --field "version=${GITHUB_REF_NAME#v}"
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
