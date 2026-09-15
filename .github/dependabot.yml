@@ -1,0 +1,18 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+
+  # swift/MacAuditKit currently has no external SwiftPM dependencies (only a
+  # local MacAuditFFI binary target), so this is a no-op until it gains one.
+  - package-ecosystem: swift
+    directory: "/swift/MacAuditKit"
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
