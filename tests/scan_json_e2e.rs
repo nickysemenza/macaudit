@@ -42,6 +42,16 @@ fn build_fixture_home() -> tempfile::TempDir {
         .status();
     std::fs::write(repo.join("README.md"), "# repo\n").unwrap();
 
+    // A project under ~/dev — this is what makes the "Development" disk
+    // category (~/dev) exist for this fixture, so `disk_category` findings
+    // are actually emitted. No `node_modules` here (that would add a second
+    // build-artifact hit and break `scan_json_finds_node_modules_artifact`'s
+    // "exactly one" assertion) — just a couple of plain source files.
+    let dev_proj = root.join("dev/proj");
+    std::fs::create_dir_all(&dev_proj).unwrap();
+    std::fs::write(dev_proj.join("package.json"), r#"{"name":"proj"}"#).unwrap();
+    std::fs::write(dev_proj.join("main.js"), "console.log(2)\n").unwrap();
+
     home
 }
 
@@ -101,6 +111,28 @@ fn scan_json_finds_node_modules_artifact() {
         .map(|rs| rs.iter().any(|r| r["command"]["type"] == "trash"))
         .unwrap_or(false);
     assert!(has_trash, "node_modules finding should have a Trash remedy");
+}
+
+#[test]
+fn scan_json_disk_categories_are_complete() {
+    let home = build_fixture_home();
+    let findings = run_scan_json(home.path());
+
+    let categories: Vec<&Value> = findings
+        .iter()
+        .filter(|f| f["kind"] == "disk_category")
+        .collect();
+
+    assert!(
+        !categories.is_empty(),
+        "expected at least one disk_category finding, got findings: {findings:#?}"
+    );
+    for c in &categories {
+        assert_eq!(
+            c["meta"]["complete"], true,
+            "disk_category finding should be complete in this fixture: {c:#?}"
+        );
+    }
 }
 
 #[test]

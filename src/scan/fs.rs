@@ -1309,6 +1309,7 @@ mod tests {
     use crate::scan::pipe::repo_channel;
     use std::collections::HashMap;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
@@ -1722,11 +1723,16 @@ mod tests {
         );
     }
 
-    /// `ctx_for` with a ~100-byte large-file threshold so small fixtures count.
+    /// `ctx_for` with a tiny large-file threshold so small fixtures count as
+    /// "large" without multi-GB files. 16 KiB: well below `big_file`'s 64 KiB
+    /// (still triggers every existing "is this reported as large" check) but
+    /// above a single filesystem block (4 KiB on APFS), so a one- or
+    /// two-block loose file can sit *below* it — see
+    /// `largest_files_group_excludes_threshold_files`.
     fn ctx_tiny_threshold(home: &Path) -> (ScanCtx, mpsc::Receiver<ScanEvent>) {
         let (mut ctx, rx, _) = ctx_for(home, false, false, vec![]);
         let mut config = (*ctx.config).clone();
-        config.scan.large_file_threshold_gb = 1e-7;
+        config.scan.large_file_threshold_gb = 16384.0 / (1024.0 * 1024.0 * 1024.0);
         ctx.config = Arc::new(config);
         (ctx, rx)
     }
@@ -1860,5 +1866,398 @@ mod tests {
             f.remedies[1].command,
             RemedyCommand::RevealInFinder { .. }
         ));
+    }
+
+    /// Restores a set of paths' permissions to `0o755` on drop, including on
+    /// panic/unwind, so a failed assertion never leaves a chmod-000 directory
+    /// behind for the rest of the test suite (or a later `tempdir` cleanup)
+    /// to trip over.
+    struct PermRestoreGuard(Vec<PathBuf>);
+    impl Drop for PermRestoreGuard {
+        fn drop(&mut self) {
+            for p in &self.0 {
+                let _ = fs::set_permissions(p, fs::Permissions::from_mode(0o755));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn categories_are_exact_and_complete() {
+        let home = tempfile::tempdir().unwrap();
+        let docs = home.path().join("Documents");
+        fs::create_dir_all(docs.join("a/b")).unwrap();
+        fs::create_dir_all(docs.join("c")).unwrap();
+        fs::write(docs.join("a/b/f1"), vec![0u8; 4096]).unwrap();
+        fs::write(docs.join("c/f2"), vec![0u8; 4096]).unwrap();
+        fs::write(docs.join("f3"), vec![0u8; 4096]).unwrap();
+
+        let (ctx, rx, _) = ctx_for(home.path(), false, false, vec![]);
+        FsScanner.scan(ctx).await.unwrap();
+        let findings = drain(rx);
+
+        let cats: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.kind == FindingKind::DiskCategory && f.title == "Documents")
+            .collect();
+        assert_eq!(cats.len(), 1, "{cats:?}");
+        let f = cats[0];
+        let expected = crate::scan::sizing::du_blocks(&docs, &|| false);
+        assert_eq!(f.size_bytes, Some(expected));
+        assert_eq!(f.meta["complete"], true);
+        assert_eq!(f.meta["errors"], 0);
+        assert_eq!(f.meta["files"], 3);
+        assert_eq!(f.severity, Severity::Info);
+        assert!(f
+            .coverage
+            .as_deref()
+            .unwrap()
+            .starts_with("Measured exactly"));
+    }
+
+    #[tokio::test]
+    async fn category_with_unreadable_subdir_is_flagged_partial() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root reads everything; the permission bits are moot.
+        }
+        let home = tempfile::tempdir().unwrap();
+        let docs = home.path().join("Documents");
+        fs::create_dir_all(&docs).unwrap();
+        // Plenty of readable entries: one unreadable folder among ~150
+        // entries is under the 1%-of-entries tolerance, not just under the
+        // absolute `PARTIAL_ATTENTION_DIRS` cap.
+        for i in 0..150 {
+            fs::write(docs.join(format!("f{i}")), vec![0u8; 128]).unwrap();
+        }
+        let locked = docs.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("secret"), vec![0u8; 4096]).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let _guard = PermRestoreGuard(vec![locked.clone()]);
+
+        let (ctx, rx, _) = ctx_for(home.path(), false, false, vec![]);
+        FsScanner.scan(ctx).await.unwrap();
+        let findings = drain(rx);
+
+        let f = findings
+            .iter()
+            .find(|f| f.kind == FindingKind::DiskCategory && f.title == "Documents")
+            .expect("Documents category");
+        assert_eq!(f.meta["complete"], false);
+        assert_eq!(f.meta["errors"], 1);
+        // One unreadable folder is under the tolerant threshold.
+        assert_eq!(f.severity, Severity::Info);
+        assert!(f.coverage.as_deref().unwrap().contains("Full Disk Access"));
+    }
+
+    #[tokio::test]
+    async fn category_flagged_attention_when_many_dirs_unreadable() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root reads everything; the permission bits are moot.
+        }
+        let home = tempfile::tempdir().unwrap();
+        let docs = home.path().join("Documents");
+        fs::create_dir_all(&docs).unwrap();
+        let mut locked_dirs = Vec::new();
+        for i in 0..30 {
+            let d = docs.join(format!("locked{i}"));
+            fs::create_dir_all(&d).unwrap();
+            fs::set_permissions(&d, fs::Permissions::from_mode(0o000)).unwrap();
+            locked_dirs.push(d);
+        }
+        let _guard = PermRestoreGuard(locked_dirs);
+
+        let (ctx, rx, _) = ctx_for(home.path(), false, false, vec![]);
+        FsScanner.scan(ctx).await.unwrap();
+        let findings = drain(rx);
+
+        let f = findings
+            .iter()
+            .find(|f| f.kind == FindingKind::DiskCategory && f.title == "Documents")
+            .expect("Documents category");
+        assert_eq!(f.severity, Severity::Attention);
+    }
+
+    #[tokio::test]
+    async fn library_contents_are_sized_but_yield_no_artifacts() {
+        let home = tempfile::tempdir().unwrap();
+        let weird = home.path().join("Library/Caches/weird");
+        fs::create_dir_all(weird.join("node_modules")).unwrap();
+        fs::write(weird.join("package.json"), "{}").unwrap();
+        fs::write(weird.join("blob"), vec![0u8; 8192]).unwrap();
+
+        let (ctx, rx, _) = ctx_for(home.path(), false, false, vec![]);
+        FsScanner.scan(ctx).await.unwrap();
+        let findings = drain(rx);
+
+        assert!(
+            !findings.iter().any(|f| f.kind == FindingKind::BuildArtifact
+                && f.path.as_deref() == Some(weird.join("node_modules").as_path())),
+            "nothing under ~/Library may become an artifact finding: {findings:?}"
+        );
+        let cache = findings
+            .iter()
+            .find(|f| f.kind == FindingKind::DiskCategory && f.title == "App caches")
+            .expect("App caches category");
+        assert!(cache.size_bytes.unwrap() >= 8192);
+        assert_eq!(cache.meta["complete"], true);
+    }
+
+    #[tokio::test]
+    async fn discovery_only_skips_library_and_artifacts() {
+        let home = tempfile::tempdir().unwrap();
+        let proj = home.path().join("proj");
+        fs::create_dir_all(proj.join(".git")).unwrap();
+        let proj2 = home.path().join("proj2");
+        fs::create_dir_all(proj2.join("node_modules")).unwrap();
+        fs::write(proj2.join("package.json"), "{}").unwrap();
+        fs::create_dir_all(home.path().join("Library/x/.git")).unwrap();
+
+        let (ctx, mut rx, repo_rx) = ctx_for(home.path(), true, true, vec![]);
+        FsScanner.scan(ctx).await.unwrap();
+
+        let mut repo_rx = repo_rx.unwrap();
+        let mut roots = Vec::new();
+        while let Ok(d) = repo_rx.try_recv() {
+            roots.push(d.root);
+        }
+        assert_eq!(roots, vec![proj]);
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert_eq!(
+            events.len(),
+            0,
+            "discovery-only must emit no events at all (no findings, no Progress, no DirTree)"
+        );
+    }
+
+    #[tokio::test]
+    async fn largest_files_group_excludes_threshold_files() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("stuff");
+        // Above the (tiny) threshold: a real "Large files" candidate.
+        let huge = dir.join("huge.bin");
+        big_file(&huge);
+        // Below the threshold: one and two filesystem blocks respectively,
+        // both non-zero, neither ever offered as a "large" file.
+        let medium = dir.join("medium.bin");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&medium, vec![0u8; 8192]).unwrap();
+        let small = dir.join("small.bin");
+        fs::write(&small, vec![0u8; 4096]).unwrap();
+
+        let (ctx, rx) = ctx_tiny_threshold(home.path());
+        FsScanner.scan(ctx).await.unwrap();
+        let findings = drain(rx);
+
+        let large: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.kind == FindingKind::LargeFile && f.meta["group"] == "Large files")
+            .collect();
+        assert_eq!(
+            large
+                .iter()
+                .filter(|f| f.path.as_deref() == Some(huge.as_path()))
+                .count(),
+            1,
+            "{large:?}"
+        );
+        assert_eq!(large[0].severity, Severity::Attention);
+        assert!(matches!(
+            large[0].remedies[0].command,
+            RemedyCommand::Trash { .. }
+        ));
+        assert!(!findings.iter().any(
+            |f| f.meta["group"] == "Largest files" && f.path.as_deref() == Some(huge.as_path())
+        ));
+
+        let largest: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.meta["group"] == "Largest files")
+            .collect();
+        assert!(
+            largest
+                .iter()
+                .all(|f| f.id != FindingId::new(FindingKind::LargeFile, &huge.to_string_lossy())),
+            "the over-threshold file must never appear in Largest files: {largest:?}"
+        );
+        let medium_f = largest
+            .iter()
+            .find(|f| f.path.as_deref() == Some(medium.as_path()))
+            .expect("medium file in Largest files");
+        let small_f = largest
+            .iter()
+            .find(|f| f.path.as_deref() == Some(small.as_path()))
+            .expect("small file in Largest files");
+        assert_eq!(medium_f.severity, Severity::Info);
+        assert_eq!(small_f.severity, Severity::Info);
+        assert!(medium_f.title.starts_with("Largest — "));
+        assert!(small_f.title.starts_with("Largest — "));
+        assert_eq!(medium_f.meta["rank"], 1);
+        assert_eq!(small_f.meta["rank"], 2);
+        assert_eq!(medium_f.remedies.len(), 1);
+        assert_eq!(small_f.remedies.len(), 1);
+        assert!(matches!(
+            medium_f.remedies[0].command,
+            RemedyCommand::RevealInFinder { .. }
+        ));
+        assert!(matches!(
+            small_f.remedies[0].command,
+            RemedyCommand::RevealInFinder { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn git_internals_are_not_loose_large_files_but_count_in_categories() {
+        let home = tempfile::tempdir().unwrap();
+        let pack = home
+            .path()
+            .join("Documents/repo/.git/objects/pack/big.pack");
+        big_file(&pack);
+
+        let (ctx, rx) = ctx_tiny_threshold(home.path());
+        FsScanner.scan(ctx).await.unwrap();
+        let findings = drain(rx);
+
+        // `.git` internals are NOT_LOOSE (never a threshold "Large files"
+        // finding) but not NO_TOP, so the pack may still legitimately show up
+        // in the unrelated "Largest files" context group — only the
+        // threshold-based classification is excluded here.
+        assert!(
+            !findings.iter().any(|f| f.kind == FindingKind::LargeFile
+                && f.meta["group"] == "Large files"
+                && f.path.as_deref() == Some(pack.as_path())),
+            "git pack internals must never be a loose large file: {findings:?}"
+        );
+        let docs = findings
+            .iter()
+            .find(|f| f.kind == FindingKind::DiskCategory && f.title == "Documents")
+            .expect("Documents category");
+        assert!(docs.size_bytes.unwrap() >= 64 * 1024);
+    }
+
+    #[tokio::test]
+    async fn progress_events_are_emitted_for_fs() {
+        let home = tempfile::tempdir().unwrap();
+        fs::write(home.path().join("f"), vec![0u8; 4096]).unwrap();
+
+        let (ctx, mut rx, _) = ctx_for(home.path(), false, false, vec![]);
+        FsScanner.scan(ctx).await.unwrap();
+
+        let mut found = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let ScanEvent::Progress { scanner, msg, .. } = &ev {
+                if *scanner == ScannerId::Fs && msg.starts_with("Indexed ") {
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "expected a final 'Indexed ...' progress summary");
+    }
+
+    #[tokio::test]
+    async fn dir_tree_event_carries_root_totals() {
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir_all(home.path().join("Documents")).unwrap();
+        fs::write(home.path().join("Documents/f"), vec![0u8; 4096]).unwrap();
+
+        let (ctx, mut rx, _) = ctx_for(home.path(), false, false, vec![]);
+        FsScanner.scan(ctx).await.unwrap();
+
+        let mut trees = Vec::new();
+        let mut findings = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                ScanEvent::DirTree { tree, .. } => trees.push(tree),
+                ScanEvent::Finding { finding, .. } => findings.push(*finding),
+                _ => {}
+            }
+        }
+        assert_eq!(trees.len(), 1, "{trees:?}");
+        let tree = &trees[0];
+        let cat_sum: u64 = findings
+            .iter()
+            .filter(|f| f.kind == FindingKind::DiskCategory)
+            .map(|f| f.size_bytes.unwrap_or(0))
+            .sum();
+        assert!(tree.node.alloc >= cat_sum);
+        assert!(tree.complete);
+        assert!(tree
+            .node
+            .find(&tree.root, &home.path().join("Documents"))
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn fixed_target_per_subdir_reads_children_from_tree() {
+        let home = tempfile::tempdir().unwrap();
+        let caches = home.path().join("Library/Caches");
+        fs::create_dir_all(caches.join("a")).unwrap();
+        fs::create_dir_all(caches.join("b")).unwrap();
+        fs::write(caches.join("a/f1"), vec![0u8; 4096]).unwrap();
+        fs::write(caches.join("b/f2"), vec![0u8; 8192]).unwrap();
+
+        let (ctx, rx, _) = ctx_for(home.path(), false, false, vec![]);
+        FsScanner.scan(ctx).await.unwrap();
+        let findings = drain(rx);
+
+        let cache_findings: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.kind == FindingKind::CacheDir)
+            .collect();
+        let a = cache_findings
+            .iter()
+            .find(|f| f.path.as_deref() == Some(caches.join("a").as_path()))
+            .expect("a cache dir");
+        let b = cache_findings
+            .iter()
+            .find(|f| f.path.as_deref() == Some(caches.join("b").as_path()))
+            .expect("b cache dir");
+        assert_eq!(
+            a.size_bytes,
+            Some(crate::scan::sizing::du_blocks(&caches.join("a"), &|| false))
+        );
+        assert_eq!(
+            b.size_bytes,
+            Some(crate::scan::sizing::du_blocks(&caches.join("b"), &|| false))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_scan_emits_nothing_after_the_walk() {
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir_all(home.path().join("Documents")).unwrap();
+        fs::write(home.path().join("Documents/f"), vec![0u8; 4096]).unwrap();
+
+        let (ctx, mut rx, _) = ctx_for(home.path(), false, false, vec![]);
+        ctx.token.cancel();
+        FsScanner.scan(ctx).await.unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ScanEvent::DirTree { .. })),
+            "cancelled scan must not emit DirTree: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                ScanEvent::Finding { finding, .. } if finding.kind == FindingKind::DiskCategory
+            )),
+            "cancelled scan must not emit DiskCategory findings: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                ScanEvent::Finding { finding, .. } if finding.meta["group"] == "Largest files"
+            )),
+            "cancelled scan must not emit Largest files findings: {events:?}"
+        );
     }
 }

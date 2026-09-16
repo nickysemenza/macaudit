@@ -1041,9 +1041,10 @@ pub fn dir_tree() -> DirTree {
                         &[("backup-2019.tar.gz", 18 * GIB + 100 * MIB)],
                         vec![],
                     ),
+                    // Brings ~/dev to the 45.2 GiB the Development category reports.
+                    dir("old-projects", &[], vec![]).with_alloc(13 * GIB + 200 * MIB, 9_000),
                 ],
-            )
-            .with_alloc(45 * GIB + 200 * MIB, 16_210),
+            ),
             dir(
                 "Library",
                 &[],
