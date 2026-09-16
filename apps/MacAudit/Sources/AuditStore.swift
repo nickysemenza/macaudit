@@ -105,8 +105,11 @@ final class AuditStore {
 
     /// Findings from the fs section whose path is under (or equal to) `path`
     /// — used by the Folders inspector to scope findings to a directory.
+    /// Disk findings at or below `path`, largest first.
     func fsFindings(under path: String) -> [Finding] {
-        findings(in: .fs).filter { $0.path?.hasPrefix(path) == true }
+        findings(in: .fs)
+            .filter { $0.path?.hasPrefix(path) == true }
+            .sorted { ($0.sizeBytes ?? 0) > ($1.sizeBytes ?? 0) }
     }
 
     /// `findings(in:)` narrowed by `searchText`.
