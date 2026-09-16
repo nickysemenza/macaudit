@@ -162,18 +162,19 @@ fn draw_sources(app: &AppState, frame: &mut Frame, area: Rect, vp: &mut Viewport
             )),
         ]));
     }
-    let categories: Vec<&Finding> = app
-        .overview_findings(ScannerId::Fs)
-        .into_iter()
-        .filter(|f| f.kind == FindingKind::DiskCategory)
-        .collect();
+    let categories = app.disk_categories();
     if !categories.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "Disk categories",
             Style::default().add_modifier(Modifier::BOLD),
         )));
-        for category in categories.into_iter().take(6) {
+        let base = lines.len() as u16;
+        for (i, category) in categories.into_iter().take(6).enumerate() {
+            vp.push(
+                Rect::new(area.x, area.y + base + i as u16, area.width, 1),
+                Hit::OverviewCategory(i),
+            );
             // Exact unless folders were unreadable; only then say so.
             let note = match category.meta.get("complete").and_then(|v| v.as_bool()) {
                 Some(false) => " (partial)",

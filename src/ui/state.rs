@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use crate::config::DeleteMode;
-use crate::model::{Finding, FindingId, ScanEvent, ScannerId, Severity};
+use crate::model::{Finding, FindingId, FindingKind, ScanEvent, ScannerId, Severity};
 use crate::ui::app::{AppState, SectionStatus};
 
 pub use crate::correlate::CORRELATED_SECTIONS;
@@ -265,6 +265,16 @@ impl AppState {
             .get(&id)
             .map(|m| m.values().collect())
             .unwrap_or_default()
+    }
+
+    /// The Disk section's `DiskCategory` findings, in their section order —
+    /// the source for both the Overview's "Disk categories" list and its
+    /// click-to-Browse indices (`Hit::OverviewCategory`).
+    pub(crate) fn disk_categories(&self) -> Vec<&Finding> {
+        self.overview_findings(ScannerId::Fs)
+            .into_iter()
+            .filter(|f| f.kind == FindingKind::DiskCategory)
+            .collect()
     }
 
     pub(crate) fn marked_total(&self) -> (usize, u64) {

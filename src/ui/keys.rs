@@ -44,6 +44,10 @@ pub enum Action {
     /// Sort by a column, flipping direction if it's already active (header
     /// click).
     SortBy(ColumnId),
+    /// Open Browse mode at a Disk category's path (Overview click on the
+    /// "Disk categories" list — there is no keyboard equivalent since the
+    /// Overview has no row cursor).
+    OpenBrowseCategory(usize),
 }
 
 /// Map a key event to an action (`None` if unbound/unhandled, e.g. key-release

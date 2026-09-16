@@ -42,6 +42,13 @@ const BINDINGS: &[(&str, &str)] = &[
     ("H", "toggle System apps visibility"),
     ("?", "toggle this help"),
     ("q", "quit"),
+    ("", "Folders"),
+    ("b", "browse the Disk tree (also: enter on a Disk category)"),
+    ("⏎ / →, l", "open the folder under the cursor"),
+    ("⌫ / ←, h", "go up a folder"),
+    ("s", "toggle sort: size / name"),
+    ("p", "show / hide detail pane"),
+    ("esc / q / b", "back to Normal (never quits)"),
 ];
 
 pub fn draw(frame: &mut Frame, area: Rect) {
@@ -56,6 +63,16 @@ pub fn draw(frame: &mut Frame, area: Rect) {
         Line::from(""),
     ];
     for (key, desc) in BINDINGS {
+        if key.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                *desc,
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(Color::Cyan),
+            )));
+            continue;
+        }
         lines.push(Line::from(vec![
             Span::styled(format!("  {key:<30}"), Style::default().fg(Color::Yellow)),
             Span::raw(*desc),

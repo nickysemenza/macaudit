@@ -10,6 +10,7 @@ pub mod keys;
 pub mod theme;
 
 mod activity;
+mod browse;
 mod cleanup_view;
 mod confirm;
 mod deps;
