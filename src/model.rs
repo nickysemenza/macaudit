@@ -8,12 +8,12 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 
 /// Stable identity for a Finding across runs — a hash of (kind tag, canonical
-/// key). This is what makes snapshot diffing (§8) work: the same
-/// artifact/app/daemon must produce the same id every scan, INCLUDING across
-/// macaudit rebuilds with different Rust toolchains — which is why this uses a
-/// pinned FNV-1a implementation rather than `DefaultHasher` (whose algorithm is
-/// deliberately unspecified between releases). Changing this function is a
-/// snapshot-format break: every stored finding would diff as removed+added.
+/// key). The same artifact/app/daemon must produce the same id every scan,
+/// INCLUDING across macaudit rebuilds with different Rust toolchains — which
+/// is why this uses a pinned FNV-1a implementation rather than
+/// `DefaultHasher` (whose algorithm is deliberately unspecified between
+/// releases). Changing this function changes every finding's identity across
+/// runs — do not do so without a deliberate migration decision.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Debug)]
 pub struct FindingId(pub u64);
 
@@ -194,9 +194,9 @@ pub enum FindingKind {
 
 impl FindingKind {
     /// The scanner that produces this kind of finding. Every kind maps to
-    /// exactly one section — used to bucket snapshot findings back into sidebar
-    /// sections for Δ badges (a stored `Finding` carries its kind, not its
-    /// originating `ScannerId`).
+    /// exactly one section — used to bucket a `Finding` back into its sidebar
+    /// section (a `Finding` carries its kind, not its originating
+    /// `ScannerId`).
     pub fn scanner(self) -> ScannerId {
         match self {
             FindingKind::SystemMetric | FindingKind::ProcessResource => ScannerId::System,
@@ -263,7 +263,7 @@ impl FindingKind {
         FindingKind::TmPurgeable,
     ];
 
-    /// Inverse of `tag()` — how the snapshot store's `kind` column maps back.
+    /// Inverse of `tag()` — parses a persisted `kind` string back to its enum.
     pub fn from_tag(tag: &str) -> Option<FindingKind> {
         FindingKind::ALL.iter().copied().find(|k| k.tag() == tag)
     }
@@ -303,17 +303,6 @@ impl FindingKind {
             FindingKind::TmPurgeable => "tm_purgeable",
         }
     }
-}
-
-/// Whether a finding belongs in durable snapshot history. Live resource data
-/// changes constantly and would make diffs noisy, so scanners mark it
-/// `Ephemeral`; all existing findings default to `Durable` for compatibility.
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum SnapshotPolicy {
-    #[default]
-    Durable,
-    Ephemeral,
 }
 
 /// Severity, ordered from least to most attention-demanding. `Reclaimable`
@@ -545,9 +534,6 @@ pub struct Finding {
     pub severity: Severity,
     #[serde(default)]
     pub remedies: Vec<Remedy>,
-    /// Whether this result participates in saved snapshot history.
-    #[serde(default)]
-    pub snapshot_policy: SnapshotPolicy,
     /// How this value was collected (command or bounded local walk).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<String>,
@@ -572,7 +558,6 @@ impl Finding {
             last_used: None,
             severity: Severity::Info,
             remedies: Vec::new(),
-            snapshot_policy: SnapshotPolicy::Durable,
             provenance: None,
             coverage: None,
             meta: serde_json::Value::Null,
@@ -605,10 +590,6 @@ impl Finding {
     }
     pub fn meta(mut self, m: serde_json::Value) -> Self {
         self.meta = m;
-        self
-    }
-    pub fn ephemeral(mut self) -> Self {
-        self.snapshot_policy = SnapshotPolicy::Ephemeral;
         self
     }
     pub fn provenance(mut self, value: impl Into<String>) -> Self {
@@ -700,9 +681,9 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    /// Golden value: the id algorithm is part of the snapshot format. If this
-    /// test fails, every stored snapshot will diff as fully removed+added —
-    /// do not "fix" the assertion without a deliberate migration decision.
+    /// Golden value: the id algorithm defines a finding's identity across
+    /// runs. If this test fails, every finding's id has changed — do not
+    /// "fix" the assertion without a deliberate migration decision.
     #[test]
     fn finding_id_algorithm_is_pinned() {
         assert_eq!(
@@ -750,22 +731,20 @@ mod tests {
     }
 
     #[test]
-    fn old_finding_json_defaults_to_durable_history() {
+    fn old_finding_json_without_optional_fields_loads() {
         let f = Finding::new(FindingKind::App, "/Applications/Foo.app", "Foo");
         let mut json = serde_json::to_value(f).unwrap();
         let object = json.as_object_mut().unwrap();
-        object.remove("snapshot_policy");
         object.remove("provenance");
         object.remove("coverage");
         let restored: Finding = serde_json::from_value(json).unwrap();
-        assert_eq!(restored.snapshot_policy, SnapshotPolicy::Durable);
         assert!(restored.provenance.is_none());
         assert!(restored.coverage.is_none());
     }
 
     #[test]
     fn old_remedy_json_without_guard_or_alternative_loads() {
-        // Snapshots written before the cleanup work carry remedies with only
+        // JSON persisted before the cleanup work carries remedies with only
         // the four original fields; they must keep deserialising as primary,
         // unguarded remedies.
         let json = serde_json::json!({

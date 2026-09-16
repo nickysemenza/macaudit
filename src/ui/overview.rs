@@ -64,7 +64,7 @@ fn draw_now(app: &AppState, frame: &mut Frame, area: Rect) {
     let mut text = vec![heading("Now — manual point-in-time sample")];
     if cards.is_empty() {
         text.push(Line::from(Span::styled(
-            "Waiting for the manual resource snapshot…",
+            "Waiting for the manual resource sample…",
             Style::default().fg(Color::DarkGray),
         )));
     } else {

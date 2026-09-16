@@ -128,8 +128,8 @@ impl Scanner for DockerScanner {
         }
 
         // Storage use alone does not explain an active dev stack. Sample
-        // container state and current CPU/RAM once; these observations are
-        // deliberately ephemeral and never become noisy snapshot diffs.
+        // container state and current CPU/RAM once, as a point-in-time
+        // observation.
         let containers = match ctx
             .runner
             .run(
@@ -181,7 +181,6 @@ impl Scanner for DockerScanner {
                     None => format!("{} · {:.1}% CPU", container.status, cpu),
                 })
                 .severity(severity)
-                .ephemeral()
                 .provenance("docker ps; docker stats --no-stream")
                 .meta(serde_json::json!({ "type": "active_container", "id": container.id, "name": container.name, "status": container.status, "cpu_percent": cpu, "memory_bytes": memory })),
             ).await;

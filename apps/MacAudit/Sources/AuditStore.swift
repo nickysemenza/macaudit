@@ -58,9 +58,7 @@ final class AuditStore {
     private(set) var findings: [SectionId: [UInt64: Finding]] = [:]
     private(set) var status: [SectionId: SectionStatus] = [:]
     private var expectedGen: [SectionId: UInt64] = [:]
-    private(set) var baseline: [SectionId: SectionBaseline] = [:]
     private(set) var activity: [String] = []
-    private(set) var lastSnapshotMessage: String?
 
     var selectedItem: SidebarItem? = .storage
     var selectedFinding: UInt64?
@@ -75,9 +73,6 @@ final class AuditStore {
     private(set) var planError: String?
     private(set) var cleanup: CleanupRun?
 
-    private(set) var snapshots: [SnapshotMeta] = []
-    private(set) var snapshotError: String?
-
     let usingFakeData: Bool
     private var scanBridge: ScanBridge?
     private var scanTask: Task<Void, Never>?
@@ -86,8 +81,6 @@ final class AuditStore {
         self.engine = engine
         self.usingFakeData = usingFakeData
         self.sections = engine.sections()
-        self.baseline = Dictionary(
-            uniqueKeysWithValues: engine.baselineCounts().map { ($0.section, $0) })
     }
 
     // MARK: - Reads
@@ -143,13 +136,6 @@ final class AuditStore {
         findings(in: id)
             .filter { $0.severity == .reclaimable }
             .reduce(0) { $0 + ($1.sizeBytes ?? 0) }
-    }
-
-    /// Δ in reclaimable bytes vs the last snapshot, once the section is done.
-    func reclaimableDelta(in id: SectionId) -> Int64? {
-        guard case .done = status(of: id), let base = baseline[id] else { return nil }
-        let delta = Int64(reclaimableBytes(in: id)) - Int64(base.reclaimableBytes)
-        return delta == 0 ? nil : delta
     }
 
     var totalReclaimableBytes: UInt64 {
@@ -255,14 +241,6 @@ final class AuditStore {
         case .correlated(_, let batch), .enriched(_, let batch):
             for f in batch {
                 findings[f.section, default: [:]][f.id] = f
-            }
-        case .snapshotSaved(let id, let message):
-            lastSnapshotMessage = message
-            push(message)
-            if id != nil {
-                baseline = Dictionary(
-                    uniqueKeysWithValues: engine.baselineCounts().map { ($0.section, $0) })
-                refreshSnapshots()
             }
         }
     }
@@ -408,38 +386,6 @@ final class AuditStore {
             push(reportPath.map { "\(summary) — report \($0)" } ?? summary)
         }
         cleanup = run
-    }
-
-    // MARK: - Snapshots
-
-    func refreshSnapshots() {
-        do {
-            snapshots = try engine.snapshots().sorted { $0.id > $1.id }
-            snapshotError = nil
-        } catch {
-            snapshotError = "\(error)"
-        }
-    }
-
-    func saveSnapshot() {
-        do {
-            let id = try engine.saveSnapshot()
-            push("saved snapshot #\(id)")
-            refreshSnapshots()
-            baseline = Dictionary(
-                uniqueKeysWithValues: engine.baselineCounts().map { ($0.section, $0) })
-        } catch {
-            snapshotError = "\(error)"
-            push("snapshot save failed: \(error)")
-        }
-    }
-
-    func diff(_ a: Int64, _ b: Int64) -> Result<SnapshotDiff, Error> {
-        Result { try engine.diffSnapshots(a: a, b: b) }
-    }
-
-    func loadHistory() -> [SectionHistoryPoint] {
-        (try? engine.sectionHistory()) ?? []
     }
 
     // MARK: - Activity

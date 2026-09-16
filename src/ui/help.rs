@@ -36,7 +36,7 @@ const BINDINGS: &[(&str, &str)] = &[
     ),
     ("c", "reopen the last cleanup report"),
     ("r", "refresh current section's point-in-time sample"),
-    ("R", "refresh all sections and save durable history"),
+    ("R", "refresh all sections"),
     ("/", "filter by substring (esc clears)"),
     ("s", "cycle sort (size / name / severity)"),
     ("H", "toggle System apps visibility"),

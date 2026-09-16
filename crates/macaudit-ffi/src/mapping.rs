@@ -6,7 +6,7 @@
 //! no fixed shape to mirror. Paths cross as strings (UniFFI has no path type).
 
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use macaudit::brewgraph::RemovalPreview;
 use macaudit::cleanup::{self, PreflightReport};
@@ -14,7 +14,6 @@ use macaudit::config::DeleteMode as CoreDeleteMode;
 use macaudit::model::{self, FindingId, ScannerId};
 use macaudit::registry::{self, ViewKind as CoreViewKind};
 use macaudit::remedy::PlannedAction;
-use macaudit::snapshot;
 
 /// One sidebar section; mirrors `ScannerId`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, uniffi::Enum)]
@@ -306,7 +305,6 @@ pub struct Finding {
     pub last_used: Option<SystemTime>,
     pub severity: Severity,
     pub remedies: Vec<Remedy>,
-    pub ephemeral: bool,
     pub provenance: Option<String>,
     pub coverage: Option<String>,
     /// Scanner-specific extras as a JSON document (`{}` when absent).
@@ -327,7 +325,6 @@ impl From<&model::Finding> for Finding {
             last_used: f.last_used,
             severity: f.severity.into(),
             remedies: f.remedies.iter().map(Remedy::from).collect(),
-            ephemeral: f.snapshot_policy == model::SnapshotPolicy::Ephemeral,
             provenance: f.provenance.clone(),
             coverage: f.coverage.clone(),
             meta_json: if f.meta.is_null() {
@@ -398,11 +395,6 @@ pub enum ScanEvent {
     Enriched {
         gen: u64,
         findings: Vec<Finding>,
-    },
-    /// A full scan completed and was persisted (or not — see `message`).
-    SnapshotSaved {
-        id: Option<i64>,
-        message: String,
     },
 }
 
@@ -593,110 +585,6 @@ impl From<cleanup::ExecEvent> for ExecEvent {
             },
         }
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct SnapshotMeta {
-    pub id: i64,
-    pub created_at: SystemTime,
-    pub machine: String,
-    pub finding_count: u64,
-    pub total_bytes: u64,
-}
-
-impl From<&snapshot::SnapshotMeta> for SnapshotMeta {
-    fn from(m: &snapshot::SnapshotMeta) -> Self {
-        SnapshotMeta {
-            id: m.id,
-            created_at: UNIX_EPOCH + Duration::from_secs(m.created_at.max(0) as u64),
-            machine: m.machine.clone(),
-            finding_count: m.finding_count.max(0) as u64,
-            total_bytes: m.total_bytes.max(0) as u64,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct GrownFinding {
-    pub finding: Finding,
-    pub old_bytes: u64,
-    pub new_bytes: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct FindingChange {
-    pub finding: Finding,
-    pub field: String,
-    pub old: String,
-    pub new: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct SnapshotDiff {
-    pub added: Vec<Finding>,
-    pub removed: Vec<Finding>,
-    pub grown: Vec<GrownFinding>,
-    pub changed: Vec<FindingChange>,
-}
-
-impl From<snapshot::SnapshotDiff> for SnapshotDiff {
-    fn from(d: snapshot::SnapshotDiff) -> Self {
-        SnapshotDiff {
-            added: findings(d.added),
-            removed: findings(d.removed),
-            grown: d
-                .grown
-                .iter()
-                .map(|(f, old, new)| GrownFinding {
-                    finding: f.into(),
-                    old_bytes: *old,
-                    new_bytes: *new,
-                })
-                .collect(),
-            changed: d
-                .changed
-                .iter()
-                .map(|c| FindingChange {
-                    finding: (&c.finding).into(),
-                    field: c.field.clone(),
-                    old: c.old.clone(),
-                    new: c.new.clone(),
-                })
-                .collect(),
-        }
-    }
-}
-
-/// One section's totals in one snapshot — the history chart's input.
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct SectionHistoryPoint {
-    pub snapshot_id: i64,
-    pub created_at: SystemTime,
-    pub section: SectionId,
-    pub finding_count: u64,
-    pub total_bytes: u64,
-    pub reclaimable_bytes: u64,
-}
-
-impl From<&snapshot::SectionTotals> for SectionHistoryPoint {
-    fn from(t: &snapshot::SectionTotals) -> Self {
-        SectionHistoryPoint {
-            snapshot_id: t.snapshot_id,
-            created_at: UNIX_EPOCH + Duration::from_secs(t.created_at.max(0) as u64),
-            section: t.section.into(),
-            finding_count: t.finding_count.max(0) as u64,
-            total_bytes: t.total_bytes.max(0) as u64,
-            reclaimable_bytes: t.reclaimable_bytes.max(0) as u64,
-        }
-    }
-}
-
-/// Per-section counts from the latest saved snapshot, for Δ badges.
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct SectionBaseline {
-    pub section: SectionId,
-    pub finding_count: u64,
-    pub reclaimable_bytes: u64,
 }
 
 pub fn finding_id(id: u64) -> FindingId {

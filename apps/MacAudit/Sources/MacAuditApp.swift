@@ -127,11 +127,4 @@ final class UnavailableEngine: MacAuditEngine {
     func plan(selection: [Selection]) throws -> Plan { throw MacAuditError.Invalid(message: "engine unavailable") }
     func execute(plan: Plan, listener: ExecListener) throws { throw MacAuditError.Invalid(message: "engine unavailable") }
     func cancelCleanup() {}
-    func snapshots() throws -> [SnapshotMeta] { [] }
-    func saveSnapshot() throws -> Int64 { throw MacAuditError.Snapshot(message: "engine unavailable") }
-    func diffSnapshots(a: Int64, b: Int64) throws -> SnapshotDiff {
-        SnapshotDiff(added: [], removed: [], grown: [], changed: [])
-    }
-    func baselineCounts() -> [SectionBaseline] { [] }
-    func sectionHistory() throws -> [SectionHistoryPoint] { [] }
 }

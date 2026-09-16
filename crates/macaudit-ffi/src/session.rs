@@ -6,9 +6,7 @@
 //! - an event is applied only when its gen EXACTLY matches the section's
 //!   expected gen (drops superseded runs and the discovery-only Fs helper);
 //! - once every correlated section is terminal, correlate in memory, then
-//!   run network enrichment in the background;
-//! - a full scan with no failed section is auto-saved as a snapshot, after
-//!   enrichment has landed.
+//!   run network enrichment in the background.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, Weak};
@@ -16,12 +14,11 @@ use std::time::Duration;
 
 use macaudit::correlate::{self, CORRELATED_SECTIONS};
 use macaudit::engine::ScannerManager;
-use macaudit::model::{Finding, FindingId, FindingKind, ScanEvent, ScannerId, Severity};
-use macaudit::snapshot::{self, SnapshotStore};
+use macaudit::model::{Finding, FindingId, FindingKind, ScanEvent, ScannerId};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::mapping::{self, SectionId};
+use crate::mapping;
 use crate::runtime::runtime;
 use crate::ScanListener;
 
@@ -47,10 +44,6 @@ pub struct Session {
     full_scan_gen: u64,
     /// The generation correlation last ran for.
     correlated_gen: u64,
-    /// The sections of the most recent full scan (auto-snapshot bookkeeping).
-    active_scan: Vec<ScannerId>,
-    scan_saved: bool,
-    enrich_pending: bool,
 }
 
 impl Session {
@@ -64,11 +57,7 @@ impl Session {
             self.status.insert(*id, Status::Scanning);
         }
         let full = ScannerId::ALL.iter().all(|s| sections.contains(s));
-        if full {
-            self.active_scan = sections.to_vec();
-            self.scan_saved = false;
-            self.full_scan_gen = gen;
-        } else if sections.iter().any(|s| CORRELATED_SECTIONS.contains(s)) {
+        if full || sections.iter().any(|s| CORRELATED_SECTIONS.contains(s)) {
             self.full_scan_gen = gen;
         }
     }
@@ -110,14 +99,6 @@ impl Session {
         sections
             .iter()
             .all(|id| matches!(self.status_of(*id), Status::Done | Status::Failed(_)))
-    }
-
-    pub fn failed_sections(&self, sections: &[ScannerId]) -> Vec<ScannerId> {
-        sections
-            .iter()
-            .copied()
-            .filter(|id| matches!(self.status_of(*id), Status::Failed(_)))
-            .collect()
     }
 
     pub fn section_findings(&self, id: ScannerId) -> Vec<Finding> {
@@ -256,8 +237,8 @@ impl Pending {
 }
 
 /// Drain the engine channel forever: apply each event to the session, batch
-/// what goes to Swift, and run the post-scan steps (correlate, enrich,
-/// auto-snapshot) exactly as the TUI loop does.
+/// what goes to Swift, and run the post-scan steps (correlate, enrich)
+/// exactly as the TUI loop does.
 ///
 /// Holds the session weakly: `Shared` owns the channel's sender, so a strong
 /// reference here would keep the channel open (and this task alive) after
@@ -343,7 +324,7 @@ pub async fn pump(mut rx: mpsc::Receiver<ScanEvent>, weak: Weak<Shared>) {
 }
 
 /// Correlate once the correlated sections are terminal (once per full-scan
-/// generation), kick off enrichment when online, then consider auto-saving.
+/// generation), then kick off enrichment when online.
 fn after_terminal(shared: &Arc<Shared>) {
     let mut events = Vec::new();
     let mut enrich: Option<(u64, BTreeMap<FindingId, Finding>)> = None;
@@ -362,7 +343,6 @@ fn after_terminal(shared: &Arc<Shared>) {
                 });
             }
             if shared.manager.fetcher().is_some() {
-                session.enrich_pending = true;
                 enrich = Some((gen, session.correlated_findings()));
             }
         }
@@ -390,7 +370,6 @@ fn after_terminal(shared: &Arc<Shared>) {
                 .collect();
             let kept = {
                 let mut session = shared.session.lock().unwrap();
-                session.enrich_pending = false;
                 session.apply_enriched(gen, changed)
             };
             if !kept.is_empty() {
@@ -399,83 +378,6 @@ fn after_terminal(shared: &Arc<Shared>) {
                     findings: mapping::findings(kept),
                 });
             }
-            maybe_autosave(&shared);
         });
-    } else {
-        maybe_autosave(shared);
     }
-}
-
-/// Persist a completed full scan once, when nothing failed and enrichment
-/// has landed — the TUI's spec §8 auto-snapshot.
-fn maybe_autosave(shared: &Shared) {
-    let event = {
-        let mut session = shared.session.lock().unwrap();
-        let complete = !session.scan_saved
-            && !session.enrich_pending
-            && session.active_scan.len() == ScannerId::ALL.len()
-            && session.sections_terminal(&session.active_scan);
-        if !complete {
-            return;
-        }
-        session.scan_saved = true;
-        let failed = session.failed_sections(&session.active_scan);
-        if failed.is_empty() {
-            match save_snapshot(&shared.manager, &session.all_findings()) {
-                Ok(id) => mapping::ScanEvent::SnapshotSaved {
-                    id: Some(id),
-                    message: format!("saved snapshot #{id}"),
-                },
-                Err(e) => mapping::ScanEvent::SnapshotSaved {
-                    id: None,
-                    message: format!("snapshot save failed: {e}"),
-                },
-            }
-        } else {
-            let names: Vec<&str> = failed.iter().map(|id| id.slug()).collect();
-            mapping::ScanEvent::SnapshotSaved {
-                id: None,
-                message: format!(
-                    "snapshot skipped: {} section(s) failed ({})",
-                    failed.len(),
-                    names.join(", ")
-                ),
-            }
-        }
-    };
-    shared.emit(event);
-}
-
-pub fn save_snapshot(
-    manager: &ScannerManager,
-    findings: &BTreeMap<FindingId, Finding>,
-) -> anyhow::Result<i64> {
-    let mut store = SnapshotStore::open(&manager.paths().history_db())?;
-    store.save(&snapshot::machine_name(), findings)
-}
-
-/// Per-section counts from the latest snapshot (`ui::load_baseline`).
-pub fn baseline(manager: &ScannerManager) -> Vec<mapping::SectionBaseline> {
-    let mut base: HashMap<ScannerId, (u64, u64)> = HashMap::new();
-    if let Ok(store) = SnapshotStore::open(&manager.paths().history_db()) {
-        if let Ok(Some(findings)) = store.latest_findings() {
-            for f in findings {
-                let entry = base.entry(f.kind.scanner()).or_insert((0, 0));
-                entry.0 += 1;
-                if f.severity == Severity::Reclaimable {
-                    entry.1 += f.size_bytes.unwrap_or(0);
-                }
-            }
-        }
-    }
-    ScannerId::ALL
-        .iter()
-        .filter_map(|id| {
-            base.get(id).map(|(n, b)| mapping::SectionBaseline {
-                section: SectionId::from(*id),
-                finding_count: *n,
-                reclaimable_bytes: *b,
-            })
-        })
-        .collect()
 }

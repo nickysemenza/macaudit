@@ -573,8 +573,8 @@ impl BrewGraph {
         g
     }
 
-    /// Rebuild from Brew findings (this scan's enriched meta, or a legacy
-    /// snapshot that only carried `dependencies`/`dependents`). Missing flags
+    /// Rebuild from Brew findings (this scan's enriched meta, or an older
+    /// scan that only carried `dependencies`/`dependents`). Missing flags
     /// stay unknown; missing dependency lists mark the node's source `None`.
     pub fn from_findings<'a>(it: impl Iterator<Item = &'a Finding>) -> Self {
         let mut g = BrewGraph::default();

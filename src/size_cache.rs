@@ -3,9 +3,8 @@
 //! since the last scan and whose cached size is still within the configured
 //! TTL (spec `scan.size_cache_ttl_hours`, default 24).
 //!
-//! Own rusqlite db file, separate from `snapshot.rs`'s history db (frozen,
-//! not touched here). Corrupted/unopenable db is never fatal to a scan: the
-//! `fs.rs` integration treats an `open` failure as an empty cache.
+//! Own rusqlite db file. Corrupted/unopenable db is never fatal to a scan:
+//! the `fs.rs` integration treats an `open` failure as an empty cache.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

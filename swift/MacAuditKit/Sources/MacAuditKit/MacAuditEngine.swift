@@ -14,11 +14,6 @@ public protocol MacAuditEngine: AnyObject, Sendable {
     func plan(selection: [Selection]) throws -> Plan
     func execute(plan: Plan, listener: ExecListener) throws
     func cancelCleanup()
-    func snapshots() throws -> [SnapshotMeta]
-    func saveSnapshot() throws -> Int64
-    func diffSnapshots(a: Int64, b: Int64) throws -> SnapshotDiff
-    func baselineCounts() -> [SectionBaseline]
-    func sectionHistory() throws -> [SectionHistoryPoint]
 }
 
 extension Engine: MacAuditEngine {}
@@ -36,7 +31,6 @@ extension SectionId: Identifiable {
 }
 
 extension Finding: Identifiable {}
-extension SnapshotMeta: Identifiable {}
 
 extension SectionId {
     /// The engine's section slug (`macaudit scan --section <slug>`).

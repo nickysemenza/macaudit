@@ -4,7 +4,6 @@ import SwiftUI
 struct ContentView: View {
     @Environment(AuditStore.self) private var store
     @State private var showInspector = true
-    @State private var showSnapshots = false
 
     var body: some View {
         @Bindable var store = store
@@ -72,13 +71,6 @@ struct ContentView: View {
                 .help("Plan and confirm the marked cleanup (⌘X)")
 
                 Button {
-                    store.refreshSnapshots()
-                    showSnapshots = true
-                } label: {
-                    Label("Snapshots", systemImage: "clock.arrow.circlepath")
-                }
-
-                Button {
                     showInspector.toggle()
                 } label: {
                     Label("Inspector", systemImage: "sidebar.right")
@@ -92,9 +84,6 @@ struct ContentView: View {
         }
         .sheet(isPresented: Binding(get: { store.cleanup != nil }, set: { if !$0 { store.dismissCleanup() } })) {
             CleanupProgressView()
-        }
-        .sheet(isPresented: $showSnapshots) {
-            SnapshotsView()
         }
         .alert("Could not plan cleanup", isPresented: Binding(get: { store.planError != nil }, set: { _ in store.clearPlanError() })) {
             Button("OK") {}

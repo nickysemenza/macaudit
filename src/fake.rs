@@ -80,14 +80,12 @@ pub fn fixtures(id: ScannerId) -> Vec<Finding> {
 }
 
 /// Mirrors `src/scan/system.rs`: 4 SystemMetric findings (`role` one of
-/// cpu/memory/swap/disk; disk alone is durable) plus a handful of
-/// ProcessResource findings, all ephemeral.
+/// cpu/memory/swap/disk) plus a handful of ProcessResource findings.
 fn system_fixtures() -> Vec<Finding> {
     vec![
         Finding::new(FindingKind::SystemMetric, "cpu-load", "CPU load")
             .detail("load average 6.42 / 4.10 / 3.05 across 8 cores")
             .severity(Severity::Attention)
-            .ephemeral()
             .meta(json!({
                 "role": "cpu",
                 "load_1": 6.42,
@@ -98,7 +96,6 @@ fn system_fixtures() -> Vec<Finding> {
         Finding::new(FindingKind::SystemMetric, "memory", "Memory pressure")
             .detail("14.2 GiB used of 16.0 GiB; 2.1 GiB compressed; 82% pressure")
             .severity(Severity::Warning)
-            .ephemeral()
             .meta(json!({
                 "role": "memory",
                 "used_bytes": 15 * GIB + 205 * MIB,
@@ -110,7 +107,6 @@ fn system_fixtures() -> Vec<Finding> {
         Finding::new(FindingKind::SystemMetric, "swap", "Swap")
             .detail("512.0 MiB used of 2.0 GiB")
             .severity(Severity::Info)
-            .ephemeral()
             .meta(json!({
                 "role": "swap",
                 "used_bytes": 512 * MIB,
@@ -137,7 +133,6 @@ fn system_fixtures() -> Vec<Finding> {
         Finding::new(FindingKind::ProcessResource, "4821:node", "node (pid 4821)")
             .detail("12.4% CPU · 180.0 MiB resident · dev · S")
             .severity(Severity::Info)
-            .ephemeral()
             .meta(json!({
                 "role": "process", "pid": 4821, "user": "dev", "cpu_percent": 12.4,
                 "memory_percent": 1.1, "rss_bytes": 180 * MIB, "state": "S", "command": "node",
@@ -145,7 +140,6 @@ fn system_fixtures() -> Vec<Finding> {
         Finding::new(FindingKind::ProcessResource, "512:Xcode", "Xcode (pid 512)")
             .detail("64.2% CPU · 2.1 GiB resident · dev · S")
             .severity(Severity::Attention)
-            .ephemeral()
             .meta(json!({
                 "role": "process", "pid": 512, "user": "dev", "cpu_percent": 64.2,
                 "memory_percent": 13.2, "rss_bytes": 2 * GIB + 100 * MIB, "state": "S",
@@ -158,7 +152,6 @@ fn system_fixtures() -> Vec<Finding> {
         )
         .detail("8.1% CPU · 512.0 MiB resident · dev · S")
         .severity(Severity::Info)
-        .ephemeral()
         .meta(json!({
             "role": "process", "pid": 933, "user": "dev", "cpu_percent": 8.1,
             "memory_percent": 3.2, "rss_bytes": 512 * MIB, "state": "S",
@@ -171,7 +164,6 @@ fn system_fixtures() -> Vec<Finding> {
         )
         .detail("132.5% CPU · 620.0 MiB resident · root · R")
         .severity(Severity::Warning)
-        .ephemeral()
         .meta(json!({
             "role": "process", "pid": 210, "user": "root", "cpu_percent": 132.5,
             "memory_percent": 3.9, "rss_bytes": 620 * MIB, "state": "R",
@@ -1280,7 +1272,7 @@ fn runtimes_fixtures() -> Vec<Finding> {
 
 /// Mirrors `src/scan/docker.rs`: one DockerObject summary per type (Images/
 /// Containers/Local Volumes/Build Cache), Reclaimable + prune remedy only
-/// when reclaimable > 0, plus ephemeral active-container observations.
+/// when reclaimable > 0, plus active-container observations.
 fn docker_fixtures() -> Vec<Finding> {
     vec![
         Finding::new(
@@ -1375,7 +1367,6 @@ fn docker_fixtures() -> Vec<Finding> {
         )
         .detail("Up 3 hours · 4.2% CPU · 210.0 MiB RAM")
         .severity(Severity::Info)
-        .ephemeral()
         .meta(json!({
             "type": "active_container", "id": "a1b2c3d4", "name": "cubby-postgres-1",
             "status": "Up 3 hours", "cpu_percent": 4.2, "memory_bytes": 220 * MIB,
@@ -1387,7 +1378,6 @@ fn docker_fixtures() -> Vec<Finding> {
         )
         .detail("Up 2 days · 118.5% CPU · 2.3 GiB RAM")
         .severity(Severity::Warning)
-        .ephemeral()
         .meta(json!({
             "type": "active_container", "id": "e5f6a7b8", "name": "macaudit-redis-1",
             "status": "Up 2 days", "cpu_percent": 118.5, "memory_bytes": 2 * GIB + 300 * MIB,

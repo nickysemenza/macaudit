@@ -33,7 +33,6 @@ mod render_tests;
 #[cfg(test)]
 mod testutil;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,9 +44,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cleanup::{self, ExecDeps, ExecEvent};
 use crate::engine::ScannerManager;
-use crate::model::{Finding, FindingKind, ScanEvent, ScannerId, Severity};
+use crate::model::{Finding, FindingKind, ScanEvent, ScannerId};
 use crate::remedy::{RealClipboard, RealTrash};
-use crate::snapshot::{self, SnapshotStore};
 use crate::ui::app::{AppState, RescanRequest};
 
 /// Run the TUI to completion. Owns the manager and the app state, wiring
@@ -80,18 +78,11 @@ async fn run_loop(
     let mut cleanup_affected: Vec<ScannerId> = Vec::new();
     let mut app = AppState::default();
     app.set_delete_mode(manager.delete_mode());
-    app.set_baseline(load_baseline(&manager));
 
     // Kick off an initial full scan.
     let all = ScannerId::ALL.to_vec();
-    let mut active_scan = all.clone();
-    let mut scan_saved = false;
     // Generation for which correlation has already run (0 = never).
     let mut correlated_gen: u64 = 0;
-    // True while a spawned network-enrichment task hasn't reported back — the
-    // auto-snapshot waits for it so TUI snapshots match headless ones (which
-    // always enrich before returning). Bounded: enrichment has hard timeouts.
-    let mut enrich_pending = false;
     let gen = manager.start(&tx, &all);
     let mut full_scan_gen = gen;
     app.begin_scan(gen, &all);
@@ -129,7 +120,6 @@ async fn run_loop(
                 // Network enrichment landed: upsert (stale generations are
                 // dropped inside apply_enriched).
                 if let Some((gen, findings)) = maybe_enriched {
-                    enrich_pending = false;
                     let n = findings.len();
                     app.apply_enriched(gen, findings);
                     if n > 0 {
@@ -164,17 +154,15 @@ async fn run_loop(
         }
 
         // Once Apps + Brew both reach terminal state, run cross-scanner
-        // correlation (cask-managed labeling) so the TUI — and the snapshot
-        // auto-saved below — see correlated findings, matching the headless
-        // path. Then kick the async network half (catalog matching + release
-        // checks) in the background; results arrive on `enrich_rx`. Once per
-        // generation.
+        // correlation (cask-managed labeling) so the TUI sees correlated
+        // findings, matching the headless path. Then kick the async network
+        // half (catalog matching + release checks) in the background; results
+        // arrive on `enrich_rx`. Once per generation.
         if correlated_gen != full_scan_gen && app.sections_terminal(state::CORRELATED_SECTIONS) {
             correlated_gen = full_scan_gen;
             app.correlate_now();
 
             if let Some(fetcher) = manager.fetcher() {
-                enrich_pending = true;
                 let mut map = app.apps_brew_findings();
                 let paths = manager.paths();
                 let config = manager.config();
@@ -197,37 +185,8 @@ async fn run_loop(
             }
         }
 
-        // Auto-save a snapshot when a full scan completes (spec §8) — cheap, and
-        // makes `snapshot diff` useful without ceremony. Only full scans, once,
-        // never partial (a failed section would diff as wholly removed next
-        // time), and only after any in-flight enrichment has landed so TUI
-        // snapshots carry the same data headless ones do.
-        if !scan_saved
-            && !enrich_pending
-            && active_scan.len() == ScannerId::ALL.len()
-            && app.scan_complete(&active_scan)
-        {
-            scan_saved = true;
-            let failed = app.failed_sections(&active_scan);
-            if failed.is_empty() {
-                match save_snapshot(&manager, &app) {
-                    Ok(id) => app.push_activity(format!("saved snapshot #{id}")),
-                    Err(e) => app.push_activity(format!("snapshot save failed: {e}")),
-                }
-            } else {
-                let names: Vec<&str> = failed.iter().map(|id| id.slug()).collect();
-                app.push_activity(format!(
-                    "snapshot skipped: {} section(s) failed ({})",
-                    failed.len(),
-                    names.join(", ")
-                ));
-            }
-        }
-
         // Service a requested rescan. Per-section generations mean a targeted
-        // rescan cancels ONLY the requested sections; an in-flight full scan
-        // keeps running, so its auto-snapshot bookkeeping must survive — only
-        // `R` (rescan all) resets it.
+        // rescan cancels ONLY the requested sections.
         if let Some(req) = app.pending_rescan.take() {
             let sections: Vec<ScannerId> = match req {
                 RescanRequest::All => ScannerId::ALL.to_vec(),
@@ -236,8 +195,6 @@ async fn run_loop(
             let gen = manager.start(&tx, &sections);
             app.begin_scan(gen, &sections);
             if matches!(req, RescanRequest::All) {
-                active_scan = sections;
-                scan_saved = false;
                 full_scan_gen = gen;
             } else if sections
                 .iter()
@@ -283,29 +240,4 @@ async fn run_loop(
         }
     }
     Ok(())
-}
-
-/// Load the most recent snapshot's per-section (count, reclaimable-bytes)
-/// baseline for Δ badges. Best-effort: any failure yields an empty baseline.
-fn load_baseline(manager: &ScannerManager) -> HashMap<ScannerId, (usize, u64)> {
-    let mut base: HashMap<ScannerId, (usize, u64)> = HashMap::new();
-    let Ok(store) = SnapshotStore::open(&manager.paths().history_db()) else {
-        return base;
-    };
-    if let Ok(Some(findings)) = store.latest_findings() {
-        for f in findings {
-            let entry = base.entry(f.kind.scanner()).or_insert((0, 0));
-            entry.0 += 1;
-            if f.severity == Severity::Reclaimable {
-                entry.1 += f.size_bytes.unwrap_or(0);
-            }
-        }
-    }
-    base
-}
-
-/// Persist the current findings as a snapshot.
-fn save_snapshot(manager: &ScannerManager, app: &AppState) -> anyhow::Result<i64> {
-    let mut store = SnapshotStore::open(&manager.paths().history_db())?;
-    store.save(&snapshot::machine_name(), &app.all_findings())
 }

@@ -12,12 +12,6 @@ public enum Formatting {
         n.map(bytes) ?? "–"
     }
 
-    /// Signed delta, e.g. "+1.2 GB" / "−300 MB".
-    public static func delta(_ n: Int64) -> String {
-        let magnitude = Swift.abs(n).formatted(.byteCount(style: .binary, spellsOutZero: false))
-        return n < 0 ? "−\(magnitude)" : "+\(magnitude)"
-    }
-
     public static func age(_ date: Date?) -> String {
         guard let date else { return "–" }
         return date.formatted(.relative(presentation: .named, unitsStyle: .abbreviated))

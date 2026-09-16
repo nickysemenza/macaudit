@@ -5,7 +5,6 @@ import SwiftUI
 /// aware of what is reclaimable inside each category.
 struct StorageOverview: View {
     @Environment(AuditStore.self) private var store
-    @State private var history: [SectionHistoryPoint] = []
 
     var body: some View {
         ScrollView {
@@ -13,15 +12,11 @@ struct StorageOverview: View {
                 DiskHeaderCard()
                 RecommendationsCard()
                 CategoriesCard()
-                Card(title: "History") {
-                    HistoryChart(points: history)
-                }
             }
             .padding(20)
             .frame(maxWidth: 900, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .center)
         }
-        .task(id: store.snapshots.count) { history = store.loadHistory() }
     }
 }
 

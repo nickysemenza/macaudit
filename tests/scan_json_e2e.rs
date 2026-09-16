@@ -5,7 +5,7 @@
 //! `$MACAUDIT_HOME` → the engine → the filesystem-based scanners (FsScanner's
 //! real `ignore` walk + GitScanner shelling real `git`) → JSON serialization —
 //! without mocking anything. It also asserts `FindingId` stability across two
-//! runs, the property snapshot diffing (§8) depends on.
+//! runs of an identical scan.
 //!
 //! We scan only `disk` (which pulls in git discovery) so the test needs no stub
 //! CLIs for brew/system_profiler/etc.; those scanners have their own unit tests
@@ -116,7 +116,7 @@ fn finding_ids_are_stable_across_runs() {
     let run1 = run_scan_json(home.path());
     let run2 = run_scan_json(home.path());
 
-    // Same fixture, same ids — this is what makes snapshot diffing meaningful.
+    // Same fixture, same ids — findings must be identifiable across scans.
     assert_eq!(
         ids_of(&run1),
         ids_of(&run2),

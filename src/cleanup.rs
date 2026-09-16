@@ -278,7 +278,8 @@ fn probe_ctx_for<'a>(paths: &'a Paths, config: &'a Config, shell: &'a ShellPath)
     }
 }
 
-/// Snapshot of every tool installation (filesystem-only), keyed by identity.
+/// A point-in-time inventory of every tool installation (filesystem-only),
+/// keyed by identity.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Inventory {
     pub items: BTreeMap<String, InventoryItem>,

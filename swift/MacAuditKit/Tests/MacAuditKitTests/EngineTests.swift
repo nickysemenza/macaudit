@@ -77,20 +77,6 @@ final class TerminalWaiter: ScanListener, @unchecked Sendable {
     #expect(!apps.isEmpty)
     #expect(apps.allSatisfy { waiter.seen.contains($0.id) })
     #expect(engine.deleteMode() == .trash)
-
-    // Snapshots round-trip through the FFI: two saves of the same findings
-    // diff clean, and the baseline reflects the latest save.
-    let a = try engine.saveSnapshot()
-    let b = try engine.saveSnapshot()
-    #expect(b > a)
-    let diff = try engine.diffSnapshots(a: a, b: b)
-    #expect(diff.added.isEmpty && diff.removed.isEmpty && diff.grown.isEmpty && diff.changed.isEmpty)
-    #expect(try engine.snapshots().count >= 2)
-    let history = try engine.sectionHistory()
-    #expect(Set(history.map(\.snapshotId)).count == 3)  // auto-save + two manual saves
-    #expect(history.contains { $0.section == .fs && $0.reclaimableBytes > 0 })
-    let baseline = engine.baselineCounts()
-    #expect(baseline.contains { $0.section == .apps && $0.findingCount == UInt64(apps.count) })
 }
 
 @Test func findingMetaDistinguishesBooleansFromNumbers() {

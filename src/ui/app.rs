@@ -6,7 +6,7 @@
 //! definition, mode dispatch, and the top-level `draw()`. The reducer itself
 //! is further split by concern:
 //! - `state.rs`: scan-event ingestion (`apply`, `begin_scan`, ...) and
-//!   section-status/baseline read-only queries.
+//!   section-status read-only queries.
 //! - `view.rs`: read-only row/selection queries (sort, filter, tree
 //!   flattening, "what's under the cursor").
 //! - `nav.rs`: cursor movement, section switching, and the Normal/Filter/Help
@@ -174,10 +174,6 @@ pub struct AppState {
     pub(super) delete_mode: DeleteMode,
     pub(crate) activity: Vec<String>,
 
-    /// Per-section baseline (count, reclaimable bytes) from the most recent
-    /// snapshot at startup, used to render "Δ since last snapshot" badges.
-    pub(super) baseline: HashMap<ScannerId, (usize, u64)>,
-
     /// Per-section generation whose events we accept (exact match — see
     /// `apply`). Absent ⇒ no scan has been requested for that section yet;
     /// its events are dropped.
@@ -234,7 +230,6 @@ impl Default for AppState {
             brew_version: 0,
             delete_mode: DeleteMode::Trash,
             activity: Vec::new(),
-            baseline: HashMap::new(),
             expected_gen: HashMap::new(),
             tick: 0,
             should_quit: false,

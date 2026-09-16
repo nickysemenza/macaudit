@@ -79,12 +79,6 @@ struct FindingInspector: View {
                 Text("Kind").foregroundStyle(.secondary)
                 Text("\(f.kind)")
             }
-            if f.ephemeral {
-                GridRow {
-                    Text("Snapshot").foregroundStyle(.secondary)
-                    Text("ephemeral — not kept in history")
-                }
-            }
         }
         .font(.callout)
     }

@@ -138,7 +138,7 @@ impl RailMode {
     /// Columns the rail occupies, including its right border.
     pub fn width(self) -> u16 {
         match self {
-            RailMode::Full => 34,
+            RailMode::Full => 26,
             RailMode::Compact => 15,
             RailMode::Hidden => 0,
         }

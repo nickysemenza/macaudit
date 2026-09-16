@@ -25,7 +25,6 @@ use macaudit::engine::{Mode, ScannerManager};
 use macaudit::model::{Finding as CoreFinding, FindingId, Remedy as CoreRemedy, ScannerId};
 use macaudit::remedy::{execution_remedies, PlannedAction, RealClipboard, RealTrash, RemedyEngine};
 use macaudit::runner::{CommandRunner, RealCommandRunner};
-use macaudit::snapshot::SnapshotStore;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -41,8 +40,6 @@ pub enum MacAuditError {
     /// Config or paths could not be loaded.
     #[error("config: {0}")]
     Config(String),
-    #[error("snapshot: {0}")]
-    Snapshot(String),
     /// A cleanup batch is already running.
     #[error("busy: {0}")]
     Busy(String),
@@ -296,53 +293,6 @@ impl Engine {
         }
     }
 
-    pub fn snapshots(&self) -> Result<Vec<SnapshotMeta>, MacAuditError> {
-        let store = self.store()?;
-        let list = store.list().map_err(snapshot_err)?;
-        Ok(list.iter().map(SnapshotMeta::from).collect())
-    }
-
-    /// Persist the current findings. Refused while any section of the last
-    /// scan failed — a partial snapshot would diff as wholesale removals.
-    pub fn save_snapshot(&self) -> Result<i64, MacAuditError> {
-        let (findings, failed) = {
-            let session = self.shared.session.lock().unwrap();
-            (
-                session.all_findings(),
-                session.failed_sections(ScannerId::ALL),
-            )
-        };
-        if !failed.is_empty() {
-            let names: Vec<&str> = failed.iter().map(|id| id.slug()).collect();
-            return Err(MacAuditError::Snapshot(format!(
-                "{} section(s) failed ({})",
-                failed.len(),
-                names.join(", ")
-            )));
-        }
-        session::save_snapshot(&self.shared.manager, &findings).map_err(snapshot_err)
-    }
-
-    pub fn diff_snapshots(&self, a: i64, b: i64) -> Result<SnapshotDiff, MacAuditError> {
-        let store = self.store()?;
-        store
-            .diff(a, b)
-            .map(SnapshotDiff::from)
-            .map_err(snapshot_err)
-    }
-
-    /// Per-section totals for every snapshot, oldest first (history chart).
-    pub fn section_history(&self) -> Result<Vec<SectionHistoryPoint>, MacAuditError> {
-        let store = self.store()?;
-        let rows = store.section_history().map_err(snapshot_err)?;
-        Ok(rows.iter().map(SectionHistoryPoint::from).collect())
-    }
-
-    /// Per-section counts from the latest snapshot, for Δ badges.
-    pub fn baseline_counts(&self) -> Vec<SectionBaseline> {
-        session::baseline(&self.shared.manager)
-    }
-
     /// Where the user's config file lives (for the Settings pane).
     pub fn config_path(&self) -> String {
         self.shared
@@ -352,16 +302,6 @@ impl Engine {
             .to_string_lossy()
             .into_owned()
     }
-}
-
-impl Engine {
-    fn store(&self) -> Result<SnapshotStore, MacAuditError> {
-        SnapshotStore::open(&self.shared.manager.paths().history_db()).map_err(snapshot_err)
-    }
-}
-
-fn snapshot_err(e: anyhow::Error) -> MacAuditError {
-    MacAuditError::Snapshot(e.to_string())
 }
 
 impl Drop for Engine {
@@ -433,19 +373,6 @@ mod tests {
     fn fake_scan_streams_every_section_and_matches_pull() {
         let (engine, _home) = fake_engine();
         let collector = scan_all(&engine);
-        // Auto-snapshot lands after the last terminal event; wait for it so
-        // the assertion below sees the full event stream.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !collector
-            .0
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|e| matches!(e, ScanEvent::SnapshotSaved { .. }))
-        {
-            assert!(Instant::now() < deadline, "no auto-snapshot");
-            std::thread::sleep(Duration::from_millis(20));
-        }
         let events = collector.0.lock().unwrap().clone();
 
         for id in ScannerId::ALL {
@@ -471,17 +398,7 @@ mod tests {
                 engine.findings(section).iter().map(|f| f.id).collect();
             assert_eq!(pulled, expected, "pull for {}", id.slug());
         }
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, ScanEvent::SnapshotSaved { id: Some(_), .. })));
-        assert_eq!(engine.snapshots().unwrap().len(), 1);
         assert_eq!(engine.sections().len(), ScannerId::ALL.len());
-        let history = engine.section_history().unwrap();
-        let sections: std::collections::HashSet<SectionId> =
-            history.iter().map(|p| p.section).collect();
-        // Every section with durable fixtures shows up once for the one snapshot.
-        assert!(sections.contains(&SectionId::Fs) && sections.contains(&SectionId::Brew));
-        assert!(history.iter().all(|p| p.snapshot_id == 1));
     }
 
     #[test]

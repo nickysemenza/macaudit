@@ -1,8 +1,8 @@
 //! End-to-end: the real `macaudit` binary against a synthetic HOME that
 //! mirrors the audited Mac's manager layouts (npm prefix, pnpm current +
 //! legacy, cargo, pipx, uv, a Homebrew-like python site), checking the
-//! `scan --json` contract, id stability across runs, `clean --dry-run`
-//! (text and JSON) and `snapshot save`/`diff --json` compatibility.
+//! `scan --json` contract, id stability across runs, and `clean --dry-run`
+//! (text and JSON).
 //!
 //! The process `PATH` is pinned so command resolution is deterministic; the
 //! login-shell probe runs `dscl`, which is not mocked here — on a machine
@@ -263,7 +263,7 @@ fn by_title<'a>(arr: &'a [Value], kind: &str, title: &str) -> &'a Value {
 }
 
 #[test]
-fn tools_scan_dry_run_and_snapshot_diff_end_to_end() {
+fn tools_scan_dry_run_end_to_end() {
     let (tmp, prefix) = build_home();
     let home = tmp.path();
 
@@ -469,25 +469,6 @@ fn tools_scan_dry_run_and_snapshot_diff_end_to_end() {
             .any(|p| p["command"] == "wasm-pack" && p["status"] == "ok"),
         "{verify:#}"
     );
-
-    // Snapshots: save twice, diff is empty (identity + change detection).
-    let s1 = run(home, &prefix, &["snapshot", "save", "--offline"]);
-    if s1.status.success() {
-        let s2 = run(home, &prefix, &["snapshot", "save", "--offline"]);
-        assert!(s2.status.success());
-        let diff = json_out(&run(
-            home,
-            &prefix,
-            &["snapshot", "diff", "--json", "--offline"],
-        ));
-        assert_eq!(diff["added"].as_array().unwrap().len(), 0);
-        assert_eq!(diff["removed"].as_array().unwrap().len(), 0);
-        assert_eq!(diff["changed"].as_array().unwrap().len(), 0);
-    } else {
-        // A full snapshot needs every real scanner to succeed on this host;
-        // a failing section is reported, not silently stored.
-        assert!(String::from_utf8_lossy(&s1.stderr).contains("section"));
-    }
 
     // `brew why` on the (unavailable) Homebrew of this sandbox errors cleanly.
     let why = run(home, &prefix, &["brew", "why", "nope", "--offline"]);

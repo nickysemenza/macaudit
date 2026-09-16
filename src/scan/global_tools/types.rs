@@ -1,7 +1,7 @@
 //! Shared vocabulary for the Global Tools scan. Every struct here serialises
 //! straight into `Finding.meta`, so field names are the JSON contract the
-//! presenter, the CLI and snapshots read. Unknown facts are `None` (JSON
-//! `null`), never a default value.
+//! presenter and the CLI read. Unknown facts are `None` (JSON `null`), never
+//! a default value.
 
 use std::path::PathBuf;
 

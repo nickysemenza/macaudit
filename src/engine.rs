@@ -19,8 +19,7 @@
 //! - **fs→git pipe**: if `Git` is in the run, the manager wires the discovery
 //!   channel (auto-adding a discovery-only `Fs` pass if disk wasn't requested).
 //! - **Headless**: `run_to_completion` drains findings into an upserting map for
-//!   `scan --json`, `snapshot save`, and `clean --dry-run` — the same engine the
-//!   TUI drives.
+//!   `scan --json` and `clean --dry-run` — the same engine the TUI drives.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -107,7 +106,7 @@ impl ScannerManager {
         self.runner.clone()
     }
 
-    /// Resolved paths (for the snapshot history db, etc.).
+    /// Resolved paths.
     pub fn paths(&self) -> Arc<Paths> {
         self.paths.clone()
     }
@@ -287,9 +286,8 @@ impl ScannerManager {
 
     /// Run a scan to completion, collecting findings into an upserting map keyed
     /// by stable `FindingId` plus the list of sections that FAILED (scanner
-    /// returned an error). Callers that persist results must check `failures` —
-    /// silently saving a partial snapshot would make the next diff report whole
-    /// sections as removed. Used by all headless commands.
+    /// returned an error). Callers should check `failures` before treating the
+    /// result as a complete picture. Used by all headless commands.
     pub async fn run_to_completion(&self, requested: &[ScannerId]) -> ScanOutcome {
         let (tx, mut rx) = mpsc::channel::<ScanEvent>(1024);
         let (sections, discovery_only) = Self::plan(requested);
