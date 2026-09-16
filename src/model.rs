@@ -3,6 +3,7 @@
 //! depend on them, so changes here ripple everywhere. Append-only during fan-out.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -633,6 +634,13 @@ pub enum ScanEvent {
         gen: u64,
         error: String,
     },
+    /// The directory tree of one walked root, for drill-down views. Emitted
+    /// by the Disk section once per root after its walk completes.
+    DirTree {
+        scanner: ScannerId,
+        gen: u64,
+        tree: Arc<crate::scan::walk::DirTree>,
+    },
 }
 
 impl ScanEvent {
@@ -642,7 +650,8 @@ impl ScanEvent {
             | ScanEvent::Progress { scanner, .. }
             | ScanEvent::Finding { scanner, .. }
             | ScanEvent::Finished { scanner, .. }
-            | ScanEvent::Failed { scanner, .. } => *scanner,
+            | ScanEvent::Failed { scanner, .. }
+            | ScanEvent::DirTree { scanner, .. } => *scanner,
         }
     }
 
@@ -652,7 +661,8 @@ impl ScanEvent {
             | ScanEvent::Progress { gen, .. }
             | ScanEvent::Finding { gen, .. }
             | ScanEvent::Finished { gen, .. }
-            | ScanEvent::Failed { gen, .. } => *gen,
+            | ScanEvent::Failed { gen, .. }
+            | ScanEvent::DirTree { gen, .. } => *gen,
         }
     }
 }

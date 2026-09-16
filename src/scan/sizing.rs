@@ -2,8 +2,9 @@
 //!
 //! Sizes are reported as **on-disk blocks** (`blocks() * 512`), not apparent
 //! `len()`: APFS clones and sparse files make apparent size a lie (spec §2).
-//! `du_blocks` sums a subtree; FsScanner runs it on a rayon pool and re-emits
-//! the finding with the size once known.
+//! Every function here is a thin wrapper over `walk::walk` (getattrlistbulk
+//! listing, rayon recursion) with the tree discarded — a caller that wants
+//! the tree uses `walk` directly.
 //!
 //! Hard links are counted ONCE per walk (like real `du`): pnpm's store model
 //! hard-links every package file into each `node_modules`, so counting per
@@ -14,7 +15,9 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
+
+use super::walk::{self, NoVisitor, WalkOptions};
 
 /// Result from a deliberately bounded directory measurement. `complete` is
 /// false when a scan was cancelled, exceeded its entry cap, or hit its shared
@@ -29,25 +32,19 @@ pub struct BoundedSize {
 
 /// Sum the on-disk size (in bytes) of everything under `root`, following no
 /// symlinks, counting hard-linked files once. Best-effort: unreadable entries
-/// are skipped. Checks `cancelled` periodically so a long walk stops promptly
+/// are skipped. Checks `cancelled` per directory so a long walk stops promptly
 /// on rescan.
-pub fn du_blocks(root: &Path, cancelled: &dyn Fn() -> bool) -> u64 {
-    du_blocks_bounded(
-        root,
-        u64::MAX,
-        Instant::now() + Duration::from_secs(365 * 24 * 60 * 60),
-        cancelled,
-    )
-    .bytes
+pub fn du_blocks(root: &Path, cancelled: &(dyn Fn() -> bool + Sync)) -> u64 {
+    size(root, WalkOptions::default(), cancelled).bytes
 }
 
 /// As `du_blocks`, but with both an entry cap and a deadline. This is used for
-/// user-facing disk allocation categories, never as a hidden full-home scan.
+/// measurements that must not turn into a hidden full-disk scan.
 pub fn du_blocks_bounded(
     root: &Path,
     max_entries: u64,
     deadline: Instant,
-    cancelled: &dyn Fn() -> bool,
+    cancelled: &(dyn Fn() -> bool + Sync),
 ) -> BoundedSize {
     du_blocks_bounded_except(root, &HashSet::new(), max_entries, deadline, cancelled)
 }
@@ -61,69 +58,18 @@ pub fn du_blocks_bounded_except(
     skip: &HashSet<PathBuf>,
     max_entries: u64,
     deadline: Instant,
-    cancelled: &dyn Fn() -> bool,
+    cancelled: &(dyn Fn() -> bool + Sync),
 ) -> BoundedSize {
-    #[cfg(unix)]
-    let mut seen_links: HashSet<(u64, u64)> = HashSet::new();
-
-    let mut total: u64 = 0;
-    let mut entries_seen = 0u64;
-    let mut stack = vec![root.to_path_buf()];
-    let mut counter: u32 = 0;
-
-    while let Some(dir) = stack.pop() {
-        counter = counter.wrapping_add(1);
-        if counter.is_multiple_of(256) && (cancelled() || Instant::now() >= deadline) {
-            return BoundedSize {
-                bytes: total,
-                entries: entries_seen,
-                complete: false,
-            };
-        }
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            entries_seen = entries_seen.saturating_add(1);
-            if entries_seen > max_entries || cancelled() || Instant::now() >= deadline {
-                return BoundedSize {
-                    bytes: total,
-                    entries: entries_seen,
-                    complete: false,
-                };
-            }
-            let meta = match entry.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if meta.is_symlink() {
-                continue;
-            }
-            if meta.is_dir() {
-                let path = entry.path();
-                if skip.is_empty() || !skip.contains(&path) {
-                    stack.push(path);
-                }
-            } else {
-                // A file with multiple hard links must only count once no
-                // matter how many of its links live under this root.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    if meta.nlink() > 1 && !seen_links.insert((meta.dev(), meta.ino())) {
-                        continue;
-                    }
-                }
-                total = total.saturating_add(on_disk_bytes(&meta));
-            }
-        }
-    }
-    BoundedSize {
-        bytes: total,
-        entries: entries_seen,
-        complete: true,
-    }
+    size(
+        root,
+        WalkOptions {
+            excludes: skip.iter().cloned().collect(),
+            deadline: Some(deadline),
+            max_entries: Some(max_entries),
+            ..WalkOptions::default()
+        },
+        cancelled,
+    )
 }
 
 /// `du_blocks` plus how many of those bytes belong to files that are also
@@ -137,66 +83,37 @@ pub struct SharedSize {
     pub externally_linked: u64,
 }
 
-pub fn du_blocks_shared(root: &Path, cancelled: &dyn Fn() -> bool) -> SharedSize {
-    #[cfg(unix)]
-    {
-        use std::collections::HashMap;
-        use std::os::unix::fs::MetadataExt;
-        // (dev, ino) → (nlink on disk, links seen in this walk, bytes)
-        let mut linked: HashMap<(u64, u64), (u64, u64, u64)> = HashMap::new();
-        let mut total = 0u64;
-        let mut stack = vec![root.to_path_buf()];
-        let mut counter = 0u32;
-        while let Some(dir) = stack.pop() {
-            counter = counter.wrapping_add(1);
-            if counter.is_multiple_of(256) && cancelled() {
-                break;
-            }
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let Ok(meta) = entry.metadata() else {
-                    continue;
-                };
-                if meta.is_symlink() {
-                    continue;
-                }
-                if meta.is_dir() {
-                    stack.push(entry.path());
-                    continue;
-                }
-                let bytes = on_disk_bytes(&meta);
-                if meta.nlink() > 1 {
-                    let e =
-                        linked
-                            .entry((meta.dev(), meta.ino()))
-                            .or_insert((meta.nlink(), 0, bytes));
-                    if e.1 == 0 {
-                        total = total.saturating_add(bytes);
-                    }
-                    e.1 += 1;
-                } else {
-                    total = total.saturating_add(bytes);
-                }
-            }
-        }
-        let externally_linked = linked
-            .values()
-            .filter(|(nlink, seen, _)| seen < nlink)
-            .map(|(_, _, b)| *b)
-            .sum();
-        SharedSize {
-            bytes: total,
-            externally_linked,
-        }
+pub fn du_blocks_shared(root: &Path, cancelled: &(dyn Fn() -> bool + Sync)) -> SharedSize {
+    let r = walk::walk(
+        root,
+        du_options(WalkOptions::default()),
+        &NoVisitor,
+        None,
+        cancelled,
+    );
+    SharedSize {
+        bytes: r.root.alloc,
+        externally_linked: r.externally_linked,
     }
-    #[cfg(not(unix))]
-    {
-        SharedSize {
-            bytes: du_blocks(root, cancelled),
-            externally_linked: 0,
-        }
+}
+
+/// Totals only: no tree, no per-directory or global largest-file lists.
+fn du_options(opts: WalkOptions) -> WalkOptions {
+    WalkOptions {
+        keep_tree: false,
+        per_dir_top: 0,
+        top_n: 0,
+        threshold: None,
+        ..opts
+    }
+}
+
+fn size(root: &Path, opts: WalkOptions, cancelled: &(dyn Fn() -> bool + Sync)) -> BoundedSize {
+    let r = walk::walk(root, du_options(opts), &NoVisitor, None, cancelled);
+    BoundedSize {
+        bytes: r.root.alloc,
+        entries: r.entries,
+        complete: r.complete,
     }
 }
 
@@ -227,6 +144,7 @@ pub fn path_on_disk_bytes(path: &Path) -> Option<u64> {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::time::Duration;
 
     #[test]
     fn du_sums_a_tree() {

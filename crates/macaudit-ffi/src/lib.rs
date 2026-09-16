@@ -138,6 +138,7 @@ impl Engine {
             session: Mutex::new(Session::default()),
             listener: Mutex::new(None),
             tx,
+            dir_trees: std::sync::RwLock::new(Vec::new()),
         });
         runtime().spawn(session::pump(rx, Arc::downgrade(&shared)));
 

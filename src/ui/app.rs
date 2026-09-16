@@ -22,6 +22,8 @@
 //! ctrl-c, which always quits) do anything.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -119,6 +121,9 @@ pub struct AppState {
     /// Findings per section, upserted by stable id (last write wins — this is the
     /// invariant that makes deferred size updates correct).
     pub(super) findings: HashMap<ScannerId, BTreeMap<FindingId, Finding>>,
+    /// Directory trees from the last Disk walk, keyed by root; cleared when
+    /// the Disk section restarts.
+    pub(super) dir_trees: BTreeMap<PathBuf, Arc<crate::scan::walk::DirTree>>,
     pub(super) status: HashMap<ScannerId, SectionStatus>,
     pub(super) marked: HashSet<FindingId>,
 
@@ -208,6 +213,7 @@ impl Default for AppState {
             .collect();
         AppState {
             findings: HashMap::new(),
+            dir_trees: BTreeMap::new(),
             status,
             marked: HashSet::new(),
             selected_section: 0,

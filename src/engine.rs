@@ -297,12 +297,16 @@ impl ScannerManager {
 
         let mut map: BTreeMap<FindingId, Finding> = BTreeMap::new();
         let mut failures: Vec<(ScannerId, String)> = Vec::new();
+        let mut dir_trees: Vec<Arc<crate::scan::walk::DirTree>> = Vec::new();
         while let Some(ev) = rx.recv().await {
             match ev {
                 ScanEvent::Finding {
                     finding, gen: g, ..
                 } if g == gen => {
                     map.insert(finding.id, *finding);
+                }
+                ScanEvent::DirTree { tree, gen: g, .. } if g == gen => {
+                    dir_trees.push(tree);
                 }
                 ScanEvent::Failed {
                     scanner,
@@ -334,6 +338,7 @@ impl ScannerManager {
         ScanOutcome {
             findings: map,
             failures,
+            dir_trees,
         }
     }
 }
@@ -343,6 +348,8 @@ pub struct ScanOutcome {
     pub findings: BTreeMap<FindingId, Finding>,
     /// Sections whose scanner returned an error, with the error text.
     pub failures: Vec<(ScannerId, String)>,
+    /// One tree per walked Disk root (empty unless Disk was scanned).
+    pub dir_trees: Vec<Arc<crate::scan::walk::DirTree>>,
 }
 
 /// Wrap one scanner: emit `Started`, run, emit `Finished`/`Failed`.

@@ -121,6 +121,9 @@ impl AppState {
         match ev {
             ScanEvent::Started { scanner, .. } => {
                 self.findings.entry(scanner).or_default().clear();
+                if scanner == ScannerId::Fs {
+                    self.dir_trees.clear();
+                }
                 if scanner == ScannerId::Brew {
                     self.brew_version += 1;
                 }
@@ -167,6 +170,9 @@ impl AppState {
             ScanEvent::Failed { scanner, error, .. } => {
                 self.status.insert(scanner, SectionStatus::Failed { error });
                 self.drop_stale_marks(scanner);
+            }
+            ScanEvent::DirTree { tree, .. } => {
+                self.dir_trees.insert(tree.root.clone(), tree);
             }
         }
     }

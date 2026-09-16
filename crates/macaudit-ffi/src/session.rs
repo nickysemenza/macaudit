@@ -9,12 +9,13 @@
 //!   run network enrichment in the background.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 use macaudit::correlate::{self, CORRELATED_SECTIONS};
 use macaudit::engine::ScannerManager;
 use macaudit::model::{Finding, FindingId, FindingKind, ScanEvent, ScannerId};
+use macaudit::scan::walk::DirTree;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -87,6 +88,9 @@ impl Session {
             ScanEvent::Failed { scanner, error, .. } => {
                 self.status.insert(*scanner, Status::Failed(error.clone()));
             }
+            // Stored on `Shared` by the pump (outside this lock); accepted here
+            // so the gen check above still gates it.
+            ScanEvent::DirTree { .. } => {}
         }
         true
     }
@@ -173,6 +177,10 @@ pub struct Shared {
     pub listener: Mutex<Option<Arc<dyn ScanListener>>>,
     /// The one long-lived scan channel, kept across rescans like the TUI's.
     pub tx: mpsc::Sender<ScanEvent>,
+    /// Directory trees from the most recent completed Disk walk, one per
+    /// root. Kept outside `session` so drill-down reads never contend with
+    /// the pump, and replaced (not cleared) on rescan so the UI never blanks.
+    pub dir_trees: RwLock<Vec<Arc<DirTree>>>,
 }
 
 impl Shared {
@@ -306,6 +314,11 @@ pub async fn pump(mut rx: mpsc::Receiver<ScanEvent>, weak: Weak<Shared>) {
                             gen,
                             error,
                         });
+                    }
+                    ScanEvent::DirTree { tree, .. } => {
+                        let mut trees = shared.dir_trees.write().unwrap();
+                        trees.retain(|t| t.root != tree.root);
+                        trees.push(tree);
                     }
                 }
                 if terminal {

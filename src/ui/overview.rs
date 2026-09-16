@@ -170,15 +170,19 @@ fn draw_sources(app: &AppState, frame: &mut Frame, area: Rect, vp: &mut Viewport
     if !categories.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Bounded disk categories",
+            "Disk categories",
             Style::default().add_modifier(Modifier::BOLD),
         )));
         for category in categories.into_iter().take(6) {
+            // Exact unless folders were unreadable; only then say so.
+            let note = match category.meta.get("complete").and_then(|v| v.as_bool()) {
+                Some(false) => " (partial)",
+                _ => "",
+            };
             lines.push(Line::from(format!(
-                "  {} — {} ({})",
+                "  {} — {}{note}",
                 category.title,
                 fmt::bytes(category.size_bytes.unwrap_or(0)),
-                category.coverage.as_deref().unwrap_or("scope unknown")
             )));
         }
     }

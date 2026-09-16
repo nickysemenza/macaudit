@@ -8,6 +8,7 @@
 
 pub mod pipe;
 pub mod sizing;
+pub mod walk;
 
 // Concrete scanners (stubs until their lane lands).
 pub mod apps;
