@@ -54,6 +54,14 @@ struct MacAuditApp: App {
                     .keyboardShortcut("x", modifiers: .command)
                     .disabled(store.marked.isEmpty)
             }
+            CommandGroup(after: .sidebar) {
+                Button("Enclosing Folder") { store.browser.up() }
+                    .keyboardShortcut(.upArrow, modifiers: .command)
+                    .disabled(store.selectedItem != .folders || !store.browser.canGoUp)
+                Button("Back") { store.browser.goBack() }
+                    .keyboardShortcut("[", modifiers: .command)
+                    .disabled(store.selectedItem != .folders || !store.browser.canGoBack)
+            }
         }
         Settings {
             SettingsView().environment(store)
@@ -127,4 +135,10 @@ final class UnavailableEngine: MacAuditEngine {
     func plan(selection: [Selection]) throws -> Plan { throw MacAuditError.Invalid(message: "engine unavailable") }
     func execute(plan: Plan, listener: ExecListener) throws { throw MacAuditError.Invalid(message: "engine unavailable") }
     func cancelCleanup() {}
+    func dirRoot() -> DirEntry? { nil }
+    func dirEntry(path: String) -> DirEntry? { nil }
+    func dirChildren(path: String) -> [DirEntry] { [] }
+    func dirSubtree(path: String, depth: UInt32, maxNodes: UInt32) -> [DirEntry] { [] }
+    func largestFiles(n: UInt32) -> [TopFile] { [] }
+    func dirTreeStats() -> DirTreeStats? { nil }
 }

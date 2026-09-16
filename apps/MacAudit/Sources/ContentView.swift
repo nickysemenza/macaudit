@@ -23,6 +23,10 @@ struct ContentView: View {
                             .navigationSubtitle(subtitle(for: section))
                             .searchable(text: $store.searchText, placement: .toolbar, prompt: "Filter \(meta.title)")
                     }
+                case .folders:
+                    FolderBrowserView()
+                        .navigationTitle("Folders")
+                        .navigationSubtitle(store.browser.current.map { PathDisplay.abbreviateHome($0.path) } ?? "")
                 case nil:
                     ContentUnavailableView("Pick a section", systemImage: "sidebar.left")
                 }
@@ -32,9 +36,15 @@ struct ContentView: View {
         }
         .onChange(of: store.selectedItem) { _, _ in store.searchText = "" }
         .inspector(isPresented: $showInspector) {
-            FindingInspector(finding: store.finding(store.selectedFinding))
-                .inspectorColumnWidth(min: 280, ideal: 340, max: 520)
-                .stableColumnSize()
+            Group {
+                if store.selectedItem == .folders {
+                    DirInspector(entry: store.browser.selectedEntry ?? store.browser.current)
+                } else {
+                    FindingInspector(finding: store.finding(store.selectedFinding))
+                }
+            }
+            .inspectorColumnWidth(min: 280, ideal: 340, max: 520)
+            .stableColumnSize()
         }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {

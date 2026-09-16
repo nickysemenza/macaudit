@@ -9,6 +9,8 @@ struct SectionSidebar: View {
         List(selection: $store.selectedItem) {
             Label("Storage", systemImage: "internaldrive")
                 .tag(SidebarItem.storage)
+            Label("Folders", systemImage: "folder")
+                .tag(SidebarItem.folders)
             Section("Sections") {
                 ForEach(store.sections, id: \.id) { meta in
                     SectionRow(meta: meta).tag(SidebarItem.section(meta.id))
