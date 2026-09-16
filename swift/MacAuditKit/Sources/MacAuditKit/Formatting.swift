@@ -16,6 +16,19 @@ public enum Formatting {
         guard let date else { return "–" }
         return date.formatted(.relative(presentation: .named, unitsStyle: .abbreviated))
     }
+
+    /// `part` as a percentage of `whole`, no decimals ("42%"); "0%" when
+    /// `whole` is zero (avoids a division by zero).
+    public static func share(_ part: UInt64, of whole: UInt64) -> String {
+        guard whole > 0 else { return "0%" }
+        let fraction = Double(part) / Double(whole)
+        return fraction.formatted(.percent.precision(.fractionLength(0)))
+    }
+
+    /// A grouped integer, e.g. "1,234,567".
+    public static func count(_ n: UInt64) -> String {
+        n.formatted(.number.grouping(.automatic))
+    }
 }
 
 extension Severity {

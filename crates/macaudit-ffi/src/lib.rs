@@ -25,6 +25,7 @@ use macaudit::engine::{Mode, ScannerManager};
 use macaudit::model::{Finding as CoreFinding, FindingId, Remedy as CoreRemedy, ScannerId};
 use macaudit::remedy::{execution_remedies, PlannedAction, RealClipboard, RealTrash, RemedyEngine};
 use macaudit::runner::{CommandRunner, RealCommandRunner};
+use macaudit::scan::walk::DirNodeSummary;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -303,6 +304,96 @@ impl Engine {
             .to_string_lossy()
             .into_owned()
     }
+
+    /// The root of the first walked Disk tree, or `None` until a Disk scan
+    /// has completed at least once.
+    pub fn dir_root(&self) -> Option<DirEntry> {
+        let trees = self.shared.dir_trees.read().unwrap();
+        let tree = trees.first()?;
+        tree.summary_at(&tree.root, 0).as_ref().map(DirEntry::from)
+    }
+
+    /// The single directory at `path`, with no children expanded.
+    pub fn dir_entry(&self, path: String) -> Option<DirEntry> {
+        let path = std::path::PathBuf::from(path);
+        let trees = self.shared.dir_trees.read().unwrap();
+        let tree = trees.iter().find(|t| path.starts_with(&t.root))?;
+        tree.summary_at(&path, 0).as_ref().map(DirEntry::from)
+    }
+
+    /// `path`'s direct children, already sorted by allocated size descending.
+    /// Empty when `path` is unknown or a leaf.
+    pub fn dir_children(&self, path: String) -> Vec<DirEntry> {
+        let path = std::path::PathBuf::from(path);
+        let trees = self.shared.dir_trees.read().unwrap();
+        let Some(tree) = trees.iter().find(|t| path.starts_with(&t.root)) else {
+            return Vec::new();
+        };
+        let Some(summary) = tree.summary_at(&path, 1) else {
+            return Vec::new();
+        };
+        summary.children.iter().map(DirEntry::from).collect()
+    }
+
+    /// `path`'s subtree, expanded `depth` levels and flattened preorder,
+    /// capped at `max_nodes` entries.
+    pub fn dir_subtree(&self, path: String, depth: u32, max_nodes: u32) -> Vec<DirEntry> {
+        let path = std::path::PathBuf::from(path);
+        let trees = self.shared.dir_trees.read().unwrap();
+        let Some(tree) = trees.iter().find(|t| path.starts_with(&t.root)) else {
+            return Vec::new();
+        };
+        let Some(summary) = tree.summary_at(&path, depth as usize) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        flatten_preorder(&summary, max_nodes as usize, &mut out);
+        out
+    }
+
+    /// The largest files across every walked root, allocated size descending.
+    pub fn largest_files(&self, n: u32) -> Vec<TopFile> {
+        let trees = self.shared.dir_trees.read().unwrap();
+        let mut merged: Vec<TopFile> = trees
+            .iter()
+            .flat_map(|t| t.largest_files(n as usize))
+            .map(|f| TopFile::from(&f))
+            .collect();
+        merged.sort_by_key(|f| std::cmp::Reverse(f.alloc));
+        merged.truncate(n as usize);
+        merged
+    }
+
+    /// Summary counters for the first walked root, for the Disk section's
+    /// header/status. `None` until a Disk scan has completed at least once.
+    pub fn dir_tree_stats(&self) -> Option<DirTreeStats> {
+        let trees = self.shared.dir_trees.read().unwrap();
+        let tree = trees.first()?;
+        Some(DirTreeStats {
+            root: tree.root.to_string_lossy().into_owned(),
+            files: tree.files,
+            dirs: tree.dirs,
+            bytes: tree.bytes,
+            errors: tree.errors,
+            complete: tree.complete,
+            elapsed_ms: tree.elapsed.as_millis() as u64,
+        })
+    }
+}
+
+/// Depth-first, parent-before-children flatten of a summary tree, stopping
+/// once `out` reaches `max_nodes`.
+fn flatten_preorder(node: &DirNodeSummary, max_nodes: usize, out: &mut Vec<DirEntry>) {
+    if out.len() >= max_nodes {
+        return;
+    }
+    out.push(DirEntry::from(node));
+    for child in &node.children {
+        if out.len() >= max_nodes {
+            return;
+        }
+        flatten_preorder(child, max_nodes, out);
+    }
 }
 
 impl Drop for Engine {
@@ -490,5 +581,57 @@ mod tests {
             engine.execute(plan, Arc::new(Sink)),
             Err(MacAuditError::Busy(_))
         ));
+    }
+
+    fn scan_fs(engine: &Engine) -> Arc<Collector> {
+        let collector = Arc::new(Collector(Mutex::new(Vec::new())));
+        let listener: Arc<dyn ScanListener> = collector.clone();
+        engine.start_scan(vec![SectionId::Fs], listener);
+        collector.wait_for_terminal(1);
+        collector
+    }
+
+    #[test]
+    fn dir_tree_is_absent_before_a_scan() {
+        let (engine, _home) = fake_engine();
+        assert!(engine.dir_root().is_none());
+        assert!(engine.dir_tree_stats().is_none());
+        assert!(engine.dir_entry("/Users/dev".to_string()).is_none());
+        assert!(engine.dir_children("/Users/dev".to_string()).is_empty());
+        assert!(engine
+            .dir_subtree("/Users/dev".to_string(), 2, 5)
+            .is_empty());
+        assert!(engine.largest_files(3).is_empty());
+    }
+
+    #[test]
+    fn fake_scan_exposes_dir_tree() {
+        let (engine, _home) = fake_engine();
+        scan_fs(&engine);
+
+        let root = engine.dir_root().expect("dir tree after a Disk scan");
+        assert_eq!(root.path, "/Users/dev");
+
+        let children = engine.dir_children(root.path.clone());
+        assert!(!children.is_empty());
+        assert!(children
+            .iter()
+            .all(|c| c.path.starts_with(&root.path) && c.path != root.path));
+        assert!(children.windows(2).all(|w| w[0].alloc >= w[1].alloc));
+
+        assert!(engine.dir_entry("/nope".to_string()).is_none());
+
+        let leaf = children
+            .iter()
+            .find(|c| !c.has_children)
+            .expect("a leaf directory in the fake tree");
+        assert!(engine.dir_children(leaf.path.clone()).is_empty());
+
+        let subtree = engine.dir_subtree(root.path.clone(), 2, 5);
+        assert!(subtree.len() <= 5);
+
+        let largest = engine.largest_files(3);
+        assert!(largest.len() <= 3);
+        assert!(largest.windows(2).all(|w| w[0].alloc >= w[1].alloc));
     }
 }

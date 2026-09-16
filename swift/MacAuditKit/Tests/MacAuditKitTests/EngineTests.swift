@@ -77,6 +77,14 @@ final class TerminalWaiter: ScanListener, @unchecked Sendable {
     #expect(!apps.isEmpty)
     #expect(apps.allSatisfy { waiter.seen.contains($0.id) })
     #expect(engine.deleteMode() == .trash)
+
+    #expect(engine.dirRoot()?.path == "/Users/dev")
+    let children = engine.dirChildren(path: "/Users/dev")
+    #expect(!children.isEmpty)
+    for (a, b) in zip(children, children.dropFirst()) {
+        #expect(a.alloc >= b.alloc)
+    }
+    #expect(engine.dirTreeStats()?.complete == true)
 }
 
 @Test func findingMetaDistinguishesBooleansFromNumbers() {

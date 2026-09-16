@@ -14,6 +14,7 @@ use macaudit::config::DeleteMode as CoreDeleteMode;
 use macaudit::model::{self, FindingId, ScannerId};
 use macaudit::registry::{self, ViewKind as CoreViewKind};
 use macaudit::remedy::PlannedAction;
+use macaudit::scan::walk::{BigFile, DirNodeSummary};
 
 /// One sidebar section; mirrors `ScannerId`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, uniffi::Enum)]
@@ -595,6 +596,67 @@ fn path_string(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
+/// One of a directory's largest own files (absolute path).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct TopFile {
+    pub path: String,
+    pub alloc: u64,
+}
+
+impl From<&BigFile> for TopFile {
+    fn from(f: &BigFile) -> Self {
+        TopFile {
+            path: path_string(&f.path),
+            alloc: f.alloc,
+        }
+    }
+}
+
+/// One directory in the Disk tree, flat (no nested children) — the UI
+/// queries one level at a time via `Engine::dir_children`/`dir_subtree`.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct DirEntry {
+    pub path: String,
+    pub name: String,
+    pub alloc: u64,
+    pub apparent: u64,
+    pub files: u64,
+    pub dirs: u64,
+    pub errors: u64,
+    /// Whether this directory has any subdirectories (`child_count > 0`).
+    pub has_children: bool,
+    /// Largest own files, largest first.
+    pub top_files: Vec<TopFile>,
+}
+
+impl From<&DirNodeSummary> for DirEntry {
+    fn from(s: &DirNodeSummary) -> Self {
+        DirEntry {
+            path: path_string(&s.path),
+            name: s.name.clone(),
+            alloc: s.alloc,
+            apparent: s.apparent,
+            files: s.files,
+            dirs: s.dirs,
+            errors: s.errors,
+            has_children: s.child_count > 0,
+            top_files: s.top_files.iter().map(TopFile::from).collect(),
+        }
+    }
+}
+
+/// Summary counters for one walked root — the Disk section's header/status.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct DirTreeStats {
+    pub root: String,
+    pub files: u64,
+    pub dirs: u64,
+    pub bytes: u64,
+    pub errors: u64,
+    pub complete: bool,
+    pub elapsed_ms: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,5 +773,48 @@ mod tests {
                 other => panic!("variant changed shape: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn dir_entry_maps_field_by_field() {
+        let summary = DirNodeSummary {
+            name: "dev".to_string(),
+            path: std::path::PathBuf::from("/Users/dev/dev"),
+            alloc: 45 * 1024 * 1024 * 1024,
+            apparent: 45 * 1024 * 1024 * 1024,
+            files: 16_210,
+            dirs: 2_222,
+            errors: 3,
+            top_files: vec![
+                BigFile {
+                    path: std::path::PathBuf::from("/Users/dev/dev/.zsh_history"),
+                    alloc: 180 * 1024,
+                },
+                BigFile {
+                    path: std::path::PathBuf::from("/Users/dev/dev/Cargo.lock"),
+                    alloc: 90 * 1024,
+                },
+            ],
+            child_count: 4,
+            children: Vec::new(),
+        };
+        let entry = DirEntry::from(&summary);
+        assert_eq!(entry.path, "/Users/dev/dev");
+        assert_eq!(entry.name, "dev");
+        assert_eq!(entry.alloc, summary.alloc);
+        assert_eq!(entry.apparent, summary.apparent);
+        assert_eq!(entry.files, summary.files);
+        assert_eq!(entry.dirs, summary.dirs);
+        assert_eq!(entry.errors, summary.errors);
+        assert!(entry.has_children);
+        assert_eq!(entry.top_files.len(), 2);
+        assert_eq!(entry.top_files[0].path, "/Users/dev/dev/.zsh_history");
+        assert_eq!(entry.top_files[0].alloc, 180 * 1024);
+        assert_eq!(entry.top_files[1].path, "/Users/dev/dev/Cargo.lock");
+        assert_eq!(entry.top_files[1].alloc, 90 * 1024);
+
+        let mut leaf = summary;
+        leaf.child_count = 0;
+        assert!(!DirEntry::from(&leaf).has_children);
     }
 }

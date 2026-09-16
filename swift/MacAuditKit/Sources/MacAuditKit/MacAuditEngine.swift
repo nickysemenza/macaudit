@@ -14,9 +14,23 @@ public protocol MacAuditEngine: AnyObject, Sendable {
     func plan(selection: [Selection]) throws -> Plan
     func execute(plan: Plan, listener: ExecListener) throws
     func cancelCleanup()
+    func dirRoot() -> DirEntry?
+    func dirEntry(path: String) -> DirEntry?
+    func dirChildren(path: String) -> [DirEntry]
+    func dirSubtree(path: String, depth: UInt32, maxNodes: UInt32) -> [DirEntry]
+    func largestFiles(n: UInt32) -> [TopFile]
+    func dirTreeStats() -> DirTreeStats?
 }
 
 extension Engine: MacAuditEngine {}
+
+extension DirEntry: Identifiable {
+    public var id: String { path }
+}
+
+extension TopFile: Identifiable {
+    public var id: String { path }
+}
 
 extension SectionId: CaseIterable {
     /// Sidebar order — the same order as `Engine.sections()`.
