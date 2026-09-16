@@ -45,6 +45,8 @@ struct SectionSidebar: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(.bar)
         }
+        // Outermost on purpose: the footer above is the sidebar's churn source.
+        .stableColumnSize()
     }
 }
 
