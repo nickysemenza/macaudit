@@ -89,7 +89,10 @@ private struct MenuBarContent: View {
                 Text(Formatting.bytes(store.totalReclaimableBytes))
                     .font(.headline).monospacedDigit().contentTransition(.numericText())
             }
-            ForEach(store.sections, id: \.id) { meta in
+            // Projects/App Storage are top-level lenses (Sidebar), not
+            // reclaimable-cleanup sections — kept out of this menu the same
+            // way they're kept out of the sidebar's Sections list.
+            ForEach(store.sections.filter { $0.id != .projects && $0.id != .appStorage }, id: \.id) { meta in
                 let bytes = store.reclaimableBytes(in: meta.id)
                 if bytes > 0 || { if case .scanning = store.status(of: meta.id) { true } else { false } }() {
                     HStack {
@@ -143,4 +146,6 @@ final class UnavailableEngine: MacAuditEngine {
     func dirTopFiles(path: String, n: UInt32) -> [TopFile] { [] }
     func largestFiles(n: UInt32) -> [TopFile] { [] }
     func dirTreeStats() -> DirTreeStats? { nil }
+    func footprint(findingId: UInt64) -> Footprint? { nil }
+    func footprintBuckets(axis: AttributionAxis) -> FootprintBuckets? { nil }
 }

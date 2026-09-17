@@ -7,6 +7,7 @@
 //! Kept out of `registry.rs` on purpose: the registry is consumed by the
 //! engine and CLI, and these types drag in ratatui.
 
+mod app_storage;
 mod apps;
 mod brew;
 mod disk;
@@ -15,6 +16,7 @@ mod git;
 mod ios;
 mod launchd;
 mod ports;
+mod projects;
 mod runtimes;
 mod shell;
 mod simulator;
@@ -23,14 +25,23 @@ mod time_machine;
 mod tools;
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use ratatui::layout::{Alignment, Constraint};
 use ratatui::style::{Color, Style};
 use serde_json::Value;
 
-use crate::model::{Finding, ScannerId};
+// `Axis` crosses into `present::projects`/`present::app_storage` (both call
+// `attribution_detail(f, m, Axis::…)`), so it's re-exported via `pub(super)
+// use` — a plain `use` here would stay private to this module and not reach
+// children through their `use super::*;`. `FootprintEntry`/`FootprintSet`/
+// `ProcKind` are only named inside this file's own detail-building code.
+pub(super) use crate::attribution::model::Axis;
+use crate::attribution::model::{FootprintEntry, FootprintSet, ProcKind};
+use crate::model::{Finding, FindingKind, ScannerId};
 use crate::ui::{fmt, theme};
 
 /// Globally unique column identities. Sorting is keyed by these, so a header
@@ -72,6 +83,17 @@ pub enum ColumnId {
     AppBytes,
     /// iOS app data (documents, caches, downloads) size.
     DataBytes,
+    /// Projects/App Storage: this owner's 1/N slice of multi-owner entries.
+    Shared,
+    /// Projects/App Storage: everything this owner touches, shared and
+    /// baseline included.
+    Reach,
+    /// Projects: linked worktree count.
+    Worktrees,
+    /// Projects: live processes whose cwd is inside the project.
+    Procs,
+    /// Projects: listening ports joined to a process inside the project.
+    Ports,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -481,6 +503,8 @@ pub fn presenter(id: ScannerId) -> &'static SectionPresenter {
         ScannerId::Apps => &apps::PRESENTER,
         ScannerId::Brew => &brew::PRESENTER,
         ScannerId::Fs => &disk::PRESENTER,
+        ScannerId::Projects => &projects::PRESENTER,
+        ScannerId::AppStorage => &app_storage::PRESENTER,
         ScannerId::Launchd => &launchd::PRESENTER,
         ScannerId::ShellEnv => &shell::PRESENTER,
         ScannerId::Runtimes => &runtimes::PRESENTER,
@@ -614,6 +638,437 @@ pub(super) fn key_meta_int(f: &Finding, key: &str) -> SortKey {
     }
 }
 
+/// A byte-valued meta field as a sort key (`None` when the field is absent,
+/// e.g. a bucket row that has no `exclusive`/`shared`/`reach`).
+pub(super) fn key_meta_bytes(f: &Finding, key: &str) -> SortKey {
+    match meta_u64(f, key) {
+        Some(b) => SortKey::Bytes(b),
+        None => SortKey::None,
+    }
+}
+
+/// The length of a meta array field as a sort key (`None`, not `0`, when the
+/// field itself is absent — so rows without the concept at all sort behind
+/// rows that have zero of it).
+pub(super) fn key_meta_array_len(f: &Finding, key: &str) -> SortKey {
+    match f.meta.get(key).and_then(|v| v.as_array()) {
+        Some(a) => SortKey::Int(a.len() as i64),
+        None => SortKey::None,
+    }
+}
+
+/// A count cell: blank at zero, dim otherwise — used for the small integer
+/// columns (worktrees, processes, ports) that would otherwise clutter a
+/// table of mostly-zero rows.
+pub(super) fn count_cell(n: usize) -> CellText {
+    if n == 0 {
+        plain("")
+    } else {
+        dim(n.to_string())
+    }
+}
+
+// ---- Projects / App Storage: shared presentation ----
+//
+// The two attribution axes (`present::projects`, `present::app_storage`)
+// share their Excl/Shared/Reach columns, the dim treatment of the three
+// synthetic bucket rows (Baseline/Unattributed/Coverage — sorted to the
+// bottom of every column, not just the default one), and the whole detail
+// pane layout. Kept here instead of duplicated in both files.
+//
+// The detail pane's "Top entries", "Processes", and the bucket rows'
+// "Baseline"/"Unattributed" entry lists need the full `Footprint`/
+// `FootprintSet` — `meta` deliberately stays summary-only (by_kind bytes,
+// counts) so it doesn't blow up the FFI's `meta_json` (see the attribution
+// plan §4). `DetailFn` only receives a `Finding`, like every other section's
+// detail fn, so rather than change that signature for all 16 sections, the
+// two attribution scanners' data is mirrored here from `AppState.footprints`
+// (`ui/state.rs`, on every `ScanEvent::Footprints`) and looked up by finding
+// id. Single-threaded rendering, hence a plain `RefCell`.
+thread_local! {
+    static FOOTPRINTS: RefCell<BTreeMap<Axis, Arc<FootprintSet>>> =
+        const { RefCell::new(BTreeMap::new()) };
+}
+
+/// Mirror `AppState.footprints` into the thread-local the two attribution
+/// detail fns read from. Called from `ui/state.rs`'s `ScanEvent::Footprints`
+/// handler, right after it updates `AppState.footprints` itself.
+pub(crate) fn cache_footprints(map: &BTreeMap<Axis, Arc<FootprintSet>>) {
+    FOOTPRINTS.with(|c| *c.borrow_mut() = map.clone());
+}
+
+/// The latest `FootprintSet` for `axis`, if that axis has finished at least
+/// one scan since the process started.
+fn cached_footprint_set(axis: Axis) -> Option<Arc<FootprintSet>> {
+    FOOTPRINTS.with(|c| c.borrow().get(&axis).cloned())
+}
+
+/// A one-line footprint bar: `▮` cells for exclusive, `▯` for shared, `·`
+/// for baseline share. The bar's length is this owner's `reach` scaled
+/// against `max_reach` (the largest reach in the section), so bars are
+/// comparable at a glance; `width` is the length the largest owner's bar
+/// would reach. Never panics on `max_reach == 0` or an all-zero owner —
+/// both just render an empty bar.
+pub(super) fn bar(
+    exclusive: u64,
+    shared: u64,
+    baseline_share: u64,
+    max_reach: u64,
+    width: usize,
+) -> String {
+    if width == 0 || max_reach == 0 {
+        return String::new();
+    }
+    let reach = exclusive
+        .saturating_add(shared)
+        .saturating_add(baseline_share);
+    if reach == 0 {
+        return String::new();
+    }
+    let filled = ((reach as f64 / max_reach as f64) * width as f64).round() as usize;
+    let filled = filled.clamp(1, width);
+    let total = reach.max(1) as u128;
+    let raw = [exclusive, shared, baseline_share];
+    let mut cells = [0usize; 3];
+    let mut assigned = 0usize;
+    for i in 0..3 {
+        cells[i] = (raw[i] as u128 * filled as u128 / total) as usize;
+        assigned += cells[i];
+    }
+    // Rounding can leave `filled - assigned` cells unaccounted for; hand
+    // them to the largest components first so the bar's visible length
+    // always matches `filled` exactly.
+    let mut remaining = filled.saturating_sub(assigned);
+    let mut order = [0usize, 1, 2];
+    order.sort_by_key(|&i| std::cmp::Reverse(raw[i]));
+    for &i in &order {
+        if remaining == 0 {
+            break;
+        }
+        if raw[i] > 0 {
+            cells[i] += 1;
+            remaining -= 1;
+        }
+    }
+    if remaining > 0 {
+        // Only reachable if every component is zero, which `reach == 0`
+        // above already ruled out — kept as a non-panicking fallback.
+        cells[0] += remaining;
+    }
+    let glyphs = ['▮', '▯', '·'];
+    let mut s = String::with_capacity(filled);
+    for (glyph, &n) in glyphs.iter().zip(cells.iter()) {
+        for _ in 0..n {
+            s.push(*glyph);
+        }
+    }
+    s
+}
+
+/// The three synthetic bucket rows both attribution axes emit
+/// (`FindingKind::ProjectBucket` / `AppStorageBucket`): Baseline,
+/// Unattributed, Coverage. Rendered dim in the Name column and sorted to
+/// the bottom under every sortable column, not just the default one.
+pub(super) fn is_attribution_bucket(f: &Finding) -> bool {
+    matches!(
+        f.kind,
+        FindingKind::ProjectBucket | FindingKind::AppStorageBucket
+    )
+}
+
+pub(super) fn bucket_aware_name_cell(f: &Finding, ctx: &CellCtx) -> CellText {
+    if is_attribution_bucket(f) {
+        dim(f.title.clone())
+    } else {
+        name_cell(f, ctx)
+    }
+}
+
+pub(super) fn key_name_bucket_last(f: &Finding) -> SortKey {
+    if is_attribution_bucket(f) {
+        SortKey::None
+    } else {
+        key_title(f)
+    }
+}
+
+fn meta_bytes_cell(f: &Finding, key: &str, ctx: &CellCtx) -> CellText {
+    plain(fmt::bytes_opt(meta_u64(f, key), ctx.is_scanning))
+}
+pub(super) fn excl_cell(f: &Finding, ctx: &CellCtx) -> CellText {
+    meta_bytes_cell(f, "exclusive", ctx)
+}
+pub(super) fn shared_cell(f: &Finding, ctx: &CellCtx) -> CellText {
+    meta_bytes_cell(f, "shared", ctx)
+}
+pub(super) fn reach_cell(f: &Finding, ctx: &CellCtx) -> CellText {
+    meta_bytes_cell(f, "reach", ctx)
+}
+pub(super) fn key_excl(f: &Finding) -> SortKey {
+    key_meta_bytes(f, "exclusive")
+}
+pub(super) fn key_shared(f: &Finding) -> SortKey {
+    key_meta_bytes(f, "shared")
+}
+pub(super) fn key_reach(f: &Finding) -> SortKey {
+    key_meta_bytes(f, "reach")
+}
+
+const CLONE_NOTE: &str = "node_modules is an APFS clone of the pnpm store — those bytes are \
+     shared with the store, not freed by deleting node_modules.";
+
+fn proc_kind_label(kind: ProcKind) -> &'static str {
+    match kind {
+        ProcKind::Shell => "shell",
+        ProcKind::Server => "server",
+        ProcKind::Other => "other",
+    }
+}
+
+/// One `FootprintEntry` as detail-pane fields: `bytes  tier  label [badges]`
+/// then, on a second dim line, the evidence that linked it.
+fn entry_fields(e: &FootprintEntry) -> Vec<Field> {
+    let mut badges = Vec::new();
+    if e.stale {
+        badges.push("stale");
+    }
+    if e.clone_of_store {
+        badges.push("clone");
+    }
+    if e.virtual_bytes {
+        badges.push("virtual");
+    }
+    if e.r#unsized {
+        badges.push("unsized");
+    }
+    let suffix = if badges.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", badges.join(" "))
+    };
+    let mut fields = vec![kv(
+        format!("{}  {}", fmt::bytes(e.bytes), e.tier.label()),
+        format!("{}{suffix}", e.label),
+    )];
+    if !e.evidence.is_empty() {
+        fields.push(kv_styled("  ↳", e.evidence.clone(), Color::DarkGray));
+    }
+    fields
+}
+
+/// Shared detail body for the Projects and App Storage presenters — the
+/// four numbers, the bar, the by-kind breakdown, top entries, worktrees/
+/// processes/ports and the APFS-clone note for an owner row; coverage/
+/// baseline/unattributed for the three bucket rows.
+pub(super) fn attribution_detail(f: &Finding, m: &mut MetaView<'_>, axis: Axis) -> Vec<Field> {
+    if is_attribution_bucket(f) {
+        attribution_bucket_detail(f, m, axis)
+    } else {
+        attribution_owner_detail(f, m, axis)
+    }
+}
+
+fn attribution_owner_detail(f: &Finding, m: &mut MetaView<'_>, axis: Axis) -> Vec<Field> {
+    let mut out = Vec::new();
+    m.skip("owner_key");
+    m.skip("group");
+    let exclusive = m.u64("exclusive").unwrap_or(0);
+    let shared = m.u64("shared").unwrap_or(0);
+    let reach = m.u64("reach").unwrap_or(0);
+    let baseline_share = m.u64("baseline_share").unwrap_or(0);
+    out.push(kv(
+        "Exclusive",
+        format!("{} — only this owner touches it", fmt::bytes(exclusive)),
+    ));
+    out.push(kv(
+        "Shared",
+        format!(
+            "{} — this owner's slice of paths more than one owner touches",
+            fmt::bytes(shared)
+        ),
+    ));
+    out.push(kv(
+        "Reach",
+        format!(
+            "{} — everything this owner touches, shared and baseline included",
+            fmt::bytes(reach)
+        ),
+    ));
+    out.push(kv(
+        "Baseline share",
+        format!(
+            "{} — this owner's slice of ecosystem-wide resources",
+            fmt::bytes(baseline_share)
+        ),
+    ));
+    out.extend(kv_str(m, "top_tier", "Best evidence"));
+
+    let set = cached_footprint_set(axis);
+    if let Some(set) = &set {
+        let max_reach = set
+            .footprints
+            .iter()
+            .map(|fp| fp.reach)
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let bar = bar(exclusive, shared, baseline_share, max_reach, 40);
+        if !bar.is_empty() {
+            out.push(Field::Text(bar));
+        }
+    }
+
+    if let Some(by_kind) = f.meta.get("by_kind").and_then(|v| v.as_array()) {
+        if !by_kind.is_empty() {
+            out.push(Field::Blank);
+            out.push(Field::Header("By kind"));
+            for row in by_kind {
+                let kind = row.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+                let bytes = row.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+                out.push(kv(kind.to_string(), fmt::bytes(bytes)));
+            }
+        }
+    }
+    m.skip("by_kind");
+    m.skip("entry_count");
+
+    let fp = set
+        .as_ref()
+        .and_then(|s| s.footprints.iter().find(|fp| fp.finding == f.id));
+    match fp {
+        Some(fp) => {
+            m.skip("worktrees");
+            m.skip("process_count");
+            m.skip("ports");
+            m.skip("clone_note");
+            let mut entries: Vec<&FootprintEntry> =
+                fp.groups.iter().flat_map(|g| &g.entries).collect();
+            entries.sort_by_key(|e| std::cmp::Reverse(e.bytes));
+            if !entries.is_empty() {
+                out.push(Field::Blank);
+                out.push(Field::Header("Top entries"));
+                for e in entries.into_iter().take(15) {
+                    out.extend(entry_fields(e));
+                }
+            }
+            if !fp.worktrees.is_empty() {
+                out.push(Field::Blank);
+                out.push(Field::Header("Worktrees"));
+                for w in &fp.worktrees {
+                    out.push(Field::Text(format!("  {}", fmt::abbrev_home(w))));
+                }
+            }
+            if !fp.processes.is_empty() {
+                out.push(Field::Blank);
+                out.push(Field::Header("Processes"));
+                for p in &fp.processes {
+                    out.push(kv(
+                        format!("  {}", p.pid),
+                        format!("{} — {}", p.name, proc_kind_label(p.kind)),
+                    ));
+                }
+            }
+            if !fp.ports.is_empty() {
+                let ports = fp
+                    .ports
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push(kv("Ports", ports));
+            }
+            if fp.clone_note {
+                out.push(Field::Blank);
+                out.push(Field::Text(CLONE_NOTE.to_string()));
+            }
+        }
+        None => {
+            out.extend(kv_list(m, "worktrees", "Worktrees"));
+            if let Some(n) = m.u64("process_count") {
+                if n > 0 {
+                    out.push(kv(
+                        "Processes",
+                        format!("{n} (reopen this row once the scan finishes for detail)"),
+                    ));
+                }
+            }
+            out.extend(kv_list(m, "ports", "Ports"));
+            if m.bool("clone_note").unwrap_or(false) {
+                out.push(Field::Blank);
+                out.push(Field::Text(CLONE_NOTE.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// Detail for the three synthetic bucket rows: Coverage shows
+/// `attributed_total / disk_total` and which dependency sections were
+/// missing; Baseline/Unattributed list their entries (with `reason` for
+/// Unattributed) from the cached `FootprintSet` — `meta` only carries their
+/// count.
+fn attribution_bucket_detail(f: &Finding, m: &mut MetaView<'_>, axis: Axis) -> Vec<Field> {
+    let mut out = Vec::new();
+    m.skip("group");
+    if f.title == "Coverage" {
+        let disk_total = m.u64("disk_total").unwrap_or(0);
+        let attributed_total = m.u64("attributed_total").unwrap_or(0);
+        let pct = if disk_total > 0 {
+            attributed_total as f64 / disk_total as f64 * 100.0
+        } else {
+            0.0
+        };
+        out.push(kv(
+            "Attributed",
+            format!(
+                "{} / {} ({pct:.0}%)",
+                fmt::bytes(attributed_total),
+                fmt::bytes(disk_total)
+            ),
+        ));
+        if let Some(missing) = m.list("missing_deps") {
+            if !missing.is_empty() {
+                let labels: Vec<String> = missing
+                    .iter()
+                    .map(|s| format!("{} not scanned", prettify_key(s)))
+                    .collect();
+                out.push(kv_styled(
+                    "Missing dependencies",
+                    labels.join(", "),
+                    Color::Yellow,
+                ));
+            }
+        }
+        return out;
+    }
+
+    m.skip("entry_count");
+    let entries = cached_footprint_set(axis).map(|set| {
+        if f.title == "Baseline" {
+            set.baseline.clone()
+        } else {
+            set.unattributed.clone()
+        }
+    });
+    match entries {
+        Some(entries) if !entries.is_empty() => {
+            let mut sorted: Vec<&FootprintEntry> = entries.iter().collect();
+            sorted.sort_by_key(|e| std::cmp::Reverse(e.bytes));
+            for e in sorted.into_iter().take(30) {
+                out.extend(entry_fields(e));
+                if let Some(reason) = &e.reason {
+                    out.push(kv_styled("  reason", reason.clone(), Color::Yellow));
+                }
+            }
+        }
+        Some(_) => out.push(Field::Text("No entries.".to_string())),
+        None => out.push(Field::Text(
+            "Not yet available — rescan this section.".to_string(),
+        )),
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,5 +1156,35 @@ mod tests {
         assert_eq!(s2, SortSpec::col(ColumnId::Branch, SortDir::Desc));
         // Unsortable / unknown columns leave the sort alone.
         assert_eq!(p.click_sort(s2, ColumnId::Port), s2);
+    }
+
+    #[test]
+    fn bar_scales_by_reach_and_splits_by_component() {
+        // Half the section's max reach, all exclusive: half the bar, all ▮.
+        assert_eq!(bar(50, 0, 0, 100, 20), "▮".repeat(10));
+        // A mix of all three components splits proportionally, largest
+        // remainder first, and the bar's length still matches exactly.
+        let mixed = bar(6, 3, 1, 10, 10);
+        assert_eq!(mixed.chars().count(), 10);
+        assert_eq!(mixed.chars().filter(|c| *c == '▮').count(), 6);
+        assert_eq!(mixed.chars().filter(|c| *c == '▯').count(), 3);
+        assert_eq!(mixed.chars().filter(|c| *c == '·').count(), 1);
+        // Never panics on zero — just renders nothing.
+        assert_eq!(bar(0, 0, 0, 100, 20), "");
+        assert_eq!(bar(10, 0, 0, 0, 20), "");
+        assert_eq!(bar(10, 0, 0, 100, 0), "");
+        // A tiny non-zero owner still shows at least one cell rather than
+        // rounding away to nothing.
+        assert_eq!(bar(1, 0, 0, 1_000_000, 20), "▮");
+    }
+
+    #[test]
+    fn attribution_bucket_rows_are_recognised_and_sort_last() {
+        let bucket = Finding::new(FindingKind::ProjectBucket, "projects:baseline", "Baseline");
+        let owner = Finding::new(FindingKind::Project, "/x", "x");
+        assert!(is_attribution_bucket(&bucket));
+        assert!(!is_attribution_bucket(&owner));
+        assert_eq!(key_name_bucket_last(&bucket), SortKey::None);
+        assert_ne!(key_name_bucket_last(&owner), SortKey::None);
     }
 }

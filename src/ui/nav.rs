@@ -380,6 +380,21 @@ impl AppState {
                 }
             }
         }
+        // Projects/App Storage: an owner row has a path (its project root
+        // or app/formula/tool path) and opens Browse there, same as a Disk
+        // category. The three synthetic bucket rows never carry a path, so
+        // Enter on them just falls through to the detail pane below.
+        if matches!(
+            self.selected_section_id(),
+            ScannerId::Projects | ScannerId::AppStorage
+        ) {
+            if let Some(f) = self.selected_finding() {
+                if let Some(path) = f.path.clone() {
+                    self.open_browse_at_path(path);
+                    return;
+                }
+            }
+        }
         self.detail_mode = DetailMode::ForceOn;
         self.detail_scroll = 0;
     }
@@ -762,5 +777,53 @@ mod tests {
 
         assert_eq!(app.mode, Mode::Browse);
         assert_eq!(app.browse.path, PathBuf::from("/Users/dev/dev"));
+    }
+
+    /// Same as the Disk category case above, but for a Projects owner row —
+    /// `cubby`'s path is its repo root, which the fake tree also has a node
+    /// for. The bucket rows (Baseline/Unattributed/Coverage) have no path,
+    /// so Enter on those must NOT enter Browse — covered by the second half
+    /// of this test.
+    #[test]
+    fn enter_on_project_finding_opens_browse_at_its_path_but_not_on_bucket_rows() {
+        let mut app = app_with_gen(1);
+        let idx = crate::registry::REGISTRY
+            .iter()
+            .position(|s| s.id == ScannerId::Projects)
+            .unwrap();
+        app.handle(Action::JumpSection(idx));
+        for f in fake::fixtures(ScannerId::Projects) {
+            app.apply(ScanEvent::Finding {
+                scanner: ScannerId::Projects,
+                gen: 1,
+                finding: Box::new(f),
+            });
+        }
+        apply_fake_tree(&mut app);
+
+        let row = app
+            .rows_titles()
+            .iter()
+            .position(|t| t.as_deref() == Some("cubby"))
+            .expect("the cubby Project row is present");
+        app.handle(Action::SelectRow(row));
+        app.handle(Action::Enter);
+        assert_eq!(app.mode, Mode::Browse);
+        assert_eq!(app.browse.path, PathBuf::from("/Users/dev/dev/cubby"));
+
+        app.handle(Action::Esc);
+        let bucket_row = app
+            .rows_titles()
+            .iter()
+            .position(|t| t.as_deref() == Some("Baseline"))
+            .expect("the Baseline bucket row is present");
+        app.handle(Action::SelectRow(bucket_row));
+        app.handle(Action::Enter);
+        assert_eq!(
+            app.mode,
+            Mode::Normal,
+            "a bucket row has no path, so Enter should just force the detail pane on"
+        );
+        assert_eq!(app.detail_mode, DetailMode::ForceOn);
     }
 }

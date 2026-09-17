@@ -37,16 +37,36 @@ struct CleanupRun {
     var reportJSON: String?
 }
 
-/// What the sidebar can select: the Storage overview, a scanner section, or
-/// the Folders drill-down.
+/// What the sidebar can select: the Storage overview, the Projects/Apps
+/// attribution lenses, a scanner section, or the Folders drill-down.
 enum SidebarItem: Hashable {
     case storage
+    case projects
+    case apps
     case section(SectionId)
     case folders
 
+    /// The scanner section backing this item, for rescan/status lookups.
+    /// `.projects`/`.apps` map to their underlying `SectionId` even though
+    /// they aren't reachable through `.section(_:)` — they're top-level
+    /// lenses, not entries in the generic Sections list.
     var section: SectionId? {
-        if case .section(let id) = self { return id }
-        return nil
+        switch self {
+        case .section(let id): id
+        case .projects: .projects
+        case .apps: .appStorage
+        case .storage, .folders: nil
+        }
+    }
+
+    /// The attribution axis this item is a lens over, `nil` for every other
+    /// item.
+    var axis: AttributionAxis? {
+        switch self {
+        case .projects: .projects
+        case .apps: .appStorage
+        default: nil
+        }
     }
 }
 
@@ -63,6 +83,9 @@ final class AuditStore {
     private var expectedGen: [SectionId: UInt64] = [:]
     private(set) var activity: [String] = []
     let browser: DirBrowser
+    /// One `OwnerBrowser` per attribution axis, keyed the same way
+    /// `LensView`/`ContentView` look them up (`SidebarItem.axis`).
+    let owners: [AttributionAxis: OwnerBrowser]
 
     var selectedItem: SidebarItem? = .storage
     var selectedFinding: UInt64?
@@ -92,6 +115,10 @@ final class AuditStore {
         self.usingFakeData = usingFakeData
         self.sections = engine.sections()
         self.browser = DirBrowser(engine: engine)
+        self.owners = [
+            .projects: OwnerBrowser(axis: .projects, engine: engine),
+            .appStorage: OwnerBrowser(axis: .appStorage, engine: engine),
+        ]
         refreshFullDiskAccess()
         // The store lives as long as the app; the observation ends with it.
         Task { [weak self] in
@@ -276,6 +303,9 @@ final class AuditStore {
                 browser.invalidate()
                 refreshFullDiskAccess()
             }
+            if let axis = section.attributionAxis {
+                owners[axis]?.refresh()
+            }
         case .sectionFailed(let section, let gen, let error):
             guard expectedGen[section] == gen else { return }
             status[section] = .failed(error)
@@ -304,6 +334,17 @@ final class AuditStore {
     func browse(path: String) {
         browser.navigate(to: path)
         selectedItem = .folders
+        selectedFinding = nil
+    }
+
+    // MARK: - Attribution lenses
+
+    /// Switch the sidebar to the owning lens and open `owner`'s entity page
+    /// — used by the "Largest projects"/"Largest apps" cards and by a lens
+    /// table's double-click.
+    func openOwner(_ owner: Finding, axis: AttributionAxis) {
+        owners[axis]?.open(owner)
+        selectedItem = axis == .projects ? .projects : .apps
         selectedFinding = nil
     }
 

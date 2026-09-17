@@ -119,3 +119,21 @@ final class TerminalWaiter: ScanListener, @unchecked Sendable {
     #expect(apps.count == d.appCount)
     #expect(apps.contains { $0.bundleId == "com.spotify.client" && $0.dynamicBytes > $0.staticBytes * 4 })
 }
+
+@Test func footprintResolvesForAFakeProjectFinding() async throws {
+    let home = FileManager.default.temporaryDirectory.appendingPathComponent("macaudit-footprint-\(UUID())")
+    let engine = try Engine(opts: EngineOptions(
+        homeOverride: home.path, fake: true, offline: true, rmMode: false))
+    let waiter = TerminalWaiter(expected: 1)
+    engine.startScan(sections: [.projects], listener: waiter)
+    await waiter.wait()
+
+    let project = try #require(waiter.findings.first { $0.kind == .project })
+    let footprint = engine.footprint(findingId: project.id)
+    #expect(footprint != nil)
+    #expect(footprint?.finding == project.id)
+    #expect(footprint?.owner.kind == .project)
+
+    let buckets = engine.footprintBuckets(axis: .projects)
+    #expect(buckets?.axis == .projects)
+}

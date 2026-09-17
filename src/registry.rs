@@ -3,6 +3,8 @@
 //! spawn list all iterate `REGISTRY`, so adding/removing a scanner is a one-line
 //! change here rather than an edit in three files (avoids fan-out merge wars).
 
+use crate::attribution::bus::ScanBus;
+use crate::attribution::{AppStorageScanner, ProjectsScanner};
 use crate::model::ScannerId;
 use crate::scan::apps::AppsScanner;
 use crate::scan::brew::BrewScanner;
@@ -82,6 +84,25 @@ pub const REGISTRY: &[SectionMeta] = &[
         // Large files / iOS Backups …) — thousands of flat rows are unreadable.
         view: ViewKind::Tree,
         build: || Box::new(FsScanner),
+    },
+    SectionMeta {
+        id: ScannerId::Projects,
+        title: "Projects",
+        short_title: "Projects",
+        view: ViewKind::Table,
+        // The engine's `Mode::Real` path constructs this with the real
+        // shared `ScanBus` instead (`ScannerManager::build_scanner`) — a
+        // detached bus just means "no dependency ever arrives", so this
+        // build fn still yields a scanner that runs to completion and
+        // reports every dependency missing.
+        build: || Box::new(ProjectsScanner::new(ScanBus::detached())),
+    },
+    SectionMeta {
+        id: ScannerId::AppStorage,
+        title: "App Storage",
+        short_title: "App space",
+        view: ViewKind::Table,
+        build: || Box::new(AppStorageScanner::new(ScanBus::detached())),
     },
     SectionMeta {
         id: ScannerId::Launchd,

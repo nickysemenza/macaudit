@@ -254,7 +254,7 @@ mod tests {
         use crate::ui::present::{ColumnId, SortDir, SortSpec};
 
         let mut app = app_with_gen(1);
-        app.handle(Action::JumpSection(10)); // Git (index 10 after Tools)
+        app.handle(Action::JumpSection(12)); // Git (index 12 — after Fs, Projects, AppStorage)
         for (name, branch) in [("a", "zeta"), ("b", "alpha")] {
             let f = Finding::new(FindingKind::GitRepo, name, name)
                 .meta(serde_json::json!({ "branch": branch }));

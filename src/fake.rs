@@ -16,6 +16,11 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use serde_json::json;
 
+use crate::attribution;
+use crate::attribution::model::{
+    Axis, EntryKind, EvidenceTier, Footprint, FootprintEntry, FootprintGroup, FootprintSet, Owner,
+    OwnerKind, Proc, ProcKind,
+};
 use crate::model::{
     Finding, FindingKind, Guard, Remedy, RemedyCommand, ScanEvent, ScannerId, Severity,
 };
@@ -69,6 +74,8 @@ pub fn fixtures(id: ScannerId) -> Vec<Finding> {
         ScannerId::Apps => apps_fixtures(),
         ScannerId::Brew => brew_fixtures(),
         ScannerId::Fs => fs_fixtures(),
+        ScannerId::Projects => attribution_findings(Axis::Projects),
+        ScannerId::AppStorage => attribution_findings(Axis::AppStorage),
         ScannerId::Launchd => launchd_fixtures(),
         ScannerId::ShellEnv => shell_env_fixtures(),
         ScannerId::Runtimes => runtimes_fixtures(),
@@ -1162,6 +1169,566 @@ impl WithAlloc for DirNode {
         self.files += files;
         self
     }
+}
+
+// ---- attribution axes (Projects / App Storage) ----
+//
+// `fake_footprint_set` is the one source of truth: it builds the
+// `FootprintSet` the fake `ScanEvent::Footprints` carries, and
+// `attribution_findings` turns that same set into the `Project`/`AppOwner`
+// findings + bucket rows via the real `attribution::footprint_finding` /
+// `attribution::bucket_findings` helpers — so a fixture's Finding id always
+// matches the id inside the fake footprints event.
+
+fn owner(key: &str, kind: OwnerKind, name: &str, path: Option<&str>) -> Owner {
+    Owner {
+        key: key.to_string(),
+        kind,
+        name: name.to_string(),
+        path: path.map(PathBuf::from),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn entry(
+    path: &str,
+    kind: EntryKind,
+    bytes: u64,
+    tier: EvidenceTier,
+    evidence: &str,
+    label: &str,
+    owners: &[&str],
+) -> FootprintEntry {
+    FootprintEntry {
+        path: PathBuf::from(path),
+        kind,
+        bytes,
+        raw_bytes: bytes,
+        owners: owners.iter().map(|s| s.to_string()).collect(),
+        tier,
+        evidence: evidence.to_string(),
+        label: label.to_string(),
+        baseline: false,
+        clone_of_store: false,
+        virtual_bytes: false,
+        r#unsized: false,
+        stale: false,
+        finding: None,
+        reason: None,
+    }
+}
+
+fn group(kind: EntryKind, entries: Vec<FootprintEntry>) -> FootprintGroup {
+    let bytes = entries.iter().map(|e| e.bytes).sum();
+    FootprintGroup {
+        kind,
+        bytes,
+        entries,
+    }
+}
+
+fn footprint(
+    finding_key: &str,
+    kind: FindingKind,
+    o: Owner,
+    groups: Vec<FootprintGroup>,
+) -> Footprint {
+    let exclusive: u64 = groups
+        .iter()
+        .flat_map(|g| &g.entries)
+        .filter(|e| e.owners.len() == 1 && !e.clone_of_store)
+        .map(|e| e.bytes)
+        .sum();
+    let shared: u64 = groups
+        .iter()
+        .flat_map(|g| &g.entries)
+        .filter(|e| e.owners.len() > 1)
+        .map(|e| e.bytes / e.owners.len() as u64)
+        .sum();
+    let reach: u64 = groups.iter().map(|g| g.bytes).sum();
+    Footprint {
+        finding: crate::model::FindingId::new(kind, finding_key),
+        owner: o,
+        exclusive,
+        shared,
+        reach,
+        baseline_share: 0,
+        groups,
+        worktrees: Vec::new(),
+        processes: Vec::new(),
+        ports: Vec::new(),
+        clone_note: exclusive != reach - shared,
+    }
+}
+
+/// A believable `FootprintSet` for one axis: a handful of owners with a few
+/// entries each (including one APFS clone, one baseline, one unattributed),
+/// used both for the fake `Footprints` event and — via
+/// `attribution::footprint_finding`/`bucket_findings` — the fixture findings
+/// themselves.
+pub(crate) fn fake_footprint_set(axis: Axis) -> FootprintSet {
+    match axis {
+        Axis::Projects => {
+            let mut cubby = footprint(
+                "/Users/dev/dev/cubby",
+                FindingKind::Project,
+                owner(
+                    "/Users/dev/dev/cubby",
+                    OwnerKind::Project,
+                    "cubby",
+                    Some("/Users/dev/dev/cubby"),
+                ),
+                vec![
+                    group(
+                        EntryKind::WorkingTree,
+                        vec![entry(
+                            "/Users/dev/dev/cubby",
+                            EntryKind::WorkingTree,
+                            8 * GIB,
+                            EvidenceTier::Exact,
+                            "repo root",
+                            "Working tree",
+                            &["/Users/dev/dev/cubby"],
+                        )],
+                    ),
+                    group(
+                        EntryKind::Artifacts,
+                        vec![entry(
+                            "/Users/dev/dev/cubby/target",
+                            EntryKind::Artifacts,
+                            12 * GIB,
+                            EvidenceTier::Exact,
+                            "Cargo.lock in cubby/",
+                            "target",
+                            &["/Users/dev/dev/cubby"],
+                        )],
+                    ),
+                    group(
+                        EntryKind::PackageCache,
+                        vec![{
+                            let mut e = entry(
+                                "/Users/dev/dev/cubby/node_modules/.pnpm",
+                                EntryKind::PackageCache,
+                                3 * GIB,
+                                EvidenceTier::Exact,
+                                "pnpm store membership",
+                                "node_modules/.pnpm (APFS clone)",
+                                &["/Users/dev/dev/cubby"],
+                            );
+                            e.clone_of_store = true;
+                            e
+                        }],
+                    ),
+                ],
+            );
+            // cubby also has a linked worktree, a couple of live processes
+            // whose cwd is inside it, and one of those processes is
+            // listening — exercises the Worktrees/Procs/Ports columns and
+            // the detail pane's worktrees/processes/ports sections.
+            cubby.worktrees = vec![PathBuf::from(
+                "/Users/dev/.claude/worktrees/cubby-attribution",
+            )];
+            cubby.processes = vec![
+                Proc {
+                    pid: 5231,
+                    name: "cargo".to_string(),
+                    kind: ProcKind::Shell,
+                    cwd: PathBuf::from("/Users/dev/dev/cubby"),
+                },
+                Proc {
+                    pid: 5240,
+                    name: "node".to_string(),
+                    kind: ProcKind::Server,
+                    cwd: PathBuf::from("/Users/dev/dev/cubby/web"),
+                },
+            ];
+            cubby.ports = vec![3000, 5173];
+            let macaudit = footprint(
+                "/Users/dev/dev/macaudit",
+                FindingKind::Project,
+                owner(
+                    "/Users/dev/dev/macaudit",
+                    OwnerKind::Project,
+                    "macaudit",
+                    Some("/Users/dev/dev/macaudit"),
+                ),
+                vec![
+                    group(
+                        EntryKind::WorkingTree,
+                        vec![entry(
+                            "/Users/dev/dev/macaudit",
+                            EntryKind::WorkingTree,
+                            GIB,
+                            EvidenceTier::Exact,
+                            "repo root",
+                            "Working tree",
+                            &["/Users/dev/dev/macaudit"],
+                        )],
+                    ),
+                    group(
+                        EntryKind::Artifacts,
+                        vec![entry(
+                            "/Users/dev/dev/macaudit/target",
+                            EntryKind::Artifacts,
+                            4 * GIB,
+                            EvidenceTier::Exact,
+                            "Cargo.lock in macaudit/",
+                            "target",
+                            &["/Users/dev/dev/macaudit"],
+                        )],
+                    ),
+                ],
+            );
+            let ingredient_parser = footprint(
+                "/Users/dev/dev/ingredient-parser",
+                FindingKind::Project,
+                owner(
+                    "/Users/dev/dev/ingredient-parser",
+                    OwnerKind::Project,
+                    "ingredient-parser",
+                    Some("/Users/dev/dev/ingredient-parser"),
+                ),
+                vec![
+                    group(
+                        EntryKind::WorkingTree,
+                        vec![entry(
+                            "/Users/dev/dev/ingredient-parser",
+                            EntryKind::WorkingTree,
+                            300 * MIB,
+                            EvidenceTier::Exact,
+                            "repo root",
+                            "Working tree",
+                            &["/Users/dev/dev/ingredient-parser"],
+                        )],
+                    ),
+                    group(
+                        EntryKind::Artifacts,
+                        vec![entry(
+                            "/Users/dev/dev/ingredient-parser/target",
+                            EntryKind::Artifacts,
+                            700 * MIB,
+                            EvidenceTier::Exact,
+                            "Cargo.lock in ingredient-parser/",
+                            "target",
+                            &["/Users/dev/dev/ingredient-parser"],
+                        )],
+                    ),
+                ],
+            );
+            let scratch_bench = footprint(
+                "/Users/dev/scratch/bench",
+                FindingKind::Project,
+                owner(
+                    "/Users/dev/scratch/bench",
+                    OwnerKind::Project,
+                    "scratch/bench",
+                    Some("/Users/dev/scratch/bench"),
+                ),
+                vec![group(
+                    EntryKind::WorkingTree,
+                    vec![entry(
+                        "/Users/dev/scratch/bench",
+                        EntryKind::WorkingTree,
+                        50 * MIB,
+                        EvidenceTier::NameMatch,
+                        "lone Cargo.toml, not inside a repo",
+                        "Working tree",
+                        &["/Users/dev/scratch/bench"],
+                    )],
+                )],
+            );
+
+            let baseline = vec![
+                entry(
+                    "/Users/dev/.rustup/toolchains/stable-aarch64-apple-darwin",
+                    EntryKind::Toolchain,
+                    1536 * MIB,
+                    EvidenceTier::EcosystemDefault,
+                    "default rustup toolchain",
+                    "stable-aarch64-apple-darwin",
+                    &[],
+                ),
+                entry(
+                    "/opt/homebrew/Cellar/node",
+                    EntryKind::Toolchain,
+                    800 * MIB,
+                    EvidenceTier::EcosystemDefault,
+                    "no .nvmrc pin — Homebrew node",
+                    "node (Homebrew)",
+                    &[],
+                ),
+            ];
+            let unattributed = vec![{
+                let mut e = entry(
+                    "/Users/dev/Library/Developer/Xcode/DerivedData/Old-abc123",
+                    EntryKind::Xcode,
+                    300 * MIB,
+                    EvidenceTier::Observed,
+                    "WorkspacePath points at a deleted project",
+                    "Old-abc123",
+                    &[],
+                );
+                e.stale = true;
+                e.reason = Some("workspace deleted".to_string());
+                e
+            }];
+
+            let footprints = vec![cubby, macaudit, ingredient_parser, scratch_bench];
+            let attributed_total = footprints.iter().map(|f| f.reach).sum::<u64>()
+                + baseline.iter().map(|e| e.bytes).sum::<u64>()
+                + unattributed.iter().map(|e| e.bytes).sum::<u64>();
+            FootprintSet {
+                axis,
+                gen: 0,
+                footprints,
+                baseline,
+                unattributed,
+                disk_total: 500 * GIB,
+                attributed_total,
+                missing_deps: Vec::new(),
+            }
+        }
+        Axis::AppStorage => {
+            let claude = footprint(
+                "com.anthropic.claudefordesktop",
+                FindingKind::AppOwner,
+                owner(
+                    "com.anthropic.claudefordesktop",
+                    OwnerKind::App,
+                    "Claude",
+                    Some("/Applications/Claude.app"),
+                ),
+                vec![
+                    group(
+                        EntryKind::AppBundle,
+                        vec![entry(
+                            "/Applications/Claude.app",
+                            EntryKind::AppBundle,
+                            500 * MIB,
+                            EvidenceTier::Exact,
+                            "bundle id",
+                            "Claude.app",
+                            &["com.anthropic.claudefordesktop"],
+                        )],
+                    ),
+                    group(
+                        EntryKind::AppSupport,
+                        vec![entry(
+                            "/Users/dev/Library/Application Support/Claude",
+                            EntryKind::AppSupport,
+                            14 * GIB,
+                            EvidenceTier::NameMatch,
+                            "CFBundleName match",
+                            "Application Support/Claude",
+                            &["com.anthropic.claudefordesktop"],
+                        )],
+                    ),
+                    group(
+                        EntryKind::Cache,
+                        vec![entry(
+                            "/Users/dev/Library/Caches/com.anthropic.claudefordesktop",
+                            EntryKind::Cache,
+                            2 * GIB,
+                            EvidenceTier::Exact,
+                            "bundle id",
+                            "Caches/com.anthropic.claudefordesktop",
+                            &["com.anthropic.claudefordesktop"],
+                        )],
+                    ),
+                ],
+            );
+            let vscode = footprint(
+                "com.microsoft.VSCode",
+                FindingKind::AppOwner,
+                owner(
+                    "com.microsoft.VSCode",
+                    OwnerKind::App,
+                    "Visual Studio Code",
+                    Some("/Applications/Visual Studio Code.app"),
+                ),
+                vec![
+                    group(
+                        EntryKind::AppBundle,
+                        vec![entry(
+                            "/Applications/Visual Studio Code.app",
+                            EntryKind::AppBundle,
+                            600 * MIB,
+                            EvidenceTier::Exact,
+                            "bundle id",
+                            "Visual Studio Code.app",
+                            &["com.microsoft.VSCode"],
+                        )],
+                    ),
+                    group(
+                        EntryKind::AppSupport,
+                        vec![entry(
+                            "/Users/dev/Library/Application Support/Code",
+                            EntryKind::AppSupport,
+                            3 * GIB,
+                            EvidenceTier::NameMatch,
+                            "CFBundleExecutable match",
+                            "Application Support/Code",
+                            &["com.microsoft.VSCode"],
+                        )],
+                    ),
+                ],
+            );
+            let chrome = footprint(
+                "com.google.Chrome",
+                FindingKind::AppOwner,
+                owner(
+                    "com.google.Chrome",
+                    OwnerKind::App,
+                    "Google Chrome",
+                    Some("/Applications/Google Chrome.app"),
+                ),
+                vec![
+                    group(
+                        EntryKind::AppBundle,
+                        vec![entry(
+                            "/Applications/Google Chrome.app",
+                            EntryKind::AppBundle,
+                            400 * MIB,
+                            EvidenceTier::Exact,
+                            "bundle id",
+                            "Google Chrome.app",
+                            &["com.google.Chrome"],
+                        )],
+                    ),
+                    group(
+                        EntryKind::AppSupport,
+                        vec![entry(
+                            "/Users/dev/Library/Application Support/Google/Chrome",
+                            EntryKind::AppSupport,
+                            6 * GIB,
+                            EvidenceTier::NameMatch,
+                            "vendor component match",
+                            "Application Support/Google/Chrome",
+                            &["com.google.Chrome"],
+                        )],
+                    ),
+                ],
+            );
+            let homebrew = footprint(
+                "homebrew",
+                FindingKind::AppOwner,
+                owner(
+                    "homebrew",
+                    OwnerKind::Homebrew,
+                    "Homebrew",
+                    Some("/opt/homebrew"),
+                ),
+                vec![group(
+                    EntryKind::Cache,
+                    vec![entry(
+                        "/Users/dev/Library/Caches/Homebrew",
+                        EntryKind::Cache,
+                        3 * GIB,
+                        EvidenceTier::Exact,
+                        "Homebrew's own cache",
+                        "Caches/Homebrew",
+                        &["homebrew"],
+                    )],
+                )],
+            );
+            let node_formula = footprint(
+                "formula:node",
+                FindingKind::AppOwner,
+                owner(
+                    "formula:node",
+                    OwnerKind::Formula,
+                    "node",
+                    Some("/opt/homebrew/Cellar/node"),
+                ),
+                vec![group(
+                    EntryKind::Cache,
+                    vec![entry(
+                        "/opt/homebrew/Cellar/node",
+                        EntryKind::Cache,
+                        150 * MIB,
+                        EvidenceTier::Exact,
+                        "Cellar path",
+                        "Cellar/node",
+                        &["formula:node"],
+                    )],
+                )],
+            );
+            let pnpm_tool = footprint(
+                "tool:pnpm",
+                FindingKind::AppOwner,
+                owner(
+                    "tool:pnpm",
+                    OwnerKind::Tool,
+                    "pnpm",
+                    Some("/Users/dev/Library/pnpm"),
+                ),
+                vec![group(
+                    EntryKind::DotDir,
+                    vec![entry(
+                        "/Users/dev/Library/pnpm",
+                        EntryKind::DotDir,
+                        200 * MIB,
+                        EvidenceTier::Exact,
+                        "global tool install root",
+                        "Library/pnpm",
+                        &["tool:pnpm"],
+                    )],
+                )],
+            );
+
+            let baseline = vec![entry(
+                "/Users/dev/.local/share/uv/python",
+                EntryKind::Toolchain,
+                400 * MIB,
+                EvidenceTier::EcosystemDefault,
+                "shared uv-managed interpreter",
+                "uv python",
+                &[],
+            )];
+            let unattributed = vec![{
+                let mut e = entry(
+                    "/Users/dev/Library/Containers/com.docker.docker-desktop-old",
+                    EntryKind::Container,
+                    250 * MIB,
+                    EvidenceTier::Observed,
+                    "no bundle/name match against any installed app",
+                    "docker-desktop-old",
+                    &[],
+                );
+                e.reason = Some("no owner matched \"docker-desktop-old\"".to_string());
+                e
+            }];
+
+            let footprints = vec![claude, vscode, chrome, homebrew, node_formula, pnpm_tool];
+            let attributed_total = footprints.iter().map(|f| f.reach).sum::<u64>()
+                + baseline.iter().map(|e| e.bytes).sum::<u64>()
+                + unattributed.iter().map(|e| e.bytes).sum::<u64>();
+            FootprintSet {
+                axis,
+                gen: 0,
+                footprints,
+                baseline,
+                unattributed,
+                disk_total: 750 * GIB,
+                attributed_total,
+                missing_deps: Vec::new(),
+            }
+        }
+    }
+}
+
+/// The Finding representations of one axis's fake `FootprintSet` — the
+/// owner rows plus the three bucket rows, built via the same code the real
+/// scanner uses so ids always agree with the fake `Footprints` event.
+fn attribution_findings(axis: Axis) -> Vec<Finding> {
+    let set = fake_footprint_set(axis);
+    let mut out: Vec<Finding> = set
+        .footprints
+        .iter()
+        .map(|fp| attribution::footprint_finding(axis, fp))
+        .collect();
+    out.extend(attribution::bucket_findings(&set));
+    out
 }
 
 /// Mirrors `src/scan/launchd.rs`: key = plist path, title = label, meta
@@ -2479,6 +3046,24 @@ impl Scanner for FakeScanner {
                     tree: std::sync::Arc::new(dir_tree()),
                 })
                 .await;
+        }
+        if let Some(axis) = match self.id {
+            ScannerId::Projects => Some(Axis::Projects),
+            ScannerId::AppStorage => Some(Axis::AppStorage),
+            _ => None,
+        } {
+            if !ctx.cancelled() {
+                let mut set = fake_footprint_set(axis);
+                set.gen = ctx.gen;
+                let _ = ctx
+                    .tx
+                    .send(ScanEvent::Footprints {
+                        scanner: self.id,
+                        gen: ctx.gen,
+                        set: std::sync::Arc::new(set),
+                    })
+                    .await;
+            }
         }
 
         Ok(())

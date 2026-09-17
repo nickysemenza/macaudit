@@ -30,6 +30,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::attribution::bus::ScanBus;
+use crate::attribution::model::FootprintSet;
+use crate::attribution::{AppStorageScanner, ProjectsScanner};
 use crate::config::{Config, Paths};
 use crate::fake::FakeScanner;
 use crate::model::{Finding, FindingId, ScanEvent, ScannerId};
@@ -71,6 +74,10 @@ pub struct ScannerManager {
     /// HTTP access for network enrichment. `None` = offline: enrichment
     /// degrades to a no-op and every existing test stays network-free.
     fetcher: Option<Arc<dyn HttpFetcher>>,
+    /// Shared with the two attribution scanners (constructed with it at
+    /// `build_scanner` time) so they can wait on other sections' latest
+    /// results without `plan()` needing to know they depend on anything.
+    bus: Arc<ScanBus>,
 }
 
 impl ScannerManager {
@@ -88,6 +95,7 @@ impl ScannerManager {
             gen: AtomicU64::new(0),
             runs: Mutex::new(HashMap::new()),
             fetcher: None,
+            bus: ScanBus::new(),
         }
     }
 
@@ -133,6 +141,7 @@ impl ScannerManager {
         for run in self.runs.lock().unwrap().values() {
             run.token.cancel();
         }
+        self.bus.cancel_all();
     }
 
     /// Begin a run: cancel the in-flight run of each section in `requested`
@@ -209,16 +218,30 @@ impl ScannerManager {
             .map(|r| (r.gen, r.token.clone()))
     }
 
-    /// Build a scanner instance for a section per the manager's mode.
+    /// Build a scanner instance for a section per the manager's mode. The two
+    /// attribution scanners are the one case the registry's `build: fn() ->
+    /// Box<dyn Scanner>` can't cover in `Mode::Real` (they need the engine's
+    /// shared `ScanBus`, not a detached one) — everything else still goes
+    /// through `registry::section(id).build`.
     fn build_scanner(&self, id: ScannerId) -> Box<dyn Scanner> {
         match self.mode {
-            Mode::Real => (registry::section(id).build)(),
+            Mode::Real => match id {
+                ScannerId::Projects => Box::new(ProjectsScanner::new(self.bus.clone())),
+                ScannerId::AppStorage => Box::new(AppStorageScanner::new(self.bus.clone())),
+                _ => (registry::section(id).build)(),
+            },
             Mode::Fake => Box::new(FakeScanner::for_section(id)),
         }
     }
 
     /// Spawn every scanner in `sections` for generation `gen`, wiring the fs→git
-    /// pipe. Each task sends its own lifecycle events. Returns the join handles.
+    /// pipe. Each task sends its own lifecycle events, into an internal
+    /// channel; one forwarder task per call feeds every event through
+    /// `bus.observe` on its way to the caller's `tx`, so the two attribution
+    /// scanners always see a complete, ordered view of a dependency's run
+    /// without the engine's `plan()` needing to know about the dependency.
+    /// Returns the join handles for the scanner tasks (not the forwarder,
+    /// which outlives them only as long as it takes to drain).
     fn spawn_set(
         &self,
         tx: &mpsc::Sender<ScanEvent>,
@@ -227,6 +250,27 @@ impl ScannerManager {
         gen: u64,
         tokens: &HashMap<ScannerId, CancellationToken>,
     ) -> Vec<JoinHandle<()>> {
+        // Register every planned section on the bus BEFORE spawning anything,
+        // so a dependency's `Started` can never race a waiter that starts
+        // watching for it later (see `ScanBus`'s module doc). The
+        // discovery-only Fs helper is deliberately NOT registered: it emits no
+        // findings and no tree, so letting it "finish validly" would replace
+        // the last real Disk snapshot with an empty one.
+        let registrations: Vec<(ScannerId, CancellationToken)> = sections
+            .iter()
+            .filter(|&&id| !(discovery_only && id == ScannerId::Fs))
+            .map(|&id| {
+                (
+                    id,
+                    tokens
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_else(CancellationToken::new),
+                )
+            })
+            .collect();
+        self.bus.begin(gen, &registrations);
+
         // Wire the repo-discovery pipe only when Git participates.
         let git_present = sections.contains(&ScannerId::Git);
         let (repo_tx, repo_rx) = if git_present {
@@ -236,8 +280,10 @@ impl ScannerManager {
             (None, None)
         };
 
+        let (internal_tx, mut internal_rx) = mpsc::channel::<ScanEvent>(1024);
+
         let base = ScanCtx {
-            tx: tx.clone(),
+            tx: internal_tx.clone(),
             token: CancellationToken::new(), // placeholder; stamped per-scanner below
             gen,
             config: self.config.clone(),
@@ -267,11 +313,25 @@ impl ScannerManager {
                 }
                 _ => {}
             }
-            handles.push(spawn_one(scanner, ctx, tx.clone()));
+            handles.push(spawn_one(scanner, ctx, internal_tx.clone()));
         }
-        // Drop our copies so the pipe closes once Fs finishes.
+        // Drop our copies so the pipe (and, below, the internal channel)
+        // close once their producers finish.
         drop(repo_tx);
         drop(repo_rx);
+        drop(internal_tx);
+
+        let bus = self.bus.clone();
+        let external_tx = tx.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = internal_rx.recv().await {
+                bus.observe(&ev);
+                if external_tx.send(ev).await.is_err() {
+                    break;
+                }
+            }
+        });
+
         handles
     }
 
@@ -288,16 +348,24 @@ impl ScannerManager {
     /// by stable `FindingId` plus the list of sections that FAILED (scanner
     /// returned an error). Callers should check `failures` before treating the
     /// result as a complete picture. Used by all headless commands.
+    ///
+    /// `requested` is expanded with `expand_deps` before planning, so asking
+    /// for just `Projects`/`AppStorage` still scans (and returns findings
+    /// for) their dependency sections — callers that want output scoped to
+    /// exactly what the user asked for filter `findings` themselves against
+    /// their own unexpanded `requested` list (`main.rs::run_scan` does this).
     pub async fn run_to_completion(&self, requested: &[ScannerId]) -> ScanOutcome {
+        let requested = expand_deps(requested);
         let (tx, mut rx) = mpsc::channel::<ScanEvent>(1024);
-        let (sections, discovery_only) = Self::plan(requested);
-        let (gen, tokens) = self.begin_sections(requested, &sections);
+        let (sections, discovery_only) = Self::plan(&requested);
+        let (gen, tokens) = self.begin_sections(&requested, &sections);
         self.spawn_set(&tx, &sections, discovery_only, gen, &tokens);
         drop(tx); // channel closes once all tasks finish
 
         let mut map: BTreeMap<FindingId, Finding> = BTreeMap::new();
         let mut failures: Vec<(ScannerId, String)> = Vec::new();
         let mut dir_trees: Vec<Arc<crate::scan::walk::DirTree>> = Vec::new();
+        let mut footprints: Vec<Arc<FootprintSet>> = Vec::new();
         while let Some(ev) = rx.recv().await {
             match ev {
                 ScanEvent::Finding {
@@ -307,6 +375,9 @@ impl ScannerManager {
                 }
                 ScanEvent::DirTree { tree, gen: g, .. } if g == gen => {
                     dir_trees.push(tree);
+                }
+                ScanEvent::Footprints { set, gen: g, .. } if g == gen => {
+                    footprints.push(set);
                 }
                 ScanEvent::Failed {
                     scanner,
@@ -339,6 +410,7 @@ impl ScannerManager {
             findings: map,
             failures,
             dir_trees,
+            footprints,
         }
     }
 }
@@ -350,6 +422,31 @@ pub struct ScanOutcome {
     pub failures: Vec<(ScannerId, String)>,
     /// One tree per walked Disk root (empty unless Disk was scanned).
     pub dir_trees: Vec<Arc<crate::scan::walk::DirTree>>,
+    /// One set per attribution axis actually scanned (empty unless
+    /// Projects/AppStorage were requested, directly or via `expand_deps`).
+    pub footprints: Vec<Arc<FootprintSet>>,
+}
+
+/// Expand `requested` with each section's attribution dependencies
+/// (`attribution::deps_of`), transitively, deduplicated, keeping first-seen
+/// order — `requested`'s own sections first (in their given order), each
+/// followed immediately by its own deps. Sections with no deps (everything
+/// but `Projects`/`AppStorage`) pass through unchanged.
+pub fn expand_deps(requested: &[ScannerId]) -> Vec<ScannerId> {
+    let mut out = Vec::new();
+    fn add(id: ScannerId, out: &mut Vec<ScannerId>) {
+        if out.contains(&id) {
+            return;
+        }
+        out.push(id);
+        for &dep in crate::attribution::deps_of(id) {
+            add(dep, out);
+        }
+    }
+    for &id in requested {
+        add(id, &mut out);
+    }
+    out
 }
 
 /// Wrap one scanner: emit `Started`, run, emit `Finished`/`Failed`.
@@ -510,5 +607,57 @@ mod tests {
         assert_eq!(fs_gen, fs_gen2, "Fs slot displaced by discovery helper");
         assert!(!fs_token.is_cancelled());
         assert_eq!(m.section_run(ScannerId::Git).unwrap().0, git_gen);
+    }
+
+    #[test]
+    fn expand_deps_pulls_in_attribution_dependencies() {
+        let expanded = expand_deps(&[ScannerId::AppStorage]);
+        assert_eq!(
+            expanded[0],
+            ScannerId::AppStorage,
+            "requested section stays first"
+        );
+        for dep in crate::attribution::APP_STORAGE_DEPS {
+            assert!(expanded.contains(dep), "missing dep {dep:?}");
+        }
+    }
+
+    #[test]
+    fn expand_deps_is_a_no_op_for_sections_without_deps() {
+        assert_eq!(
+            expand_deps(&[ScannerId::Fs, ScannerId::Ports]),
+            vec![ScannerId::Fs, ScannerId::Ports]
+        );
+    }
+
+    #[test]
+    fn expand_deps_dedups_when_a_dependency_is_also_requested() {
+        let expanded = expand_deps(&[ScannerId::Fs, ScannerId::Projects]);
+        assert_eq!(
+            expanded.iter().filter(|id| **id == ScannerId::Fs).count(),
+            1,
+            "Fs is both explicitly requested and a Projects dependency"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_to_completion_expands_deps_and_collects_footprints() {
+        let m = mgr(Mode::Fake);
+        let outcome = m.run_to_completion(&[ScannerId::AppStorage]).await;
+        assert_eq!(
+            outcome.footprints.len(),
+            1,
+            "AppStorage's fake footprints event should land"
+        );
+        assert_eq!(
+            outcome.footprints[0].axis,
+            crate::attribution::model::Axis::AppStorage
+        );
+        // Dependency sections' findings are present too (not filtered here —
+        // that's main.rs::run_scan's job).
+        assert!(outcome
+            .findings
+            .values()
+            .any(|f| f.kind.scanner() == ScannerId::Apps));
     }
 }

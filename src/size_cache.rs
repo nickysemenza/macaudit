@@ -29,11 +29,19 @@ pub struct SizeCache {
 
 impl SizeCache {
     /// Open (creating parent dirs + schema) the on-disk size cache database.
+    ///
+    /// Sets a 5s `busy_timeout`: the App Storage axis's entitlements lookup
+    /// (`src/attribution/apps/entitlements.rs`) opens this same db from
+    /// several `std::thread::scope` workers at once, and a rescan's own
+    /// artifact-size writes may be in flight concurrently too — without a
+    /// busy timeout a second writer gets `SQLITE_BUSY` immediately instead
+    /// of waiting for the first to finish its transaction.
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let cache = SizeCache { conn };
         cache.init_schema()?;
         Ok(cache)
@@ -55,6 +63,12 @@ impl SizeCache {
                 size        INTEGER NOT NULL,
                 computed_at INTEGER NOT NULL,
                 root_mtime  INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS entitlements (
+                app_path    TEXT PRIMARY KEY,
+                mtime       INTEGER NOT NULL,
+                app_groups  TEXT NOT NULL,
+                sandboxed   INTEGER NOT NULL
             );
             "#,
         )?;
@@ -110,6 +124,73 @@ impl SizeCache {
         tx.commit()?;
         Ok(())
     }
+
+    /// A cached `codesign -d --entitlements` read for one app bundle, if
+    /// there is one and the bundle's mtime hasn't moved since it was
+    /// recorded (a changed mtime means the app was reinstalled/updated, so
+    /// the cached entitlements can no longer be trusted).
+    pub fn get_entitlements(
+        &self,
+        app_path: &Path,
+        mtime: i64,
+    ) -> anyhow::Result<Option<CachedEntitlements>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT mtime, app_groups, sandboxed FROM entitlements WHERE app_path = ?1")?;
+        let row = stmt
+            .query_row(rusqlite::params![app_path.to_string_lossy()], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .ok();
+        let Some((cached_mtime, app_groups_json, sandboxed)) = row else {
+            return Ok(None);
+        };
+        if cached_mtime != mtime {
+            return Ok(None);
+        }
+        let app_groups: Vec<String> = serde_json::from_str(&app_groups_json).unwrap_or_default();
+        Ok(Some(CachedEntitlements {
+            app_groups,
+            sandboxed: sandboxed != 0,
+        }))
+    }
+
+    /// Upsert one app bundle's entitlements read.
+    pub fn put_entitlements(
+        &self,
+        app_path: &Path,
+        mtime: i64,
+        app_groups: &[String],
+        sandboxed: bool,
+    ) -> anyhow::Result<()> {
+        let app_groups_json = serde_json::to_string(app_groups)?;
+        self.conn.execute(
+            "INSERT INTO entitlements (app_path, mtime, app_groups, sandboxed)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(app_path) DO UPDATE SET
+                 mtime = excluded.mtime,
+                 app_groups = excluded.app_groups,
+                 sandboxed = excluded.sandboxed",
+            rusqlite::params![
+                app_path.to_string_lossy(),
+                mtime,
+                app_groups_json,
+                sandboxed as i64
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+/// A previously fetched app bundle's entitlements (`entitlements` table).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CachedEntitlements {
+    pub app_groups: Vec<String>,
+    pub sandboxed: bool,
 }
 
 /// Path to the size cache database, derived from `Paths::state_dir` (which is
@@ -212,6 +293,55 @@ mod tests {
         assert_eq!(
             loaded.get(&PathBuf::from("/a")),
             Some(&sized(999, 2000, 600))
+        );
+    }
+
+    #[test]
+    fn entitlements_roundtrip() {
+        let cache = SizeCache::open_in_memory().unwrap();
+        let groups = vec!["group.io.robbie.homeassistant".to_string()];
+        cache
+            .put_entitlements(
+                Path::new("/Applications/Home Assistant.app"),
+                100,
+                &groups,
+                true,
+            )
+            .unwrap();
+        let got = cache
+            .get_entitlements(Path::new("/Applications/Home Assistant.app"), 100)
+            .unwrap();
+        assert_eq!(
+            got,
+            Some(CachedEntitlements {
+                app_groups: groups,
+                sandboxed: true,
+            })
+        );
+    }
+
+    #[test]
+    fn entitlements_stale_mtime_misses() {
+        let cache = SizeCache::open_in_memory().unwrap();
+        cache
+            .put_entitlements(Path::new("/Applications/X.app"), 100, &[], false)
+            .unwrap();
+        assert_eq!(
+            cache
+                .get_entitlements(Path::new("/Applications/X.app"), 200)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn entitlements_missing_path_is_none() {
+        let cache = SizeCache::open_in_memory().unwrap();
+        assert_eq!(
+            cache
+                .get_entitlements(Path::new("/Applications/Nope.app"), 1)
+                .unwrap(),
+            None
         );
     }
 

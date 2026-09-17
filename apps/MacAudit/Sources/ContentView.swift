@@ -16,6 +16,18 @@ struct ContentView: View {
                     StorageOverview()
                         .navigationTitle("Storage")
                         .navigationSubtitle("\(Formatting.bytes(store.totalReclaimableBytes)) reclaimable across \(store.sections.count) sections")
+                case .projects, .apps:
+                    if let axis = store.selectedItem?.axis, let section = store.selectedItem?.section {
+                        if let owner = store.owners[axis]?.selectedOwner {
+                            OwnerDetailView(axis: axis)
+                                .navigationTitle(owner.title)
+                                .navigationSubtitle(axis == .projects ? "Projects" : "Apps")
+                        } else {
+                            LensView(axis: axis)
+                                .navigationTitle(axis == .projects ? "Projects" : "Apps")
+                                .navigationSubtitle(subtitle(for: section))
+                        }
+                    }
                 case .section(let section):
                     if let meta = store.meta(for: section) {
                         SectionDetail(meta: meta)
@@ -39,6 +51,14 @@ struct ContentView: View {
             Group {
                 if store.selectedItem == .folders {
                     DirInspector(entry: store.browser.selectedEntry ?? store.browser.current)
+                } else if let axis = store.selectedItem?.axis, let browser = store.owners[axis] {
+                    if let entry = browser.selectedEntry {
+                        EntryInspector(entry: entry, axis: axis)
+                    } else if let owner = browser.selectedOwner ?? store.finding(store.selectedFinding) {
+                        OwnerInspector(finding: owner, axis: axis)
+                    } else {
+                        ContentUnavailableView("No selection", systemImage: "info.circle")
+                    }
                 } else {
                     FindingInspector(finding: store.finding(store.selectedFinding))
                 }

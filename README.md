@@ -7,10 +7,25 @@ dev-environment sprawl, with safe, explicit remediation.
 
 ## Features
 
-- **Resource Health overview + 14 audit sections**: a manual point-in-time
+- **Resource Health overview + 16 audit sections**: a manual point-in-time
   CPU/memory/swap/disk/process summary, plus Apps, Brew, Global Tools, Disk,
-  Daemons, Shell, Runtimes, Docker, Ports, Git, Simulators, iOS Devices,
-  Keys, and Time Machine — see the [sections tour](#sections-tour) below.
+  Projects, App Storage, Daemons, Shell, Runtimes, Docker, Ports, Git,
+  Simulators, iOS Devices, Keys, and Time Machine — see the
+  [sections tour](#sections-tour) below.
+- **What is *this project* costing me?** The Projects section attributes
+  disk to every project it discovers — git repos and manifest-only dirs
+  anywhere on the volume — including what lives *outside* the repo because
+  of it: the crates its `Cargo.lock` pins in `~/.cargo/registry`, the pnpm
+  store versions that link back to it, the toolchain its `rust-toolchain`
+  or `.nvmrc` pins, a `CARGO_TARGET_DIR` redirected into `~/.cache`,
+  DerivedData whose `info.plist` names its workspace, its app's simulator
+  containers, Claude Code/Codex sessions whose `cwd` is inside it, VS Code
+  workspace storage, its linked worktrees, and the processes and listening
+  ports running from it. See [Attribution](#attribution) for the numbers.
+- **What is *this app* costing me?** App Storage is the iOS
+  "Settings › Storage" view for the Mac: every `.app` (Apple's included),
+  Homebrew formula, and global dev tool, joined — with no configuration — to
+  the `~/Library/*`, dotdir, cache and data locations that belong to it.
 - **iPhone storage, from the Mac.** Plug in an iPhone or iPad and the iOS
   Devices section reads what Settings › iPhone Storage won't tell you: how
   much is *purgeable* (on one 256 GB phone, 146 GB hiding behind "19 GB
@@ -179,6 +194,7 @@ MacAudit.app in System Settings; without it those subtrees are skipped.
 macaudit                              # launch the TUI (default)
 macaudit scan --json                  # machine-readable scan, for scripts
 macaudit scan --section apps,disk     # restrict to specific sections
+macaudit footprints --axis projects   # per-project attribution with every entry; --axis apps, --json
 macaudit clean --dry-run              # print remedy commands, run nothing
 macaudit clean --dry-run --select wget,npm:/opt/homebrew/lib/node_modules:eslint
                                       # preview specific findings (+ preflight, Homebrew impact); --json for scripts
@@ -309,16 +325,45 @@ include_apple_python = true      # /Library/Python sites: inventory only, never 
 | Brew | Installed formulae and casks as an origin-grouped dependency explorer (explicitly installed / installed as dependency / unknown origin / autoremove candidates / casks) built from `brew info --json=v2 --installed` install receipts; `d` flips between *needs* and *needed by*, direct and transitive rows are distinguished, cask `depends_on` and `binary` artifacts are included. Origin comes from Homebrew's `installed_on_request` flag — a leaf is never assumed to be user-requested or unneeded; `brew autoremove --dry-run` provides the confirmed-orphan signal. Uninstall remedies exist only for packages nothing installed still needs (never `--ignore-dependencies`); outdated packages keep `brew upgrade`. |
 | Global Tools | Every installation by npm, pnpm (hashed `global/v<N>` and legacy `global/<N>` layouts), cargo, pipx, uv, pip (Homebrew, Apple and user site-packages) and bun, keyed by manager + install root + package so two copies stay distinct and stable across scans. Per installation: version (or `unknown`), interpreter/runtime and whether it still exists, exported commands, launchers and their targets, resolution in your login shell vs this process, ownership, project evidence, and a classification. Includes one row per command name (shell vs process resolution with every PATH candidate and its owner) and a coverage row per manager. |
 | Disk | Build artifacts (`node_modules`, `target`, `.venv`, etc.), package-manager caches, and large loose files found by a single `getattrlistbulk`-based parallel filesystem walk of the whole boot volume (mount points are never crossed; `[scan] roots = ["~"]` limits it to the home directory), plus allocation categories measured exactly off that same walk rather than estimated: the home directory's (Development, Documents, Caches, Application Support, Package caches, …) and the system's (Applications, macOS, System Library, System data). Only the home directory — or a configured root that is not one of its ancestors — is mined for artifacts, repositories and loose large files; `/System`, `/Applications`, `/Library`, `/private` and other accounts are sized for the categories and the folder browser but never classified (Homebrew's taps are repositories, system frameworks contain `node_modules`). Unreadable folders are counted and surfaced as a coverage note on the affected category rather than silently under-reporting — TCC-protected user data (Mail, Messages, Safari, … without Full Disk Access) with a Full Disk Access hint, root-owned system folders as exactly that; a category is flagged for attention only once enough of it is unreadable to matter. A "Largest files" group lists the top 25 files on the scanned roots regardless of the size threshold, Reveal-in-Finder only — context for where the disk went, not a cleanup candidate. macOS packages (`.app`, `.xcodeproj`, Photos/Music/iMovie libraries, VM bundles, …) are opaque to the walk — nothing inside one is ever listed or offered for deletion; a large data library is reported as a single informational item ("Data libraries" group, Reveal in Finder only) so the disk picture is complete — it is never a cleanup candidate. A `target` dir is recognised by its sibling `Cargo.toml` *or* by cargo's own `.rustc_info.json`/`CACHEDIR.TAG` inside it (relocated target dirs, workspace members); its primary remedy is `cargo clean --manifest-path …` with Trash as the alternative. Artifacts inside a linked git worktree name the main repository they belong to. A pnpm-linked `node_modules` reports how much of its size is hard-linked from the pnpm store (reclaimed only by `pnpm store prune`) and estimates the real reclaim; APFS clones are not detectable and can make it smaller still. The full directory tree from the walk is also published (`ScanEvent::DirTree`) for a drill-down folder browser, which the app/TUI is building separately. |
+| Projects | One row per project (a non-vendored git repo root, or a directory with a project manifest outside any repo; linked worktrees and monorepo packages fold into their repo) with **exclusive / shared / reach / baseline** bytes, a breakdown by resource kind, and the live processes and listening ports whose working directory is inside it. Every entry names the evidence that linked it. Synthetic rows: **Baseline** (ecosystem-wide resources like the default toolchain that would remain with zero projects), **Unattributed** (an orphaned DerivedData entry whose workspace was deleted, a session whose cwd is gone — each with the reason), and **Coverage**. |
+| App Storage | One row per owner — `.app` bundles under `/Applications`, `~/Applications` and `/System/Applications` (helpers fold into their outer bundle, casks into their app), Homebrew formulae, Homebrew itself, and global dev tools — with the same four numbers and a breakdown of every `~/Library/{Application Support,Caches,Containers,Group Containers,Logs,HTTPStorages,WebKit,Preferences,…}`, dotdir, cache and well-known data location (Photos library, Mail, Messages, iCloud Drive, `~/Library/Developer`) linked to it. |
 | Daemons | LaunchAgents/LaunchDaemons, flagging orphaned entries whose binary no longer exists. |
 | Shell | Your login shell's `$PATH` (fish/zsh/bash): duplicates, dead entries, system dirs shadowing Homebrew, which entries MacAudit's own process cannot see (agents and apps launch with a different environment), and shell startup time. |
 | Runtimes | Language version managers (nvm/fnm/volta/mise/asdf/pyenv/rustup) and their installed toolchain versions. |
 | Docker | Reclaimable space per category (images, containers, volumes, build cache) via `docker system df`, plus active container CPU/RAM samples via one-shot `docker stats`. |
 | Ports | Listening TCP ports with the owning process and PID. |
-| Git | Local repos with uncommitted work, unpushed commits (including branches with no upstream), stashes, and working-tree sizes; package-manager checkouts are filtered out. |
+| Git | Local repos with uncommitted work, unpushed commits (including branches with no upstream), stashes, and the size of each `.git` directory (objects, packs, stashes — what git itself stores; the checkout including build output is the Projects section's job); package-manager checkouts are filtered out. |
 | Simulators | iOS Simulator devices and runtimes, with targeted delete remedies for unavailable ones. |
 | iOS Devices | A USB-connected iPhone/iPad's capacity, free, purgeable and committed space via `ideviceinfo`, plus every installed app's bundle and data size via `ideviceinstaller`; apps whose data dwarfs the app (offline downloads, caches) are flagged for attention. Read-only — remedies are copy-to-clipboard commands. |
 | Keys | SSH keys in `~/.ssh`, flagging old or weak ones. |
 | Time Machine | Backup health per destination (last backup, failures, quota), an exclusion-aware estimate of what the backup set would contain, exclusions and how much each saves, suggested exclusions with one-click `tmutil addexclusion`, stale `/Volumes/Backups of …` mount points, and local snapshots with the purgeable-space upper bound. |
+
+## Attribution
+
+The Projects and App Storage sections are two *lenses* over the same
+whole-disk walk the Disk section performs. Each path gets exactly one owner
+set per lens (so nothing double-counts within a lens; across the two lenses
+the same bytes legitimately appear twice — `~/.cargo/registry` is both
+"cubby's" and "rustup's"). Per owner:
+
+| Number | Meaning |
+|---|---|
+| **Exclusive** | Bytes only this owner touches — what deleting it (and everything only it needs) would free. |
+| **Shared** | Its 1/N slice of paths that N owners touch (a pnpm store linked from three projects, a Group Container used by an app and its extension). |
+| **Reach** | Everything it touches at all, shared and baseline included. |
+| **Baseline share** | Its 1/N slice of ecosystem-wide resources (the default Rust toolchain is shared by every Rust project). |
+
+Every entry carries how it was linked: **exact** (a lockfile, a bundle id, a
+container or entitlement group, a `WorkspacePath`, a session `cwd`, a store
+link), **name match** (a cache named after a project or `CFBundleName`),
+**observed** (a running process has it open, or its cwd is there),
+**ecosystem default** (baseline), or **curated** (a short built-in table for
+the handful of well-known dirs — `Docker Desktop`, `Ableton` — that no
+signal derives). Two honesty notes the UI repeats where they apply: a pnpm
+`node_modules/.pnpm` is an APFS clone of the store, so its bytes count
+toward reach but are not freed by deleting `node_modules`; and Docker
+images/containers are sized by Docker itself *inside* the sparse
+`Docker.raw`, so they are shown per project but never added to any total.
 
 ## Global tools
 

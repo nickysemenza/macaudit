@@ -16,9 +16,13 @@
 //! ancestor repo (a repo living inside another repo's gitignored dir — e.g. a
 //! checkout under a gitignored `build/` — is vendored by definition).
 //!
-//! **Sizes**: each surviving repo's working tree is `du`'d through the shared
-//! size cache (same mtime+TTL semantics as Disk artifacts), emitted as a
-//! deferred size update.
+//! **Sizes**: each surviving repo's `.git` directory — what git itself
+//! stores: objects, packs, stashes, worktree metadata — is `du`'d through
+//! the shared size cache (same mtime+TTL semantics as Disk artifacts) and
+//! emitted as a deferred size update. Deliberately *not* the whole checkout:
+//! that would be dominated by untracked build output (`target/`,
+//! `node_modules/`), which the Disk section already itemises and the
+//! Projects section attributes.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -124,11 +128,14 @@ impl Scanner for GitScanner {
                     return;
                 };
 
-                // Attach the working-tree size: cached when fresh, else emit
-                // unsized now and follow up with a measured re-emit (upsert).
-                let root_mtime = root_mtime_secs(&root);
+                // Attach the `.git` size: cached when fresh, else emit unsized
+                // now and follow up with a measured re-emit (upsert). Keyed
+                // on the `.git` path so entries never collide with anything
+                // keyed on the checkout root.
+                let git_dir = root.join(".git");
+                let root_mtime = root_mtime_secs(&git_dir);
                 let cached = cache
-                    .get(&root)
+                    .get(&git_dir)
                     .copied()
                     .filter(|c| is_fresh(c, root_mtime, now_secs, ttl_hours));
                 match cached {
@@ -139,9 +146,9 @@ impl Scanner for GitScanner {
                         }
                         ctx.emit(f).await;
                     }
-                    None if root.exists() => {
+                    None if git_dir.exists() => {
                         ctx.emit(finding.clone()).await;
-                        let du_root = root.clone();
+                        let du_root = git_dir.clone();
                         let token = ctx.token.clone();
                         let size = tokio::task::spawn_blocking(move || {
                             du_blocks(&du_root, &|| token.is_cancelled())
@@ -154,7 +161,7 @@ impl Scanner for GitScanner {
                             return;
                         }
                         fresh.lock().unwrap().push((
-                            root,
+                            git_dir,
                             CachedSize {
                                 size,
                                 computed_at: now_secs,
@@ -552,12 +559,15 @@ mod tests {
 
     #[tokio::test]
     async fn real_repo_dir_gets_sized_and_cached() {
-        // A repo root that actually exists on disk gets an unsized emit
+        // A repo whose `.git` actually exists on disk gets an unsized emit
         // followed by a sized re-emit (same id), and the size lands in the db.
+        // The measured bytes are `.git`'s alone — the 1 MiB of untracked
+        // working-tree content must not show up.
         let home = tempfile::tempdir().unwrap();
         let repo = home.path().join("myrepo");
-        std::fs::create_dir_all(repo.join(".git")).unwrap();
-        std::fs::write(repo.join("README.md"), vec![b'x'; 4096]).unwrap();
+        std::fs::create_dir_all(repo.join(".git/objects")).unwrap();
+        std::fs::write(repo.join(".git/objects/pack"), vec![b'x'; 4096]).unwrap();
+        std::fs::write(repo.join("target.bin"), vec![b'x'; 1 << 20]).unwrap();
         let repo_s = repo.to_string_lossy().into_owned();
 
         let runner = MockCommandRunner::new()
@@ -593,11 +603,19 @@ mod tests {
         }
         assert_eq!(count, 2, "unsized emit then sized re-emit");
         let sized = sized.expect("sized re-emit");
-        assert!(sized.size_bytes.unwrap() >= 4096);
+        let bytes = sized.size_bytes.unwrap();
+        assert!(bytes >= 4096, "{bytes}");
+        assert!(
+            bytes < 1 << 20,
+            "working tree leaked into .git size: {bytes}"
+        );
 
         let db = size_cache::db_path(&Paths::from_home(home.path()));
         let cache = SizeCache::open(&db).unwrap().load_all().unwrap();
-        assert!(cache.contains_key(&repo), "repo size persisted to cache");
+        assert!(
+            cache.contains_key(&repo.join(".git")),
+            ".git size persisted to cache"
+        );
     }
 
     #[tokio::test]

@@ -14,6 +14,12 @@ struct StorageOverview: View {
                     FullDiskAccessBanner(store: store)
                 }
                 RecommendationsCard()
+                if !store.findings(in: .projects).isEmpty || !store.findings(in: .appStorage).isEmpty {
+                    HStack(alignment: .top, spacing: 16) {
+                        LargestOwnersCard(axis: .projects, title: "Largest projects", icon: "folder.badge.gearshape")
+                        LargestOwnersCard(axis: .appStorage, title: "Largest apps", icon: "app.badge")
+                    }
+                }
                 CategoriesCard()
             }
             .padding(20)
@@ -284,6 +290,64 @@ private struct CategoriesCard: View {
                         }
                     }
                     .padding(.vertical, 4)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Largest owners (Projects / App Storage)
+
+/// Top 5 owners by exclusive bytes for one attribution axis. Hidden by the
+/// caller when that axis hasn't produced any findings yet; empty once
+/// scanned-but-no-owners is still shown so the "nothing found" case reads
+/// clearly rather than the card just vanishing.
+private struct LargestOwnersCard: View {
+    @Environment(AuditStore.self) private var store
+    let axis: AttributionAxis
+    let title: String
+    let icon: String
+
+    private var sectionId: SectionId { axis == .projects ? .projects : .appStorage }
+
+    private var top5: [LensModel.Row] {
+        Array(LensModel.rows(store.findings(in: sectionId)).prefix(5))
+    }
+
+    var body: some View {
+        if !store.findings(in: sectionId).isEmpty {
+            Card(title: title) {
+                let rows = top5
+                if rows.isEmpty {
+                    Text("Nothing attributed yet.").foregroundStyle(.secondary).padding(.vertical, 4)
+                } else {
+                    let maxExclusive = max(rows.map(\.summary.exclusive).max() ?? 1, 1)
+                    ForEach(Array(rows.enumerated()), id: \.element.id) { i, row in
+                        if i > 0 { Divider() }
+                        Button {
+                            store.openOwner(row.finding, axis: axis)
+                        } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName: icon)
+                                    .frame(width: 22, height: 22)
+                                    .foregroundStyle(.secondary)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(row.finding.title).lineLimit(1)
+                                    GeometryReader { geo in
+                                        Capsule()
+                                            .fill(Color.accentColor)
+                                            .frame(width: max(2, geo.size.width * CGFloat(row.summary.exclusive) / CGFloat(maxExclusive)), height: 5)
+                                    }
+                                    .frame(height: 5)
+                                }
+                                Spacer()
+                                Text(Formatting.bytes(row.summary.exclusive)).monospacedDigit().foregroundStyle(.secondary)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.vertical, 4)
+                    }
                 }
             }
         }
