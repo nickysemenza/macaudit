@@ -25,7 +25,7 @@ use serde_json::json;
 
 use crate::model::{Finding, FindingKind, Remedy, RemedyCommand, ScanEvent, ScannerId, Severity};
 use crate::scan::pipe::{RepoDiscovery, RepoSender};
-use crate::scan::sizing::{du_blocks, du_blocks_bounded, du_blocks_shared};
+use crate::scan::sizing::{du_blocks, du_blocks_shared};
 use crate::scan::walk::{
     self, DirAction, DirNode, DirTree, Entry, Flags, Kind, Visitor, WalkOptions, WalkStats,
 };
@@ -52,10 +52,6 @@ const PROJECT_MARKERS: &[&str] = &[
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 /// The "Largest files" group: this many, regardless of the threshold.
 const LARGEST_FILES: usize = 25;
-/// Budget for sizing an opaque subtree such as `~/Library/CloudStorage`.
-const OPAQUE_BUDGET: Duration = Duration::from_secs(3);
-const OPAQUE_MAX_ENTRIES: u64 = 200_000;
-
 /// An artifact directory awaiting its rolled-up size.
 struct Hit {
     label: String,
@@ -170,11 +166,6 @@ const IN_TRASH: Flags = Flags(1 << 12);
 const CLASSIFIED: Flags =
     Flags(IN_LIBRARY.0 | IN_PACKAGE.0 | IN_GIT.0 | IN_ARTIFACT.0 | IN_TRASH.0);
 
-/// Subtrees under `~/Library` that are listed opaquely: File Provider
-/// domains (Dropbox, Drive, OneDrive) enumerate on `opendir`, which can be
-/// slow and network-bound, so they get a bounded measurement instead.
-const OPAQUE_UNDER_LIBRARY: &[&str] = &["CloudStorage"];
-
 /// The walk's per-directory classifier. Shared by every rayon worker; the
 /// last clone to drop releases `repo_tx` and closes the fs→git pipe.
 struct FsVisitor {
@@ -216,22 +207,6 @@ impl Visitor for FsVisitor {
         let Some(name) = child.name.to_str() else {
             return DirAction::Descend(flags);
         };
-        if flags.contains(IN_LIBRARY)
-            && parent == self.library
-            && OPAQUE_UNDER_LIBRARY.contains(&name)
-        {
-            let r = du_blocks_bounded(
-                &parent.join(name),
-                OPAQUE_MAX_ENTRIES,
-                Instant::now() + OPAQUE_BUDGET,
-                &|| self.token.is_cancelled(),
-            );
-            return DirAction::Opaque {
-                alloc: r.bytes,
-                files: r.entries,
-                dirs: 0,
-            };
-        }
         // Inside a classified subtree nothing below is a project of ours.
         if flags.0 & CLASSIFIED.0 != 0 {
             return DirAction::Descend(flags);

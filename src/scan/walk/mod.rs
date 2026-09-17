@@ -204,8 +204,6 @@ pub enum DirAction {
     Descend(Flags),
     /// Do not list it; it contributes nothing.
     Skip,
-    /// Record it with these totals without listing it.
-    Opaque { alloc: u64, files: u64, dirs: u64 },
 }
 
 /// Per-directory hooks. Every rayon worker calls these concurrently.
@@ -484,7 +482,6 @@ impl Walk<'_> {
 
         let entries = listing.entries;
         let mut subdirs: Vec<(PathBuf, Flags)> = Vec::new();
-        let mut opaque: Vec<DirNode> = Vec::new();
         let mut top: Vec<(String, u64)> = Vec::with_capacity(self.opts.per_dir_top + 1);
         let mut own_files = 0u64;
         let mut own_bytes = 0u64;
@@ -511,14 +508,6 @@ impl Walk<'_> {
                     match self.visitor.on_child_dir(path, e, &entries, flags) {
                         DirAction::Descend(f) => subdirs.push((child, f)),
                         DirAction::Skip => {}
-                        DirAction::Opaque { alloc, files, dirs } => opaque.push(DirNode {
-                            name: e.name.to_string_lossy().into_owned(),
-                            alloc,
-                            apparent: alloc,
-                            files,
-                            dirs,
-                            ..DirNode::default()
-                        }),
                     }
                 }
                 Kind::File | Kind::Other => {
@@ -592,7 +581,6 @@ impl Walk<'_> {
             .into_par_iter()
             .map(|(p, f)| self.scan_dir(&p, f))
             .collect();
-        children.extend(opaque);
         for c in &children {
             node.alloc += c.alloc;
             node.apparent += c.apparent;
@@ -925,18 +913,17 @@ mod tests {
     }
 
     #[test]
-    fn visitor_skip_and_opaque() {
+    fn visitor_skip_omits_the_subtree() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join("skipme")).unwrap();
-        write_file(&root.join("skipme/file"), 4096);
-        std::fs::create_dir_all(root.join("opaque")).unwrap();
-        // Deliberately large: if the walker ever descended into `opaque`
+        // Deliberately large: if the walker ever descended into `skipme`
         // despite the visitor's answer, this would show up in `root.alloc`.
-        write_file(&root.join("opaque/huge"), 1_000_000);
+        write_file(&root.join("skipme/huge"), 1_000_000);
+        write_file(&root.join("kept"), 4096);
 
-        struct SkipOpaque;
-        impl Visitor for SkipOpaque {
+        struct SkipOne;
+        impl Visitor for SkipOne {
             fn on_child_dir(
                 &self,
                 _parent: &Path,
@@ -944,37 +931,20 @@ mod tests {
                 _siblings: &[Entry],
                 flags: Flags,
             ) -> DirAction {
-                match child.name.to_string_lossy().as_ref() {
-                    "skipme" => DirAction::Skip,
-                    "opaque" => DirAction::Opaque {
-                        alloc: 1234,
-                        files: 5,
-                        dirs: 2,
-                    },
-                    _ => DirAction::Descend(flags),
+                if child.name == "skipme" {
+                    DirAction::Skip
+                } else {
+                    DirAction::Descend(flags)
                 }
             }
         }
 
-        let result = walk(root, WalkOptions::default(), &SkipOpaque, None, &|| false);
+        let result = walk(root, WalkOptions::default(), &SkipOne, None, &|| false);
 
         assert!(!result.root.children.iter().any(|c| c.name == "skipme"));
-        let opaque = result
-            .root
-            .children
-            .iter()
-            .find(|c| c.name == "opaque")
-            .expect("opaque present in children");
-        assert_eq!(opaque.alloc, 1234);
-        assert_eq!(opaque.files, 5);
-        assert!(
-            opaque.children.is_empty(),
-            "opaque subtree must not be listed"
-        );
-        assert_eq!(result.root.alloc, 1234);
-        assert_eq!(result.root.files, 5);
-        // Rolled up as 1 (the opaque node itself) + the 2 it reported.
-        assert_eq!(result.root.dirs, 1 + 2);
+        assert_eq!(result.root.alloc, 4096);
+        assert_eq!(result.root.files, 1);
+        assert_eq!(result.root.dirs, 0);
     }
 
     #[test]
