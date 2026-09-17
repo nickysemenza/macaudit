@@ -44,6 +44,9 @@ public struct FindingMeta: @unchecked Sendable {
         String(cString: n.objCType) == "c"
     }
     public func strings(_ key: String) -> [String] { object[key] as? [String] ?? [] }
+    /// Raw JSON array (of objects, numbers, …) at `key` — used where the
+    /// value isn't a flat `[String]`, e.g. `by_kind: [{kind, bytes}]`.
+    public func array(_ key: String) -> [Any] { object[key] as? [Any] ?? [] }
     public func has(_ key: String) -> Bool { object[key] != nil && !(object[key] is NSNull) }
 
     /// Display form of any value, for the inspector's key/value list.
@@ -275,5 +278,225 @@ public struct IosAppUsage: Sendable {
         version = m.string("app_version")
         staticBytes = m.uint64("static_bytes") ?? 0
         dynamicBytes = m.uint64("dynamic_bytes") ?? 0
+    }
+}
+
+// MARK: - Attribution (Projects / App Storage)
+
+extension Finding {
+    /// The three synthetic per-axis rows (`bucket_findings` in
+    /// `src/attribution/mod.rs`): Baseline, Unattributed, Coverage.
+    public var isAttributionBucket: Bool {
+        kind == .projectBucket || kind == .appStorageBucket
+    }
+
+    /// `baseline` | `unattributed` | `coverage` for a bucket finding, `nil`
+    /// otherwise. `bucket_findings` sets `title` literally to
+    /// "Baseline"/"Unattributed"/"Coverage" — the most stable signal
+    /// available in the FFI's `Finding` (its `key` only feeds the id hash,
+    /// it isn't a field).
+    public var bucketKind: String? {
+        guard isAttributionBucket else { return nil }
+        switch title {
+        case "Baseline": return "baseline"
+        case "Unattributed": return "unattributed"
+        case "Coverage": return "coverage"
+        default: return nil
+        }
+    }
+}
+
+extension OwnerKind {
+    /// Mirrors `OwnerKind::label()` (`src/attribution/model.rs`) for display.
+    public var label: String {
+        switch self {
+        case .project: "Project"
+        case .app: "App"
+        case .formula: "Formula"
+        case .homebrew: "Homebrew"
+        case .tool: "Tool"
+        case .baseline: "Baseline"
+        case .unattributed: "Unattributed"
+        }
+    }
+
+    /// Reverses `label` — the string an owner Finding's `meta.owner_kind`
+    /// carries.
+    public init?(label: String) {
+        switch label {
+        case "Project": self = .project
+        case "App": self = .app
+        case "Formula": self = .formula
+        case "Homebrew": self = .homebrew
+        case "Tool": self = .tool
+        case "Baseline": self = .baseline
+        case "Unattributed": self = .unattributed
+        default: return nil
+        }
+    }
+}
+
+extension EvidenceTier {
+    /// Mirrors `EvidenceTier::label()` for display: how confident the link
+    /// from an entry to its owner is, strongest first.
+    public var label: String {
+        switch self {
+        case .exact: "exact"
+        case .nameMatch: "name match"
+        case .observed: "observed"
+        case .ecosystemDefault: "ecosystem default"
+        case .curated: "curated"
+        }
+    }
+
+    /// Reverses `label` — the string `meta.top_tier` carries.
+    public init?(label: String) {
+        switch label {
+        case "exact": self = .exact
+        case "name match": self = .nameMatch
+        case "observed": self = .observed
+        case "ecosystem default": self = .ecosystemDefault
+        case "curated": self = .curated
+        default: return nil
+        }
+    }
+}
+
+extension EntryKind {
+    /// Mirrors `EntryKind::label()` for display.
+    public var label: String {
+        switch self {
+        case .workingTree: "Working tree"
+        case .artifacts: "Artifacts"
+        case .worktree: "Worktree"
+        case .packageCache: "Package cache"
+        case .toolchain: "Toolchain"
+        case .xcode: "Xcode"
+        case .simulator: "Simulator"
+        case .docker: "Docker"
+        case .agentState: "Agent state"
+        case .editorState: "Editor state"
+        case .projectCache: "Project cache"
+        case .appBundle: "App bundle"
+        case .container: "Container"
+        case .groupContainer: "Group container"
+        case .appSupport: "App support"
+        case .cache: "Cache"
+        case .preferences: "Preferences"
+        case .logs: "Logs"
+        case .webData: "Web data"
+        case .savedState: "Saved state"
+        case .dotDir: "Dot dir"
+        case .data: "Data"
+        case .other: "Other"
+        }
+    }
+
+    /// Reverses `label` — the string each `meta.by_kind[].kind` entry
+    /// carries (the typed entries themselves, from
+    /// `Engine.footprint(findingId:)`, already carry the FFI enum).
+    public init?(label: String) {
+        switch label {
+        case "Working tree": self = .workingTree
+        case "Artifacts": self = .artifacts
+        case "Worktree": self = .worktree
+        case "Package cache": self = .packageCache
+        case "Toolchain": self = .toolchain
+        case "Xcode": self = .xcode
+        case "Simulator": self = .simulator
+        case "Docker": self = .docker
+        case "Agent state": self = .agentState
+        case "Editor state": self = .editorState
+        case "Project cache": self = .projectCache
+        case "App bundle": self = .appBundle
+        case "Container": self = .container
+        case "Group container": self = .groupContainer
+        case "App support": self = .appSupport
+        case "Cache": self = .cache
+        case "Preferences": self = .preferences
+        case "Logs": self = .logs
+        case "Web data": self = .webData
+        case "Saved state": self = .savedState
+        case "Dot dir": self = .dotDir
+        case "Data": self = .data
+        case "Other": self = .other
+        default: return nil
+        }
+    }
+}
+
+extension ProcKind {
+    public var label: String {
+        switch self {
+        case .shell: "shell"
+        case .server: "server"
+        case .other: "other"
+        }
+    }
+}
+
+/// One resource-kind's byte total within an owner's `by_kind` breakdown
+/// (`OwnerSummary.byKind`). `kind` is `nil` when the label doesn't match any
+/// known `EntryKind` (forward-compatible with a scanner-only label).
+public struct OwnerKindBytes: Sendable, Equatable {
+    public let kind: EntryKind?
+    public let label: String
+    public let bytes: UInt64
+}
+
+/// Typed view of a Projects/App-Storage owner Finding's summary
+/// (`FindingKind.project`/`.appOwner`) — the `meta` keys `footprint_finding`
+/// (`src/attribution/mod.rs`) writes. The entry-level breakdown is fetched
+/// separately, on demand, via `Engine.footprint(findingId:)`.
+public struct OwnerSummary: Sendable, Equatable {
+    public let ownerKey: String
+    public let ownerKind: OwnerKind?
+    public let exclusive: UInt64
+    public let shared: UInt64
+    public let reach: UInt64
+    public let baselineShare: UInt64
+    public let byKind: [OwnerKindBytes]
+    public let entryCount: Int
+    public let worktrees: [String]
+    public let processCount: Int
+    public let ports: [Int]
+    public let topTier: EvidenceTier?
+    public let cloneNote: Bool
+    public let group: String?
+
+    /// `sizeBytes` on the finding is always `exclusive + shared`
+    /// (`footprint_finding`); exposed here so callers don't have to add it
+    /// back up themselves.
+    public var sizeBytes: UInt64 { exclusive + shared }
+
+    public init?(_ f: Finding) {
+        guard f.kind == .project || f.kind == .appOwner else { return nil }
+        let m = f.meta
+        guard let ownerKey = m.string("owner_key"),
+            let exclusive = m.uint64("exclusive"),
+            let shared = m.uint64("shared"),
+            let reach = m.uint64("reach"),
+            let baselineShare = m.uint64("baseline_share")
+        else { return nil }
+        self.ownerKey = ownerKey
+        self.ownerKind = m.string("owner_kind").flatMap(OwnerKind.init(label:))
+        self.exclusive = exclusive
+        self.shared = shared
+        self.reach = reach
+        self.baselineShare = baselineShare
+        self.byKind = m.array("by_kind").compactMap { raw -> OwnerKindBytes? in
+            guard let dict = raw as? [String: Any], let label = dict["kind"] as? String,
+                let bytesNumber = dict["bytes"] as? NSNumber, bytesNumber.doubleValue >= 0
+            else { return nil }
+            return OwnerKindBytes(
+                kind: EntryKind(label: label), label: label, bytes: UInt64(bytesNumber.doubleValue))
+        }
+        self.entryCount = Int(m.uint64("entry_count") ?? 0)
+        self.worktrees = m.strings("worktrees")
+        self.processCount = Int(m.uint64("process_count") ?? 0)
+        self.ports = m.array("ports").compactMap { ($0 as? NSNumber)?.intValue }
+        self.topTier = m.string("top_tier").flatMap(EvidenceTier.init(label:))
+        self.cloneNote = m.bool("clone_note") ?? false
+        self.group = m.string("group")
     }
 }

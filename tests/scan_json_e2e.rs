@@ -166,3 +166,41 @@ fn finding_ids_are_stable_across_runs() {
         "expected at least the node_modules finding"
     );
 }
+
+/// `--section projects` pulls its dependency sections in behind the scenes
+/// (Disk, Git, ...) but the output must stay scoped to what was asked for —
+/// and stay a plain array, the shape every other `scan --json` caller relies
+/// on. The fixture's git repo and manifest-only project both become rows.
+#[test]
+fn scan_json_section_projects_is_filtered_to_project_findings() {
+    let home = build_fixture_home();
+    let out = Command::new(env!("CARGO_BIN_EXE_macaudit"))
+        .args(["scan", "--section", "projects", "--json"])
+        .env("MACAUDIT_HOME", home.path())
+        .output()
+        .expect("run macaudit");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let findings = json.as_array().expect("top-level array");
+
+    let kinds: Vec<&str> = findings.iter().filter_map(|f| f["kind"].as_str()).collect();
+    assert!(
+        kinds
+            .iter()
+            .all(|k| *k == "project" || *k == "project_bucket"),
+        "dependency sections leaked into --section projects output: {kinds:?}"
+    );
+    let names: Vec<&str> = findings
+        .iter()
+        .filter(|f| f["kind"] == "project")
+        .filter_map(|f| f["title"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"webapp") && names.contains(&"proj"),
+        "expected the fixture's manifest projects as rows, got {names:?}"
+    );
+}

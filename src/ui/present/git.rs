@@ -89,9 +89,14 @@ static COLUMNS: &[Column] = &[
         .sortable(key_branch, SortDir::Asc),
     Column::new(ColumnId::State, "State", Constraint::Length(16), state)
         .sortable(key_state, SortDir::Desc),
-    Column::new(ColumnId::Size, "Size", Constraint::Length(10), size_cell)
-        .right()
-        .sortable(key_size, SortDir::Desc),
+    Column::new(
+        ColumnId::Size,
+        ".git size",
+        Constraint::Length(10),
+        size_cell,
+    )
+    .right()
+    .sortable(key_size, SortDir::Desc),
     Column::new(ColumnId::Age, "Used", Constraint::Length(8), age_cell)
         .right()
         .sortable(key_age, SortDir::Desc),

@@ -59,6 +59,12 @@ pub enum ScannerId {
     Brew,
     Tools,
     Fs,
+    /// One row per discovered project (git repo root or manifest-only dir) —
+    /// exclusive/shared/reach across everything the project touches.
+    Projects,
+    /// One row per `.app`/Homebrew formula/global tool owner — the iOS
+    /// "Settings › Storage" view for the Mac.
+    AppStorage,
     Launchd,
     ShellEnv,
     Runtimes,
@@ -80,6 +86,8 @@ impl ScannerId {
         ScannerId::Brew,
         ScannerId::Tools,
         ScannerId::Fs,
+        ScannerId::Projects,
+        ScannerId::AppStorage,
         ScannerId::Launchd,
         ScannerId::ShellEnv,
         ScannerId::Runtimes,
@@ -100,6 +108,8 @@ impl ScannerId {
             ScannerId::Brew => "brew",
             ScannerId::Tools => "tools",
             ScannerId::Fs => "fs",
+            ScannerId::Projects => "projects",
+            ScannerId::AppStorage => "app_storage",
             ScannerId::Launchd => "launchd",
             ScannerId::ShellEnv => "shell_env",
             ScannerId::Runtimes => "runtimes",
@@ -122,6 +132,8 @@ impl ScannerId {
             "brew" | "homebrew" => ScannerId::Brew,
             "tools" | "global_tools" | "globals" | "dev_tools" => ScannerId::Tools,
             "fs" | "disk" => ScannerId::Fs,
+            "projects" | "project" => ScannerId::Projects,
+            "app_storage" | "apps_storage" | "footprint" | "footprints" => ScannerId::AppStorage,
             "launchd" | "daemons" => ScannerId::Launchd,
             "shell_env" | "shell" | "shellenv" | "env" => ScannerId::ShellEnv,
             "runtimes" | "runtime" => ScannerId::Runtimes,
@@ -148,6 +160,16 @@ pub enum FindingKind {
     /// A bounded, durable disk-allocation category (for example `~/dev`).
     DiskCategory,
     App,
+    /// One discovered project row (Projects axis).
+    Project,
+    /// One owner row (App Storage axis): app bundle, formula, Homebrew
+    /// itself, or global tool.
+    AppOwner,
+    /// A synthetic Baseline/Unattributed/Coverage row for the Projects axis.
+    ProjectBucket,
+    /// A synthetic Baseline/Unattributed/Coverage row for the App Storage
+    /// axis.
+    AppStorageBucket,
     BrewFormula,
     BrewCask,
     /// One installation of a globally installed developer tool (npm/pnpm/
@@ -203,6 +225,8 @@ impl FindingKind {
             FindingKind::SystemMetric | FindingKind::ProcessResource => ScannerId::System,
             FindingKind::DiskCategory => ScannerId::Fs,
             FindingKind::App => ScannerId::Apps,
+            FindingKind::Project | FindingKind::ProjectBucket => ScannerId::Projects,
+            FindingKind::AppOwner | FindingKind::AppStorageBucket => ScannerId::AppStorage,
             FindingKind::BrewFormula | FindingKind::BrewCask => ScannerId::Brew,
             FindingKind::GlobalTool
             | FindingKind::CommandResolution
@@ -236,6 +260,10 @@ impl FindingKind {
         FindingKind::ProcessResource,
         FindingKind::DiskCategory,
         FindingKind::App,
+        FindingKind::Project,
+        FindingKind::AppOwner,
+        FindingKind::ProjectBucket,
+        FindingKind::AppStorageBucket,
         FindingKind::BrewFormula,
         FindingKind::BrewCask,
         FindingKind::GlobalTool,
@@ -276,6 +304,10 @@ impl FindingKind {
             FindingKind::ProcessResource => "process_resource",
             FindingKind::DiskCategory => "disk_category",
             FindingKind::App => "app",
+            FindingKind::Project => "project",
+            FindingKind::AppOwner => "app_owner",
+            FindingKind::ProjectBucket => "project_bucket",
+            FindingKind::AppStorageBucket => "app_storage_bucket",
             FindingKind::BrewFormula => "brew_formula",
             FindingKind::BrewCask => "brew_cask",
             FindingKind::GlobalTool => "global_tool",
@@ -641,6 +673,13 @@ pub enum ScanEvent {
         gen: u64,
         tree: Arc<crate::scan::walk::DirTree>,
     },
+    /// One attribution axis's whole scan output, emitted once by
+    /// `ProjectsScanner`/`AppStorageScanner` after their per-owner findings.
+    Footprints {
+        scanner: ScannerId,
+        gen: u64,
+        set: Arc<crate::attribution::model::FootprintSet>,
+    },
 }
 
 impl ScanEvent {
@@ -651,7 +690,8 @@ impl ScanEvent {
             | ScanEvent::Finding { scanner, .. }
             | ScanEvent::Finished { scanner, .. }
             | ScanEvent::Failed { scanner, .. }
-            | ScanEvent::DirTree { scanner, .. } => *scanner,
+            | ScanEvent::DirTree { scanner, .. }
+            | ScanEvent::Footprints { scanner, .. } => *scanner,
         }
     }
 
@@ -662,7 +702,8 @@ impl ScanEvent {
             | ScanEvent::Finding { gen, .. }
             | ScanEvent::Finished { gen, .. }
             | ScanEvent::Failed { gen, .. }
-            | ScanEvent::DirTree { gen, .. } => *gen,
+            | ScanEvent::DirTree { gen, .. }
+            | ScanEvent::Footprints { gen, .. } => *gen,
         }
     }
 }

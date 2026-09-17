@@ -6,8 +6,10 @@
 //! on the wall clock (Disk/Git show "last used" dates). To update after an
 //! intentional change: `INSTA_UPDATE=always cargo test render_tests`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::attribution::model::Axis;
 use crate::fake;
 use crate::model::{ScanEvent, ScannerId};
 use crate::ui::app::{AppState, Mode};
@@ -69,7 +71,12 @@ fn draw_smoke_test_across_modes() {
     assert!(!app.should_quit);
 }
 
-/// An app with every section fully scanned from the fake fixtures.
+/// An app with every section fully scanned from the fake fixtures. Also
+/// publishes both attribution axes' `Footprints` event (as the real
+/// scanners do alongside their `Project`/`AppOwner` findings) so the
+/// Projects/App Storage detail pane's cache-backed sections (top entries,
+/// processes, baseline/unattributed entries) have something to render
+/// instead of falling back to the meta-only summary.
 fn app_with_fixtures() -> AppState {
     let mut app = app_with_gen(1);
     for id in ScannerId::ALL {
@@ -84,6 +91,15 @@ fn app_with_fixtures() -> AppState {
             scanner: *id,
             gen: 1,
             duration: Duration::from_millis(10),
+        });
+    }
+    for axis in Axis::ALL {
+        let mut set = fake::fake_footprint_set(*axis);
+        set.gen = 1;
+        app.apply(ScanEvent::Footprints {
+            scanner: axis.scanner(),
+            gen: 1,
+            set: Arc::new(set),
         });
     }
     app
@@ -135,9 +151,47 @@ fn golden_ios_table_with_detail() {
 #[test]
 fn golden_daemons_table_with_detail() {
     let mut app = app_with_fixtures();
-    app.handle(Action::Char('6'));
+    // Digit '8' now jumps to Launchd/Daemons: Projects/App Storage were
+    // inserted right after Fs (digit '5'), shifting every later section's
+    // digit hotkey by two.
+    app.handle(Action::Char('8'));
     app.handle(Action::Down);
     app.handle(Action::Down);
+    insta::assert_snapshot!(render(&mut app, 160, 44));
+}
+
+/// Projects table + detail: cubby (the default-sort top row, exclusive
+/// desc) has a working tree, artifacts, an APFS-clone pnpm entry, a linked
+/// worktree, two processes, and two ports — exercising the Excl/Shared/
+/// Reach/Worktrees/Procs/Ports columns, the top-entries breakdown with tier
+/// and clone badge, and the clone note. The three dim Baseline/Unattributed/
+/// Coverage rows sort to the bottom of the table beneath it.
+#[test]
+fn golden_projects_table_with_detail() {
+    let mut app = app_with_fixtures();
+    let idx = crate::registry::REGISTRY
+        .iter()
+        .position(|s| s.id == ScannerId::Projects)
+        .unwrap();
+    app.handle(Action::JumpSection(idx));
+    app.detail_mode = DetailMode::ForceOn;
+    insta::assert_snapshot!(render(&mut app, 160, 44));
+}
+
+/// App Storage table + detail: Claude (the default-sort top row) has an app
+/// bundle, an Application Support dir (name match), and a cache dir (exact
+/// bundle id) — exercising the Kind/Excl/Shared/Reach columns and the
+/// top-entries/by-kind breakdown. Same bucket-row-at-bottom treatment as
+/// Projects.
+#[test]
+fn golden_app_storage_table_with_detail() {
+    let mut app = app_with_fixtures();
+    let idx = crate::registry::REGISTRY
+        .iter()
+        .position(|s| s.id == ScannerId::AppStorage)
+        .unwrap();
+    app.handle(Action::JumpSection(idx));
+    app.detail_mode = DetailMode::ForceOn;
     insta::assert_snapshot!(render(&mut app, 160, 44));
 }
 
@@ -191,7 +245,9 @@ fn draw_smoke_test_cleanup_modes_and_explorer() {
     app.handle(Action::Char('4'));
     app.handle(Action::Down);
     render(&mut app, 150, 44);
-    app.handle(Action::Char('7'));
+    // Digit '9' now jumps to Shell: see the golden_daemons_table_with_detail
+    // comment above.
+    app.handle(Action::Char('9'));
     app.handle(Action::Down);
     render(&mut app, 150, 44);
 }

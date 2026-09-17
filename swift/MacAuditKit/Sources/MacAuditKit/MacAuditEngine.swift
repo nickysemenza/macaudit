@@ -22,6 +22,8 @@ public protocol MacAuditEngine: AnyObject, Sendable {
     func dirTopFiles(path: String, n: UInt32) -> [TopFile]
     func largestFiles(n: UInt32) -> [TopFile]
     func dirTreeStats() -> DirTreeStats?
+    func footprint(findingId: UInt64) -> Footprint?
+    func footprintBuckets(axis: Axis) -> FootprintBuckets?
 }
 
 extension Engine: MacAuditEngine {}
@@ -37,8 +39,9 @@ extension TopFile: Identifiable {
 extension SectionId: CaseIterable {
     /// Sidebar order — the same order as `Engine.sections()`.
     public static let allCases: [SectionId] = [
-        .system, .apps, .brew, .tools, .fs, .launchd, .shellEnv, .runtimes,
-        .docker, .ports, .git, .simulator, .ios, .sshKeys, .timeMachine,
+        .system, .apps, .brew, .tools, .fs, .projects, .appStorage, .launchd,
+        .shellEnv, .runtimes, .docker, .ports, .git, .simulator, .ios,
+        .sshKeys, .timeMachine,
     ]
 }
 
@@ -47,6 +50,10 @@ extension SectionId: Identifiable {
 }
 
 extension Finding: Identifiable {}
+
+extension FootprintEntry: Identifiable {
+    public var id: String { path }
+}
 
 extension SectionId {
     /// The engine's section slug (`macaudit scan --section <slug>`).
@@ -57,6 +64,8 @@ extension SectionId {
         case .brew: "brew"
         case .tools: "tools"
         case .fs: "fs"
+        case .projects: "projects"
+        case .appStorage: "app_storage"
         case .launchd: "launchd"
         case .shellEnv: "shell_env"
         case .runtimes: "runtimes"
@@ -67,6 +76,16 @@ extension SectionId {
         case .ios: "ios"
         case .sshKeys: "ssh_keys"
         case .timeMachine: "time_machine"
+        }
+    }
+
+    /// The attribution axis this section is a lens over, `nil` for every
+    /// other section.
+    public var attributionAxis: AttributionAxis? {
+        switch self {
+        case .projects: .projects
+        case .appStorage: .appStorage
+        default: nil
         }
     }
 }

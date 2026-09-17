@@ -130,6 +130,11 @@ pub struct AppState {
     /// Directory trees from the last Disk walk, keyed by root; cleared when
     /// the Disk section restarts.
     pub(super) dir_trees: BTreeMap<PathBuf, Arc<crate::scan::walk::DirTree>>,
+    /// The latest `FootprintSet` per attribution axis, replaced (not
+    /// cleared) on rescan so the Projects/App Storage panes never blank —
+    /// mirrors `dir_trees`.
+    pub(crate) footprints:
+        BTreeMap<crate::attribution::model::Axis, Arc<crate::attribution::model::FootprintSet>>,
     /// Folder drill-down cursor/sort/breadcrumb, live only while `mode ==
     /// Mode::Browse` but kept around otherwise so leaving and re-entering
     /// Browse (without navigating) reopens where it left off.
@@ -224,6 +229,7 @@ impl Default for AppState {
         AppState {
             findings: HashMap::new(),
             dir_trees: BTreeMap::new(),
+            footprints: BTreeMap::new(),
             browse: browse::BrowseState::default(),
             status,
             marked: HashSet::new(),

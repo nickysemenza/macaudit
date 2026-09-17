@@ -8,6 +8,7 @@
 use std::path::Path;
 use std::time::SystemTime;
 
+use macaudit::attribution::model as attrib;
 use macaudit::brewgraph::RemovalPreview;
 use macaudit::cleanup::{self, PreflightReport};
 use macaudit::config::DeleteMode as CoreDeleteMode;
@@ -24,6 +25,8 @@ pub enum SectionId {
     Brew,
     Tools,
     Fs,
+    Projects,
+    AppStorage,
     Launchd,
     ShellEnv,
     Runtimes,
@@ -44,6 +47,8 @@ impl From<ScannerId> for SectionId {
             ScannerId::Brew => SectionId::Brew,
             ScannerId::Tools => SectionId::Tools,
             ScannerId::Fs => SectionId::Fs,
+            ScannerId::Projects => SectionId::Projects,
+            ScannerId::AppStorage => SectionId::AppStorage,
             ScannerId::Launchd => SectionId::Launchd,
             ScannerId::ShellEnv => SectionId::ShellEnv,
             ScannerId::Runtimes => SectionId::Runtimes,
@@ -66,6 +71,8 @@ impl From<SectionId> for ScannerId {
             SectionId::Brew => ScannerId::Brew,
             SectionId::Tools => ScannerId::Tools,
             SectionId::Fs => ScannerId::Fs,
+            SectionId::Projects => ScannerId::Projects,
+            SectionId::AppStorage => ScannerId::AppStorage,
             SectionId::Launchd => ScannerId::Launchd,
             SectionId::ShellEnv => ScannerId::ShellEnv,
             SectionId::Runtimes => ScannerId::Runtimes,
@@ -146,6 +153,10 @@ pub enum FindingKind {
     ProcessResource,
     DiskCategory,
     App,
+    Project,
+    AppOwner,
+    ProjectBucket,
+    AppStorageBucket,
     BrewFormula,
     BrewCask,
     GlobalTool,
@@ -182,6 +193,10 @@ impl From<model::FindingKind> for FindingKind {
             K::ProcessResource => FindingKind::ProcessResource,
             K::DiskCategory => FindingKind::DiskCategory,
             K::App => FindingKind::App,
+            K::Project => FindingKind::Project,
+            K::AppOwner => FindingKind::AppOwner,
+            K::ProjectBucket => FindingKind::ProjectBucket,
+            K::AppStorageBucket => FindingKind::AppStorageBucket,
             K::BrewFormula => FindingKind::BrewFormula,
             K::BrewCask => FindingKind::BrewCask,
             K::GlobalTool => FindingKind::GlobalTool,
@@ -654,10 +669,355 @@ pub struct DirTreeStats {
     pub elapsed_ms: u64,
 }
 
+// ---- Attribution axes (Projects / App Storage) ----
+//
+// FFI mirrors of `macaudit::attribution::model`. Everything here is a value
+// copy: `Engine::footprint`/`footprint_buckets` build these from a read lock
+// over `Shared.footprints`, so nothing here borrows engine memory. Enum
+// variant order matches the core enums exactly (`attrib::*`).
+
+/// Which attribution lens a `Footprint`/`FootprintBuckets` belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, uniffi::Enum)]
+pub enum Axis {
+    Projects,
+    AppStorage,
+}
+
+impl From<attrib::Axis> for Axis {
+    fn from(a: attrib::Axis) -> Self {
+        match a {
+            attrib::Axis::Projects => Axis::Projects,
+            attrib::Axis::AppStorage => Axis::AppStorage,
+        }
+    }
+}
+
+impl From<Axis> for attrib::Axis {
+    fn from(a: Axis) -> Self {
+        match a {
+            Axis::Projects => attrib::Axis::Projects,
+            Axis::AppStorage => attrib::Axis::AppStorage,
+        }
+    }
+}
+
+/// What sort of thing owns a `Footprint`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum OwnerKind {
+    Project,
+    App,
+    Formula,
+    Homebrew,
+    Tool,
+    Baseline,
+    Unattributed,
+}
+
+impl From<attrib::OwnerKind> for OwnerKind {
+    fn from(k: attrib::OwnerKind) -> Self {
+        match k {
+            attrib::OwnerKind::Project => OwnerKind::Project,
+            attrib::OwnerKind::App => OwnerKind::App,
+            attrib::OwnerKind::Formula => OwnerKind::Formula,
+            attrib::OwnerKind::Homebrew => OwnerKind::Homebrew,
+            attrib::OwnerKind::Tool => OwnerKind::Tool,
+            attrib::OwnerKind::Baseline => OwnerKind::Baseline,
+            attrib::OwnerKind::Unattributed => OwnerKind::Unattributed,
+        }
+    }
+}
+
+/// What resource an entry represents — the breakdown axis within one owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum EntryKind {
+    WorkingTree,
+    Artifacts,
+    Worktree,
+    PackageCache,
+    Toolchain,
+    Xcode,
+    Simulator,
+    Docker,
+    AgentState,
+    EditorState,
+    ProjectCache,
+    AppBundle,
+    Container,
+    GroupContainer,
+    AppSupport,
+    Cache,
+    Preferences,
+    Logs,
+    WebData,
+    SavedState,
+    DotDir,
+    Data,
+    Other,
+}
+
+impl From<attrib::EntryKind> for EntryKind {
+    fn from(k: attrib::EntryKind) -> Self {
+        match k {
+            attrib::EntryKind::WorkingTree => EntryKind::WorkingTree,
+            attrib::EntryKind::Artifacts => EntryKind::Artifacts,
+            attrib::EntryKind::Worktree => EntryKind::Worktree,
+            attrib::EntryKind::PackageCache => EntryKind::PackageCache,
+            attrib::EntryKind::Toolchain => EntryKind::Toolchain,
+            attrib::EntryKind::Xcode => EntryKind::Xcode,
+            attrib::EntryKind::Simulator => EntryKind::Simulator,
+            attrib::EntryKind::Docker => EntryKind::Docker,
+            attrib::EntryKind::AgentState => EntryKind::AgentState,
+            attrib::EntryKind::EditorState => EntryKind::EditorState,
+            attrib::EntryKind::ProjectCache => EntryKind::ProjectCache,
+            attrib::EntryKind::AppBundle => EntryKind::AppBundle,
+            attrib::EntryKind::Container => EntryKind::Container,
+            attrib::EntryKind::GroupContainer => EntryKind::GroupContainer,
+            attrib::EntryKind::AppSupport => EntryKind::AppSupport,
+            attrib::EntryKind::Cache => EntryKind::Cache,
+            attrib::EntryKind::Preferences => EntryKind::Preferences,
+            attrib::EntryKind::Logs => EntryKind::Logs,
+            attrib::EntryKind::WebData => EntryKind::WebData,
+            attrib::EntryKind::SavedState => EntryKind::SavedState,
+            attrib::EntryKind::DotDir => EntryKind::DotDir,
+            attrib::EntryKind::Data => EntryKind::Data,
+            attrib::EntryKind::Other => EntryKind::Other,
+        }
+    }
+}
+
+/// How confident a claim linking a path to an owner is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum EvidenceTier {
+    Exact,
+    NameMatch,
+    Observed,
+    EcosystemDefault,
+    Curated,
+}
+
+impl From<attrib::EvidenceTier> for EvidenceTier {
+    fn from(t: attrib::EvidenceTier) -> Self {
+        match t {
+            attrib::EvidenceTier::Exact => EvidenceTier::Exact,
+            attrib::EvidenceTier::NameMatch => EvidenceTier::NameMatch,
+            attrib::EvidenceTier::Observed => EvidenceTier::Observed,
+            attrib::EvidenceTier::EcosystemDefault => EvidenceTier::EcosystemDefault,
+            attrib::EvidenceTier::Curated => EvidenceTier::Curated,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ProcKind {
+    Shell,
+    Server,
+    Other,
+}
+
+impl From<attrib::ProcKind> for ProcKind {
+    fn from(k: attrib::ProcKind) -> Self {
+        match k {
+            attrib::ProcKind::Shell => ProcKind::Shell,
+            attrib::ProcKind::Server => ProcKind::Server,
+            attrib::ProcKind::Other => ProcKind::Other,
+        }
+    }
+}
+
+/// One row's identity: `key` is the stable, axis-specific identity a
+/// resolver's claims are grouped by.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct Owner {
+    pub key: String,
+    pub kind: OwnerKind,
+    pub name: String,
+    pub path: Option<String>,
+}
+
+impl From<&attrib::Owner> for Owner {
+    fn from(o: &attrib::Owner) -> Self {
+        Owner {
+            key: o.key.clone(),
+            kind: o.kind.into(),
+            name: o.name.clone(),
+            path: o.path.as_deref().map(path_string),
+        }
+    }
+}
+
+/// A live process whose cwd is inside a project.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct Proc {
+    pub pid: u32,
+    pub name: String,
+    pub kind: ProcKind,
+    pub cwd: String,
+}
+
+impl From<&attrib::Proc> for Proc {
+    fn from(p: &attrib::Proc) -> Self {
+        Proc {
+            pid: p.pid,
+            name: p.name.clone(),
+            kind: p.kind.into(),
+            cwd: path_string(&p.cwd),
+        }
+    }
+}
+
+/// One accounted path under an owner (or under Baseline/Unattributed).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct FootprintEntry {
+    pub path: String,
+    pub kind: EntryKind,
+    pub bytes: u64,
+    pub raw_bytes: u64,
+    /// Owner keys touching this path — `len() > 1` means shared.
+    pub owners: Vec<String>,
+    pub tier: EvidenceTier,
+    pub evidence: String,
+    pub label: String,
+    pub baseline: bool,
+    pub clone_of_store: bool,
+    pub virtual_bytes: bool,
+    /// `unsized` is a reserved word in Rust, hence the raw identifier; the
+    /// generated Swift sees the plain field name `unsized`.
+    pub r#unsized: bool,
+    pub stale: bool,
+    pub finding: Option<u64>,
+    pub reason: Option<String>,
+}
+
+impl From<&attrib::FootprintEntry> for FootprintEntry {
+    fn from(e: &attrib::FootprintEntry) -> Self {
+        FootprintEntry {
+            path: path_string(&e.path),
+            kind: e.kind.into(),
+            bytes: e.bytes,
+            raw_bytes: e.raw_bytes,
+            owners: e.owners.clone(),
+            tier: e.tier.into(),
+            evidence: e.evidence.clone(),
+            label: e.label.clone(),
+            baseline: e.baseline,
+            clone_of_store: e.clone_of_store,
+            virtual_bytes: e.virtual_bytes,
+            r#unsized: e.r#unsized,
+            stale: e.stale,
+            finding: e.finding.map(|id| id.0),
+            reason: e.reason.clone(),
+        }
+    }
+}
+
+/// One resource-kind bucket within an owner's breakdown.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct FootprintGroup {
+    pub kind: EntryKind,
+    pub bytes: u64,
+    pub entries: Vec<FootprintEntry>,
+}
+
+impl From<&attrib::FootprintGroup> for FootprintGroup {
+    fn from(g: &attrib::FootprintGroup) -> Self {
+        FootprintGroup {
+            kind: g.kind.into(),
+            bytes: g.bytes,
+            entries: g.entries.iter().map(FootprintEntry::from).collect(),
+        }
+    }
+}
+
+/// One owner's row: the exclusive/shared/reach/baseline-share numbers plus
+/// its breakdown. Fetched on demand via `Engine::footprint(finding_id)`
+/// rather than carried in the `Finding` — the entry list can be large.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct Footprint {
+    pub finding: u64,
+    pub owner: Owner,
+    pub exclusive: u64,
+    pub shared: u64,
+    pub reach: u64,
+    pub baseline_share: u64,
+    pub groups: Vec<FootprintGroup>,
+    pub worktrees: Vec<String>,
+    pub processes: Vec<Proc>,
+    pub ports: Vec<u16>,
+    pub clone_note: bool,
+}
+
+impl From<&attrib::Footprint> for Footprint {
+    fn from(f: &attrib::Footprint) -> Self {
+        Footprint {
+            finding: f.finding.0,
+            owner: Owner::from(&f.owner),
+            exclusive: f.exclusive,
+            shared: f.shared,
+            reach: f.reach,
+            baseline_share: f.baseline_share,
+            groups: f.groups.iter().map(FootprintGroup::from).collect(),
+            worktrees: f.worktrees.iter().map(|p| path_string(p)).collect(),
+            processes: f.processes.iter().map(Proc::from).collect(),
+            ports: f.ports.clone(),
+            clone_note: f.clone_note,
+        }
+    }
+}
+
+/// One axis's coverage: the synthetic Baseline/Unattributed rows and totals.
+/// Per-owner footprints are not repeated here — fetch those individually via
+/// `Engine::footprint(finding_id)`.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct FootprintBuckets {
+    pub axis: Axis,
+    pub baseline: Vec<FootprintEntry>,
+    pub unattributed: Vec<FootprintEntry>,
+    pub disk_total: u64,
+    pub attributed_total: u64,
+    pub missing_deps: Vec<SectionId>,
+}
+
+impl From<&attrib::FootprintSet> for FootprintBuckets {
+    fn from(set: &attrib::FootprintSet) -> Self {
+        FootprintBuckets {
+            axis: set.axis.into(),
+            baseline: set.baseline.iter().map(FootprintEntry::from).collect(),
+            unattributed: set.unattributed.iter().map(FootprintEntry::from).collect(),
+            disk_total: set.disk_total,
+            attributed_total: set.attributed_total,
+            missing_deps: set
+                .missing_deps
+                .iter()
+                .map(|d| SectionId::from(*d))
+                .collect(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use macaudit::fake;
+
+    #[test]
+    fn axis_round_trips_through_ffi_and_back() {
+        for axis in attrib::Axis::ALL {
+            let ffi: Axis = (*axis).into();
+            let back: attrib::Axis = ffi.into();
+            assert_eq!(back, *axis);
+        }
+    }
+
+    #[test]
+    fn entry_kind_maps_every_core_variant() {
+        // The `From<attrib::EntryKind> for EntryKind` match has no wildcard
+        // arm, so this is really enforced at compile time (a new core
+        // variant without a matching FFI arm fails to build); iterating
+        // `ALL` here just exercises every arm at runtime too.
+        for kind in attrib::EntryKind::ALL {
+            let _ffi: EntryKind = (*kind).into();
+        }
+    }
 
     #[test]
     fn section_ids_round_trip_over_every_scanner() {

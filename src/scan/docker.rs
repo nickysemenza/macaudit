@@ -1,14 +1,27 @@
 //! DockerScanner (spec §3.7) — `docker system df --format json` → dangling
-//! images, stopped containers, unused volumes, build cache. If the CLI is
-//! missing or the daemon is unreachable, emit a single Info finding and
-//! return Ok — never fail the whole scan over an optional tool.
+//! images, stopped containers, unused volumes, build cache, plus a
+//! per-object inventory (every container/image/volume, not just the
+//! aggregates) that `src/attribution/projects/resolvers/docker.rs` joins to
+//! a project via Compose labels. If the CLI is missing or the daemon is
+//! unreachable, emit a single Info finding and return Ok — never fail the
+//! whole scan over an optional tool.
 
 use async_trait::async_trait;
 
 use std::collections::HashMap;
 
+use serde::Deserialize;
+
 use crate::model::{Finding, FindingKind, Remedy, RemedyCommand, ScannerId, Severity};
 use crate::scan::{ScanCtx, Scanner};
+
+/// Docker Compose stamps every object it creates with these two labels (plus
+/// `com.docker.compose.service`, `.container-number`, ... we don't need).
+/// The Projects resolver joins a container to a project via
+/// `COMPOSE_WORKING_DIR_LABEL`, then pulls in its image/volumes via
+/// `COMPOSE_PROJECT_LABEL`.
+const COMPOSE_PROJECT_LABEL: &str = "com.docker.compose.project";
+const COMPOSE_WORKING_DIR_LABEL: &str = "com.docker.compose.project.working_dir";
 
 #[derive(Default)]
 pub struct DockerScanner;
@@ -23,7 +36,10 @@ impl Scanner for DockerScanner {
         // NOTE: `--format json` is ignored when `-v`/`--verbose` is passed (docker
         // prints the human-readable verbose tables instead), so we must NOT pass
         // `-v`. The plain `docker system df --format json` emits the NDJSON summary
-        // (Type/TotalCount/Active/Size/Reclaimable) this parser expects.
+        // (Type/TotalCount/Active/Size/Reclaimable) this parser expects. This also
+        // means a per-volume size (which only `-v` reports) isn't available —
+        // `emit_volumes` below leaves `size_bytes` absent rather than parse the
+        // verbose text tables.
         let out = match ctx
             .runner
             .run("docker", &["system", "df", "--format", "json"], &ctx.token)
@@ -90,6 +106,7 @@ impl Scanner for DockerScanner {
             ))
             .severity(severity)
             .meta(serde_json::json!({
+                "object": "summary",
                 "type": ty,
                 "total_count": total_count,
                 "active": active,
@@ -127,64 +144,14 @@ impl Scanner for DockerScanner {
             ctx.emit(finding).await;
         }
 
-        // Storage use alone does not explain an active dev stack. Sample
-        // container state and current CPU/RAM once, as a point-in-time
-        // observation.
-        let containers = match ctx
-            .runner
-            .run(
-                "docker",
-                &["ps", "--format", "{{.ID}}\t{{.Names}}\t{{.Status}}"],
-                &ctx.token,
-            )
-            .await
-        {
-            Ok(o) if o.success() => parse_containers(&o.stdout_str()),
-            _ => return Ok(()),
-        };
-        let stats: HashMap<String, ContainerStats> = match ctx
-            .runner
-            .run(
-                "docker",
-                &[
-                    "stats",
-                    "--no-stream",
-                    "--format",
-                    "{{.ID}}\t{{.CPUPerc}}\t{{.MemUsage}}",
-                ],
-                &ctx.token,
-            )
-            .await
-        {
-            Ok(o) if o.success() => parse_stats(&o.stdout_str()),
-            _ => HashMap::new(),
-        };
-        for container in containers {
-            let stat = stats.get(&container.id);
-            let cpu = stat.map(|s| s.cpu_percent).unwrap_or(0.0);
-            let memory = stat.and_then(|s| s.memory_bytes);
-            let severity = if cpu >= 100.0 || memory.unwrap_or(0) >= 2 * 1024 * 1024 * 1024 {
-                Severity::Warning
-            } else if cpu >= 50.0 || memory.unwrap_or(0) >= 1024 * 1024 * 1024 {
-                Severity::Attention
-            } else {
-                Severity::Info
-            };
-            ctx.emit(
-                Finding::new(
-                    FindingKind::DockerObject,
-                    &format!("container:{}", container.id),
-                    format!("{} — active container", container.name),
-                )
-                .detail(match memory {
-                    Some(memory) => format!("{} · {:.1}% CPU · {} RAM", container.status, cpu, format_size(memory)),
-                    None => format!("{} · {:.1}% CPU", container.status, cpu),
-                })
-                .severity(severity)
-                .provenance("docker ps; docker stats --no-stream")
-                .meta(serde_json::json!({ "type": "active_container", "id": container.id, "name": container.name, "status": container.status, "cpu_percent": cpu, "memory_bytes": memory })),
-            ).await;
-        }
+        // Per-object inventory: every container (running or not), every
+        // image, every volume — not just the aggregates above. The Projects
+        // resolver joins these to a project via Compose's
+        // `com.docker.compose.project[.working_dir]` labels.
+        let containers = fetch_containers(&ctx).await;
+        emit_containers(&ctx, &containers).await;
+        emit_images(&ctx, &containers).await;
+        emit_volumes(&ctx).await;
 
         Ok(())
     }
@@ -241,31 +208,385 @@ fn parse_human_size(s: &str) -> Option<u64> {
     Some((num * mult) as u64)
 }
 
-#[derive(Debug)]
-struct Container {
+/// Parse a container's `Size` column: `"<rw> (virtual <total>)"`, or just
+/// `"<rw>"` when Docker omits the virtual part (older CLI versions). The RW
+/// size is the container's own writable layer; the virtual size is what the
+/// full image + layer stack would take if nothing were shared.
+fn parse_container_size(s: &str) -> (Option<u64>, Option<u64>) {
+    let s = s.trim();
+    match s.split_once('(') {
+        Some((rw, rest)) => {
+            let virt = rest
+                .trim_end_matches(')')
+                .trim()
+                .strip_prefix("virtual")
+                .unwrap_or(rest)
+                .trim();
+            (parse_human_size(rw.trim()), parse_human_size(virt))
+        }
+        None => (parse_human_size(s), None),
+    }
+}
+
+/// Parse Docker's `k=v,k=v` label string — the flat comma-joined form
+/// `--format`'s `.Labels` template value always prints, never nested JSON.
+fn parse_labels(s: &str) -> HashMap<String, String> {
+    s.split(',')
+        .filter_map(|pair| {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                return None;
+            }
+            let (k, v) = pair.split_once('=')?;
+            Some((k.trim().to_string(), v.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Deserialize one NDJSON line per row (the shape every `docker ... --format
+/// '{{json .}}'` subcommand emits); a line that fails to parse is dropped
+/// rather than aborting the whole inventory.
+fn parse_ndjson<T: serde::de::DeserializeOwned>(input: &str) -> Vec<T> {
+    input
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            serde_json::from_str(line).ok()
+        })
+        .collect()
+}
+
+/// One row of `docker ps -a -s --format '{{json .}}'`.
+#[derive(Debug, Clone, Deserialize)]
+struct PsRow {
+    #[serde(rename = "ID")]
     id: String,
+    #[serde(rename = "Names")]
+    names: String,
+    #[serde(rename = "Image")]
+    image: String,
+    #[serde(rename = "Labels")]
+    labels: String,
+    #[serde(rename = "Size")]
+    size: String,
+    #[serde(rename = "State")]
+    state: String,
+    #[serde(rename = "CreatedAt")]
+    created_at: String,
+}
+
+/// One row of `docker image ls --format '{{json .}}'`.
+#[derive(Debug, Deserialize)]
+struct ImageRow {
+    #[serde(rename = "ID")]
+    id: String,
+    #[serde(rename = "Repository")]
+    repository: String,
+    #[serde(rename = "Tag")]
+    tag: String,
+    #[serde(rename = "Size")]
+    size: String,
+    #[serde(rename = "CreatedAt")]
+    created_at: String,
+}
+
+/// One row of `docker volume ls --format '{{json .}}'`.
+#[derive(Debug, Deserialize)]
+struct VolumeRow {
+    #[serde(rename = "Name")]
     name: String,
-    status: String,
+    #[serde(rename = "Labels")]
+    labels: String,
+    #[serde(rename = "Driver")]
+    driver: String,
+    #[serde(rename = "Mountpoint")]
+    mountpoint: String,
+}
+
+async fn fetch_containers(ctx: &ScanCtx) -> Vec<PsRow> {
+    match ctx
+        .runner
+        .run(
+            "docker",
+            &["ps", "-a", "-s", "--format", "{{json .}}"],
+            &ctx.token,
+        )
+        .await
+    {
+        Ok(o) if o.success() => parse_ndjson(&o.stdout_str()),
+        _ => Vec::new(),
+    }
+}
+
+/// One finding per container (running or not) — `docker ps` alone; CPU/RAM
+/// are sampled once for whichever of them `docker stats` reports (only the
+/// running ones). Previously this section covered only running containers,
+/// each getting its own finding built from two separate commands; now every
+/// container gets exactly one finding, built by merging both commands' data
+/// up front, so there's still only one `container:<id>` finding per
+/// container rather than two competing writes to the same key.
+async fn emit_containers(ctx: &ScanCtx, containers: &[PsRow]) {
+    if containers.is_empty() {
+        return;
+    }
+    let stats: HashMap<String, ContainerStats> = match ctx
+        .runner
+        .run(
+            "docker",
+            &[
+                "stats",
+                "--no-stream",
+                "--format",
+                "{{.ID}}\t{{.CPUPerc}}\t{{.MemUsage}}",
+            ],
+            &ctx.token,
+        )
+        .await
+    {
+        Ok(o) if o.success() => parse_stats(&o.stdout_str()),
+        _ => HashMap::new(),
+    };
+
+    for row in containers {
+        let labels = parse_labels(&row.labels);
+        let compose_project = labels.get(COMPOSE_PROJECT_LABEL).cloned();
+        let compose_working_dir = labels.get(COMPOSE_WORKING_DIR_LABEL).cloned();
+        let (size_rw_bytes, size_virtual_bytes) = parse_container_size(&row.size);
+        let running = row.state == "running";
+        let stat = stats.get(&row.id);
+        let cpu = stat.map(|s| s.cpu_percent).unwrap_or(0.0);
+        let memory = stat.and_then(|s| s.memory_bytes);
+
+        let severity = if !running {
+            Severity::Info
+        } else if cpu >= 100.0 || memory.unwrap_or(0) >= 2 * 1024 * 1024 * 1024 {
+            Severity::Warning
+        } else if cpu >= 50.0 || memory.unwrap_or(0) >= 1024 * 1024 * 1024 {
+            Severity::Attention
+        } else {
+            Severity::Info
+        };
+        let detail = if running {
+            match memory {
+                Some(memory) => {
+                    format!(
+                        "{} · {:.1}% CPU · {} RAM",
+                        row.state,
+                        cpu,
+                        format_size(memory)
+                    )
+                }
+                None => format!("{} · {:.1}% CPU", row.state, cpu),
+            }
+        } else {
+            format!("{} · created {}", row.state, row.created_at)
+        };
+
+        let mut meta = serde_json::json!({
+            "object": "container",
+            "id": row.id,
+            "name": row.names,
+            "image": row.image,
+            "labels": labels,
+            "state": row.state,
+            "cpu_percent": cpu,
+            "memory_bytes": memory,
+        });
+        if let Some(rw) = size_rw_bytes {
+            meta["size_rw_bytes"] = serde_json::json!(rw);
+        }
+        if let Some(v) = size_virtual_bytes {
+            meta["size_virtual_bytes"] = serde_json::json!(v);
+        }
+        if let Some(cp) = &compose_project {
+            meta["compose_project"] = serde_json::json!(cp);
+        }
+        if let Some(wd) = &compose_working_dir {
+            meta["compose_working_dir"] = serde_json::json!(wd);
+        }
+
+        let mut finding = Finding::new(
+            FindingKind::DockerObject,
+            &format!("container:{}", row.id),
+            format!("{} — container", row.names),
+        )
+        .detail(detail)
+        .severity(severity)
+        .provenance("docker ps -a -s; docker stats --no-stream")
+        .meta(meta);
+        if let Some(sz) = size_rw_bytes.or(size_virtual_bytes) {
+            finding = finding.size(sz);
+        }
+        ctx.emit(finding).await;
+    }
+}
+
+/// One finding per image, `used_by` listing which of `containers` reference
+/// it (by tag or by id) — plus one `docker inspect` call across every image
+/// id to pick up Compose's labels on the image itself (a compose-built
+/// image carries `com.docker.compose.project[.working_dir]` even when no
+/// container from it happens to be running).
+async fn emit_images(ctx: &ScanCtx, containers: &[PsRow]) {
+    let out = match ctx
+        .runner
+        .run(
+            "docker",
+            &["image", "ls", "--format", "{{json .}}"],
+            &ctx.token,
+        )
+        .await
+    {
+        Ok(o) if o.success() => o.stdout_str().into_owned(),
+        _ => return,
+    };
+    let rows: Vec<ImageRow> = parse_ndjson(&out);
+    if rows.is_empty() {
+        return;
+    }
+
+    let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+    let mut inspect_args = vec!["inspect", "--format", "{{.Id}} {{json .Config.Labels}}"];
+    inspect_args.extend(ids.iter().copied());
+    let inspected = match ctx.runner.run("docker", &inspect_args, &ctx.token).await {
+        Ok(o) if o.success() => parse_inspect_labels(&o.stdout_str()),
+        _ => Vec::new(),
+    };
+
+    for row in rows {
+        let labels = inspected
+            .iter()
+            .find(|(full_id, _)| {
+                let full_id = full_id.trim_start_matches("sha256:");
+                full_id.starts_with(&row.id)
+            })
+            .map(|(_, labels)| labels.clone())
+            .unwrap_or_default();
+        let compose_project = labels.get(COMPOSE_PROJECT_LABEL).cloned();
+        let compose_working_dir = labels.get(COMPOSE_WORKING_DIR_LABEL).cloned();
+        let size_bytes = parse_human_size(&row.size);
+        let repo_tag = format!("{}:{}", row.repository, row.tag);
+        let used_by: Vec<&str> = containers
+            .iter()
+            .filter(|c| image_matches(&c.image, &row.id, &repo_tag))
+            .map(|c| c.id.as_str())
+            .collect();
+
+        let mut meta = serde_json::json!({
+            "object": "image",
+            "id": row.id,
+            "repository": row.repository,
+            "tag": row.tag,
+            "labels": labels,
+            "used_by": used_by,
+        });
+        if let Some(cp) = &compose_project {
+            meta["compose_project"] = serde_json::json!(cp);
+        }
+        if let Some(wd) = &compose_working_dir {
+            meta["compose_working_dir"] = serde_json::json!(wd);
+        }
+        if let Some(sz) = size_bytes {
+            meta["size_bytes"] = serde_json::json!(sz);
+        }
+
+        let mut finding = Finding::new(
+            FindingKind::DockerObject,
+            &format!("image:{}", row.id),
+            format!("{repo_tag} — image"),
+        )
+        .detail(format!("created {}", row.created_at))
+        .severity(Severity::Info)
+        .provenance("docker image ls; docker inspect")
+        .meta(meta);
+        if let Some(sz) = size_bytes {
+            finding = finding.size(sz);
+        }
+        ctx.emit(finding).await;
+    }
+}
+
+/// Whether a container's `Image` field (a `repo:tag`, or an id/digest for an
+/// untagged pull) refers to this image.
+fn image_matches(container_image: &str, image_id: &str, repo_tag: &str) -> bool {
+    if container_image == repo_tag {
+        return true;
+    }
+    let stripped = container_image.trim_start_matches("sha256:");
+    stripped.starts_with(image_id) || image_id.starts_with(stripped)
+}
+
+/// Parse `docker inspect --format '{{.Id}} {{json .Config.Labels}}'`
+/// output: one `<full sha256 id> <json labels object>` line per image.
+/// `.Config.Labels` is `null` for an unlabelled image, which fails to
+/// deserialize as a map and falls back to empty rather than dropping the
+/// row.
+fn parse_inspect_labels(input: &str) -> Vec<(String, HashMap<String, String>)> {
+    input
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let (id, json_part) = line.split_once(' ')?;
+            let labels: HashMap<String, String> =
+                serde_json::from_str(json_part).unwrap_or_default();
+            Some((id.to_string(), labels))
+        })
+        .collect()
+}
+
+/// One finding per volume. `docker system df -v` is the only subcommand
+/// that reports a volume's size, and it ignores `--format json` (see the
+/// module-level NOTE above), so `size_bytes` is left absent rather than
+/// parsed from its verbose text tables.
+async fn emit_volumes(ctx: &ScanCtx) {
+    let out = match ctx
+        .runner
+        .run(
+            "docker",
+            &["volume", "ls", "--format", "{{json .}}"],
+            &ctx.token,
+        )
+        .await
+    {
+        Ok(o) if o.success() => o.stdout_str().into_owned(),
+        _ => return,
+    };
+    let rows: Vec<VolumeRow> = parse_ndjson(&out);
+    for row in rows {
+        let labels = parse_labels(&row.labels);
+        let compose_project = labels.get(COMPOSE_PROJECT_LABEL).cloned();
+
+        let mut meta = serde_json::json!({
+            "object": "volume",
+            "name": row.name,
+            "driver": row.driver,
+            "mountpoint": row.mountpoint,
+            "labels": labels,
+        });
+        if let Some(cp) = &compose_project {
+            meta["compose_project"] = serde_json::json!(cp);
+        }
+
+        ctx.emit(
+            Finding::new(
+                FindingKind::DockerObject,
+                &format!("volume:{}", row.name),
+                format!("{} — volume", row.name),
+            )
+            .severity(Severity::Info)
+            .provenance("docker volume ls")
+            .meta(meta),
+        )
+        .await;
+    }
 }
 
 #[derive(Debug)]
 struct ContainerStats {
     cpu_percent: f64,
     memory_bytes: Option<u64>,
-}
-
-fn parse_containers(input: &str) -> Vec<Container> {
-    input
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.splitn(3, '\t');
-            Some(Container {
-                id: parts.next()?.trim().to_string(),
-                name: parts.next()?.trim().to_string(),
-                status: parts.next()?.trim().to_string(),
-            })
-        })
-        .collect()
 }
 
 fn parse_stats(input: &str) -> HashMap<String, ContainerStats> {
@@ -323,25 +644,29 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn daemon_unreachable_emits_single_info_finding() {
+    async fn run_and_collect(mock: MockCommandRunner) -> Vec<Finding> {
         let (tx, mut rx) = tokio::sync::mpsc::channel(256);
-        let mock = MockCommandRunner::new().on_fail(
-            "docker",
-            &["system", "df", "--format", "json"],
-            1,
-            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?",
-        );
         let mut ctx = ctx_with(mock);
         ctx.tx = tx;
         DockerScanner.scan(ctx).await.unwrap();
-
         let mut findings = Vec::new();
         while let Ok(ev) = rx.try_recv() {
             if let crate::model::ScanEvent::Finding { finding, .. } = ev {
                 findings.push(*finding);
             }
         }
+        findings
+    }
+
+    #[tokio::test]
+    async fn daemon_unreachable_emits_single_info_finding() {
+        let mock = MockCommandRunner::new().on_fail(
+            "docker",
+            &["system", "df", "--format", "json"],
+            1,
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?",
+        );
+        let findings = run_and_collect(mock).await;
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Info);
         assert_eq!(findings[0].title, "Docker daemon not reachable");
@@ -349,42 +674,21 @@ mod tests {
 
     #[tokio::test]
     async fn missing_binary_emits_single_info_finding() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
         // No response registered ⇒ MockCommandRunner errors, simulating a
         // missing `docker` binary.
-        let mock = MockCommandRunner::new();
-        let mut ctx = ctx_with(mock);
-        ctx.tx = tx;
-        DockerScanner.scan(ctx).await.unwrap();
-
-        let mut findings = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            if let crate::model::ScanEvent::Finding { finding, .. } = ev {
-                findings.push(*finding);
-            }
-        }
+        let findings = run_and_collect(MockCommandRunner::new()).await;
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Info);
     }
 
     #[tokio::test]
     async fn parses_df_rows_into_findings_with_remedies() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
         let mock = MockCommandRunner::new().on(
             "docker",
             &["system", "df", "--format", "json"],
             DF_FIXTURE,
         );
-        let mut ctx = ctx_with(mock);
-        ctx.tx = tx;
-        DockerScanner.scan(ctx).await.unwrap();
-
-        let mut findings = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            if let crate::model::ScanEvent::Finding { finding, .. } = ev {
-                findings.push(*finding);
-            }
-        }
+        let findings = run_and_collect(mock).await;
         assert_eq!(findings.len(), 4);
 
         let images = findings
@@ -418,6 +722,48 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn compose_labelled_container_yields_compose_working_dir() {
+        let ps_fixture = concat!(
+            r#"{"ID":"abc123","Names":"cubby-db","Image":"postgres:15","#,
+            r#""Labels":"com.docker.compose.project=cubby,com.docker.compose.project.working_dir=/Users/dev/cubby","#,
+            r#""Size":"12B (virtual 1.2GB)","State":"running","CreatedAt":"2026-01-01 00:00:00 +0000 UTC"}"#,
+            "\n",
+        );
+        let mock = MockCommandRunner::new()
+            .on("docker", &["system", "df", "--format", "json"], DF_FIXTURE)
+            .on(
+                "docker",
+                &["ps", "-a", "-s", "--format", "{{json .}}"],
+                ps_fixture,
+            )
+            .on(
+                "docker",
+                &[
+                    "stats",
+                    "--no-stream",
+                    "--format",
+                    "{{.ID}}\t{{.CPUPerc}}\t{{.MemUsage}}",
+                ],
+                "abc123\t2.0%\t50MiB / 8GiB\n",
+            );
+        let findings = run_and_collect(mock).await;
+
+        let container = findings
+            .iter()
+            .find(|f| f.meta["object"] == "container")
+            .expect("container finding");
+        assert_eq!(container.meta["compose_project"], "cubby");
+        assert_eq!(container.meta["compose_working_dir"], "/Users/dev/cubby");
+        assert_eq!(container.meta["size_rw_bytes"], 12u64);
+        assert_eq!(container.meta["size_virtual_bytes"], 1_200_000_000u64);
+        assert_eq!(container.meta["state"], "running");
+        assert_eq!(
+            container.meta["labels"]["com.docker.compose.project"],
+            "cubby"
+        );
+    }
+
     #[test]
     fn human_size_parsing() {
         assert_eq!(parse_human_size("1.113GB"), Some(1_113_000_000));
@@ -428,9 +774,58 @@ mod tests {
     }
 
     #[test]
-    fn parses_live_container_rows() {
-        let containers = parse_containers("abc\tcubby-db\tUp 2 minutes\n");
-        assert_eq!(containers[0].name, "cubby-db");
+    fn container_size_parsing_splits_rw_and_virtual() {
+        assert_eq!(
+            parse_container_size("12B (virtual 1.2GB)"),
+            (Some(12), Some(1_200_000_000))
+        );
+        assert_eq!(
+            parse_container_size("456.7MB (virtual 456.7MB)"),
+            (Some(456_700_000), Some(456_700_000))
+        );
+        assert_eq!(parse_container_size("0B"), (Some(0), None));
+        assert_eq!(parse_container_size(""), (None, None));
+    }
+
+    #[test]
+    fn label_string_parsing() {
+        let labels = parse_labels(
+            "com.docker.compose.project=cubby,com.docker.compose.project.working_dir=/Users/dev/cubby",
+        );
+        assert_eq!(
+            labels.get("com.docker.compose.project").map(String::as_str),
+            Some("cubby")
+        );
+        assert_eq!(
+            labels
+                .get("com.docker.compose.project.working_dir")
+                .map(String::as_str),
+            Some("/Users/dev/cubby")
+        );
+        assert_eq!(parse_labels("").len(), 0);
+        // A value containing '=' (base64-ish) only splits on the first '='.
+        let with_eq = parse_labels("key=va=lue");
+        assert_eq!(with_eq.get("key").map(String::as_str), Some("va=lue"));
+    }
+
+    #[test]
+    fn image_matches_by_repo_tag_or_id() {
+        assert!(image_matches("postgres:15", "abcdef123456", "postgres:15"));
+        assert!(image_matches(
+            "abcdef123456",
+            "abcdef123456789",
+            "postgres:15"
+        ));
+        assert!(image_matches(
+            "sha256:abcdef123456789",
+            "abcdef123456",
+            "postgres:15"
+        ));
+        assert!(!image_matches("redis:7", "abcdef123456", "postgres:15"));
+    }
+
+    #[test]
+    fn parses_stats_rows() {
         let stats = parse_stats("abc\t12.5%\t780MiB / 8GiB\n");
         assert_eq!(stats["abc"].cpu_percent, 12.5);
         assert!(stats["abc"].memory_bytes.unwrap() > 700 * 1024 * 1024);

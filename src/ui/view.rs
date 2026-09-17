@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn sort_is_per_section_and_s_cycles_through_columns() {
         let mut app = app_with_gen(1);
-        app.handle(Action::JumpSection(10)); // Git (index 10)
+        app.handle(Action::JumpSection(12)); // Git (index 12 — after Fs, Projects, AppStorage)
         app.apply(git_repo(1, "b-small", 1, "main"));
         app.apply(git_repo(1, "a-big", 100, "zeta"));
         app.apply(git_repo(1, "c-mid", 50, "alpha"));
@@ -294,7 +294,7 @@ mod tests {
                 .collect()
         };
         assert_eq!(names(&app), ["a-big", "c-mid", "b-small"]);
-        assert_eq!(app.sort_label(), "Size↓");
+        assert_eq!(app.sort_label(), ".git size↓");
 
         // `s` moves to the next sortable column (Repo, A→Z).
         app.handle(Action::Char('s'));

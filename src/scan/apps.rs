@@ -141,20 +141,43 @@ fn is_unmanaged_candidate(classification: Classification, obtained_from: Option<
     )
 }
 
-/// Bundle id best-effort extraction: `system_profiler`'s
-/// `SPApplicationsDataType` doesn't include `CFBundleIdentifier`, so we read it
-/// from the app bundle's `Contents/Info.plist`. Any failure (no path, missing
-/// or malformed plist, absent key) yields `None` — fixture apps whose paths
-/// don't exist on disk simply return `None`, which keeps scan tests hermetic.
-fn bundle_id(raw: &RawApp) -> Option<String> {
-    let path = raw.path.as_ref()?;
+/// Everything the App Storage axis's linker (`src/attribution/apps`) needs
+/// from an app bundle's `Contents/Info.plist`, read in one pass:
+/// `CFBundleIdentifier` (already used for cask correlation), plus
+/// `CFBundleName`, `CFBundleDisplayName`, and `CFBundleExecutable` for the
+/// linker's name-match tier. Any failure (no path, missing or malformed
+/// plist, absent key) yields `None`s — fixture apps whose paths don't exist
+/// on disk simply return the default, which keeps scan tests hermetic.
+#[derive(Default)]
+struct BundleMeta {
+    bundle_id: Option<String>,
+    bundle_name: Option<String>,
+    display_name: Option<String>,
+    executable: Option<String>,
+}
+
+fn bundle_meta(raw: &RawApp) -> BundleMeta {
+    let Some(path) = raw.path.as_ref() else {
+        return BundleMeta::default();
+    };
     let plist_path = std::path::Path::new(path).join("Contents/Info.plist");
-    let value = plist::Value::from_file(&plist_path).ok()?;
-    value
-        .as_dictionary()?
-        .get("CFBundleIdentifier")?
-        .as_string()
-        .map(str::to_string)
+    let Ok(value) = plist::Value::from_file(&plist_path) else {
+        return BundleMeta::default();
+    };
+    let Some(dict) = value.as_dictionary() else {
+        return BundleMeta::default();
+    };
+    let field = |key: &str| {
+        dict.get(key)
+            .and_then(|v| v.as_string())
+            .map(str::to_string)
+    };
+    BundleMeta {
+        bundle_id: field("CFBundleIdentifier"),
+        bundle_name: field("CFBundleName"),
+        display_name: field("CFBundleDisplayName"),
+        executable: field("CFBundleExecutable"),
+    }
 }
 
 #[async_trait]
@@ -254,6 +277,10 @@ impl Scanner for AppsScanner {
             let title = format!("{} {}", raw.name, raw.version.as_deref().unwrap_or(""));
             let title = title.trim().to_string();
 
+            // Single plist read feeds both the cask-correlation bundle id and
+            // the App Storage axis's linker fields (src/attribution/apps).
+            let bundle = bundle_meta(&raw);
+
             let meta = json!({
                 "classification": final_classification.as_str(),
                 "group": final_classification.group_label(in_applications_dir(&path, &ctx)),
@@ -261,7 +288,10 @@ impl Scanner for AppsScanner {
                 "obtained_from": raw.obtained_from,
                 "signed_by": raw.signed_by.as_ref().map(|s| s.display()),
                 "version": raw.version,
-                "bundle_id": bundle_id(&raw),
+                "bundle_id": bundle.bundle_id,
+                "bundle_name": bundle.bundle_name,
+                "display_name": bundle.display_name,
+                "executable": bundle.executable,
                 "rosetta_or_intel_only": rosetta_flag,
                 "is_apple_silicon_host": is_apple_silicon,
             });

@@ -9,10 +9,17 @@ struct SectionSidebar: View {
         List(selection: $store.selectedItem) {
             Label("Storage", systemImage: "internaldrive")
                 .tag(SidebarItem.storage)
+            Label("Projects", systemImage: "folder.badge.gearshape")
+                .tag(SidebarItem.projects)
+            Label("Apps", systemImage: "app.badge")
+                .tag(SidebarItem.apps)
             Label("Folders", systemImage: "folder")
                 .tag(SidebarItem.folders)
             Section("Sections") {
-                ForEach(store.sections, id: \.id) { meta in
+                // Projects/App Storage are top-level lenses above, not
+                // generic scanner sections — kept out of this list and the
+                // Rescan-All menu (`MacAuditApp.swift`) the same way.
+                ForEach(store.sections.filter { $0.id != .projects && $0.id != .appStorage }, id: \.id) { meta in
                     SectionRow(meta: meta).tag(SidebarItem.section(meta.id))
                 }
             }
@@ -118,6 +125,8 @@ private struct SectionRow: View {
         case .brew: "mug"
         case .tools: "wrench.and.screwdriver"
         case .fs: "internaldrive"
+        case .projects: "folder.badge.gearshape"
+        case .appStorage: "app.badge"
         case .launchd: "gearshape.2"
         case .shellEnv: "terminal"
         case .runtimes: "cube.box"

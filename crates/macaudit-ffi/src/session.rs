@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
+use macaudit::attribution::model::{Axis, FootprintSet};
 use macaudit::correlate::{self, CORRELATED_SECTIONS};
 use macaudit::engine::ScannerManager;
 use macaudit::model::{Finding, FindingId, FindingKind, ScanEvent, ScannerId};
@@ -91,6 +92,7 @@ impl Session {
             // Stored on `Shared` by the pump (outside this lock); accepted here
             // so the gen check above still gates it.
             ScanEvent::DirTree { .. } => {}
+            ScanEvent::Footprints { .. } => {}
         }
         true
     }
@@ -181,6 +183,10 @@ pub struct Shared {
     /// root. Kept outside `session` so drill-down reads never contend with
     /// the pump, and replaced (not cleared) on rescan so the UI never blanks.
     pub dir_trees: RwLock<Vec<Arc<DirTree>>>,
+    /// The latest `FootprintSet` per attribution axis. Kept outside
+    /// `session` for the same reason as `dir_trees`, and replaced (not
+    /// cleared) on rescan. `Engine::footprint`/`footprint_buckets` read this.
+    pub footprints: RwLock<HashMap<Axis, Arc<FootprintSet>>>,
 }
 
 impl Shared {
@@ -319,6 +325,9 @@ pub async fn pump(mut rx: mpsc::Receiver<ScanEvent>, weak: Weak<Shared>) {
                         let mut trees = shared.dir_trees.write().unwrap();
                         trees.retain(|t| t.root != tree.root);
                         trees.push(tree);
+                    }
+                    ScanEvent::Footprints { set, .. } => {
+                        shared.footprints.write().unwrap().insert(set.axis, set);
                     }
                 }
                 if terminal {

@@ -42,6 +42,8 @@ pub enum Command {
     /// Show or edit configuration.
     #[command(subcommand)]
     Config(ConfigCmd),
+    /// Attribution axes: per-project or per-app disk footprints.
+    Footprints(FootprintsArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -129,6 +131,17 @@ pub enum BrewCmd {
     },
 }
 
+#[derive(clap::Args, Debug)]
+pub struct FootprintsArgs {
+    /// Restrict to one axis (`projects` or `apps`). Default: both.
+    #[arg(long)]
+    pub axis: Option<String>,
+
+    /// Emit the `FootprintSet`(s) as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum ConfigCmd {
     /// Print the config file path.
@@ -148,6 +161,20 @@ impl ScanArgs {
 impl CleanArgs {
     pub fn sections(&self) -> anyhow::Result<Vec<ScannerId>> {
         resolve_sections(&self.section)
+    }
+}
+
+impl FootprintsArgs {
+    /// The requested axes, or both when `--axis` is absent. Errors on an
+    /// unknown value.
+    pub fn axes(&self) -> anyhow::Result<Vec<crate::attribution::model::Axis>> {
+        use crate::attribution::model::Axis;
+        match &self.axis {
+            None => Ok(Axis::ALL.to_vec()),
+            Some(s) => Axis::parse(s)
+                .map(|a| vec![a])
+                .ok_or_else(|| anyhow::anyhow!("unknown axis: {s}")),
+        }
     }
 }
 
@@ -198,5 +225,38 @@ mod tests {
             json: false,
         };
         assert!(a.sections().is_err());
+    }
+
+    #[test]
+    fn footprints_axis_defaults_to_both() {
+        let a = FootprintsArgs {
+            axis: None,
+            json: false,
+        };
+        assert_eq!(
+            a.axes().unwrap(),
+            crate::attribution::model::Axis::ALL.to_vec()
+        );
+    }
+
+    #[test]
+    fn footprints_axis_parses_apps() {
+        let a = FootprintsArgs {
+            axis: Some("apps".into()),
+            json: false,
+        };
+        assert_eq!(
+            a.axes().unwrap(),
+            vec![crate::attribution::model::Axis::AppStorage]
+        );
+    }
+
+    #[test]
+    fn footprints_unknown_axis_errors() {
+        let a = FootprintsArgs {
+            axis: Some("nope".into()),
+            json: false,
+        };
+        assert!(a.axes().is_err());
     }
 }

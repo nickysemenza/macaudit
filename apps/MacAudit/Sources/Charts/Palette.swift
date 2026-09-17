@@ -52,6 +52,10 @@ enum Palette {
         // Brew install reasons / app classifications.
         "requested": .blue, "dependency": .teal, "autoremove": .orange, "unknown": .gray,
         "system": .gray, "user": .blue, "app_store": .cyan, "unmanaged": .orange, "cask": .brown,
+        // Projects/App Storage lens coverage bar.
+        "Attributed": .green,
+        "Baseline": .gray,
+        "Unattributed": .red.opacity(0.7),
     ]
 
     static let reclaimable = Color.orange
@@ -59,6 +63,38 @@ enum Palette {
 
     static func section(_ id: SectionId) -> Color {
         categorical[SectionId.allCases.firstIndex(of: id)! % categorical.count]
+    }
+
+    /// Stable colour per `EntryKind` — an owner's resource-kind breakdown
+    /// (`OwnerDetailView`'s `BarBreakdown`/table/treemap, `OwnerInspector`).
+    /// Grouped so kinds from the same ecosystem read as a family (Xcode ↔
+    /// Simulator, the various `~/Library` locations, …).
+    static func color(for kind: EntryKind) -> Color {
+        switch kind {
+        case .workingTree: .red
+        case .artifacts: .orange
+        case .worktree: .indigo
+        case .packageCache: .mint
+        case .toolchain: .cyan
+        case .xcode: .purple
+        case .simulator: .pink
+        case .docker: .purple.opacity(0.6)
+        case .agentState: .teal
+        case .editorState: .yellow
+        case .projectCache: .mint.opacity(0.6)
+        case .appBundle: .blue
+        case .container: .indigo.opacity(0.6)
+        case .groupContainer: .indigo.opacity(0.4)
+        case .appSupport: .green
+        case .cache: .teal.opacity(0.6)
+        case .preferences: .brown
+        case .logs: .brown.opacity(0.6)
+        case .webData: .cyan.opacity(0.6)
+        case .savedState: .yellow.opacity(0.6)
+        case .dotDir: .gray.opacity(0.7)
+        case .data: .blue.opacity(0.6)
+        case .other: .gray
+        }
     }
 }
 

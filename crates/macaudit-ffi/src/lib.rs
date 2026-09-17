@@ -140,6 +140,7 @@ impl Engine {
             listener: Mutex::new(None),
             tx,
             dir_trees: std::sync::RwLock::new(Vec::new()),
+            footprints: std::sync::RwLock::new(std::collections::HashMap::new()),
         });
         runtime().spawn(session::pump(rx, Arc::downgrade(&shared)));
 
@@ -393,6 +394,35 @@ impl Engine {
             complete: tree.complete,
             elapsed_ms: tree.elapsed.as_millis() as u64,
         })
+    }
+
+    /// One owner's full breakdown, by the `Finding.id` of its `Project`/
+    /// `AppOwner` row — `None` before that axis has scanned, or if `id`
+    /// doesn't belong to an owner row. The entry list can be large, so it is
+    /// fetched on demand here rather than carried on the `Finding` itself;
+    /// Swift retries on the next `sectionFinished`.
+    ///
+    /// Takes only the `footprints` read lock, never `session` — the pump
+    /// (`session.rs`) always takes `session` before touching `footprints`
+    /// when both are needed, so taking `session` here too could deadlock
+    /// against it under the opposite order. `footprint`/`footprint_buckets`
+    /// avoid the question entirely by never touching `session`.
+    pub fn footprint(&self, finding_id: u64) -> Option<Footprint> {
+        let footprints = self.shared.footprints.read().unwrap();
+        footprints
+            .values()
+            .find_map(|set| set.footprints.iter().find(|fp| fp.finding.0 == finding_id))
+            .map(Footprint::from)
+    }
+
+    /// One axis's coverage buckets (Baseline, Unattributed, disk/attributed
+    /// totals, missing deps) — `None` until that axis has scanned at least
+    /// once. See `footprint` for the lock-order note.
+    pub fn footprint_buckets(&self, axis: Axis) -> Option<FootprintBuckets> {
+        let footprints = self.shared.footprints.read().unwrap();
+        footprints
+            .get(&axis.into())
+            .map(|set| FootprintBuckets::from(set.as_ref()))
     }
 }
 
@@ -675,5 +705,47 @@ mod tests {
         let largest = engine.largest_files(3);
         assert!(largest.len() <= 3);
         assert!(largest.windows(2).all(|w| w[0].alloc >= w[1].alloc));
+    }
+
+    #[test]
+    fn footprint_is_absent_before_any_scan() {
+        let (engine, _home) = fake_engine();
+        assert!(engine.footprint(0).is_none());
+        assert!(engine.footprint_buckets(Axis::Projects).is_none());
+        assert!(engine.footprint_buckets(Axis::AppStorage).is_none());
+    }
+
+    #[test]
+    fn footprint_resolves_every_project_and_app_owner_finding() {
+        let (engine, _home) = fake_engine();
+        scan_all(&engine);
+
+        for section in [SectionId::Projects, SectionId::AppStorage] {
+            let owner_findings: Vec<Finding> = engine
+                .findings(section)
+                .into_iter()
+                .filter(|f| matches!(f.kind, FindingKind::Project | FindingKind::AppOwner))
+                .collect();
+            assert!(
+                !owner_findings.is_empty(),
+                "{section:?} produced no owner findings"
+            );
+            for f in owner_findings {
+                let fp = engine
+                    .footprint(f.id)
+                    .unwrap_or_else(|| panic!("no footprint for finding {}", f.id));
+                assert_eq!(fp.finding, f.id);
+                assert_eq!(fp.owner.name, f.title);
+            }
+        }
+
+        let projects = engine
+            .footprint_buckets(Axis::Projects)
+            .expect("Projects buckets after a scan");
+        assert_eq!(projects.axis, Axis::Projects);
+        let apps = engine
+            .footprint_buckets(Axis::AppStorage)
+            .expect("AppStorage buckets after a scan");
+        assert_eq!(apps.axis, Axis::AppStorage);
     }
 }

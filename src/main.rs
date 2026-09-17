@@ -6,7 +6,9 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::Parser;
 
-use macaudit::cli::{BrewCmd, CleanArgs, Cli, Command, ConfigCmd, ScanArgs, ToolsArgs, ToolsCmd};
+use macaudit::cli::{
+    BrewCmd, CleanArgs, Cli, Command, ConfigCmd, FootprintsArgs, ScanArgs, ToolsArgs, ToolsCmd,
+};
 use macaudit::config::{Config, DeleteMode, Paths};
 use macaudit::engine::{Mode, ScannerManager};
 use macaudit::model::ScannerId;
@@ -51,24 +53,79 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Tools(args)) => run_tools(&manager, &args).await,
         Some(Command::Brew(cmd)) => run_brew(&manager, cmd).await,
         Some(Command::Config(cmd)) => run_config(&paths, cmd),
+        Some(Command::Footprints(args)) => run_footprints(&manager, &args).await,
     }
+}
+
+/// Keep only findings belonging to a section the user actually asked for.
+/// `run_to_completion` silently expands `requested` with attribution
+/// dependencies (Fs, Git, ...) so the two axis scanners have something to
+/// resolve against; callers that print findings must undo that expansion so
+/// `--section projects` prints Projects findings, not also Fs/Git/....
+fn filter_to_requested(
+    findings: std::collections::BTreeMap<macaudit::model::FindingId, macaudit::model::Finding>,
+    requested: &[ScannerId],
+) -> std::collections::BTreeMap<macaudit::model::FindingId, macaudit::model::Finding> {
+    findings
+        .into_iter()
+        .filter(|(_, f)| requested.contains(&f.kind.scanner()))
+        .collect()
 }
 
 async fn run_scan(manager: &ScannerManager, args: &ScanArgs) -> anyhow::Result<()> {
     let sections = args.sections()?;
     let outcome = manager.run_to_completion(&sections).await;
     warn_failures(&outcome.failures);
+    let findings = filter_to_requested(outcome.findings, &sections);
     if args.json {
-        println!("{}", output::findings_to_json(&outcome.findings)?);
+        println!("{}", output::findings_to_json(&findings)?);
     } else {
-        for f in outcome.findings.values() {
+        for f in findings.values() {
             let size = f
                 .size_bytes
                 .map(|b| humansize::format_size(b, humansize::BINARY))
                 .unwrap_or_else(|| "-".to_string());
             println!("[{}] {:>10}  {}", f.severity_label(), size, f.title);
         }
-        println!("\n{} findings", outcome.findings.len());
+        println!("\n{} findings", findings.len());
+    }
+    Ok(())
+}
+
+async fn run_footprints(manager: &ScannerManager, args: &FootprintsArgs) -> anyhow::Result<()> {
+    let axes = args.axes()?;
+    let sections: Vec<ScannerId> = axes.iter().map(|a| a.scanner()).collect();
+    let outcome = manager.run_to_completion(&sections).await;
+    warn_failures(&outcome.failures);
+    let sets: Vec<&macaudit::attribution::model::FootprintSet> = outcome
+        .footprints
+        .iter()
+        .map(|s| s.as_ref())
+        .filter(|s| axes.contains(&s.axis))
+        .collect();
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&sets)?);
+    } else {
+        for set in &sets {
+            println!("== {} ==", set.axis.label());
+            for fp in &set.footprints {
+                println!(
+                    "{:<32} excl {:>10}  shared {:>10}  reach {:>10}",
+                    fp.owner.name,
+                    humansize::format_size(fp.exclusive, humansize::BINARY),
+                    humansize::format_size(fp.shared, humansize::BINARY),
+                    humansize::format_size(fp.reach, humansize::BINARY),
+                );
+            }
+            let baseline_bytes: u64 = set.baseline.iter().map(|e| e.bytes).sum();
+            println!(
+                "baseline {} of {} on disk, {} unattributed, missing deps: {:?}",
+                humansize::format_size(baseline_bytes, humansize::BINARY),
+                humansize::format_size(set.disk_total, humansize::BINARY),
+                set.unattributed.len(),
+                set.missing_deps,
+            );
+        }
     }
     Ok(())
 }
@@ -87,15 +144,16 @@ async fn run_clean(manager: &ScannerManager, args: &CleanArgs) -> anyhow::Result
     let sections = args.sections()?;
     let outcome = manager.run_to_completion(&sections).await;
     warn_failures(&outcome.failures);
+    let findings = filter_to_requested(outcome.findings, &sections);
     if args.json {
         println!(
             "{}",
-            output::dry_run_json(&outcome.findings, manager.delete_mode(), &args.select)?
+            output::dry_run_json(&findings, manager.delete_mode(), &args.select)?
         );
     } else {
         print!(
             "{}",
-            output::dry_run_report_selected(&outcome.findings, manager.delete_mode(), &args.select)
+            output::dry_run_report_selected(&findings, manager.delete_mode(), &args.select)
         );
     }
     Ok(())

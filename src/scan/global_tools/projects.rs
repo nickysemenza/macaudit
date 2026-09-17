@@ -23,7 +23,10 @@ use serde_json::Value;
 use super::util::{file_name, list_dir, read_json, read_toml};
 use super::ProbeCtx;
 
-const SKIP_DIRS: &[&str] = &[
+/// Also reused, unmodified, by the attribution Projects axis's manifest-only
+/// sweep (`crate::attribution::projects::discovery`) to prune the same
+/// build-output/vendor/cache directories from its own home-subtree walk.
+pub(crate) const SKIP_DIRS: &[&str] = &[
     "node_modules",
     "target",
     "vendor",
@@ -115,23 +118,30 @@ impl ProjectIndex {
     }
 }
 
+/// Manifest filenames that mark a directory as a project. Also the match
+/// list the attribution Projects axis's manifest-only sweep
+/// (`crate::attribution::projects::discovery`) uses against an already-
+/// fetched directory listing, instead of calling the `exists()`-per-name
+/// `is_project` below (that sweep visits far more candidate directories
+/// than this correlation pass does, so one `listing::list` plus a name match
+/// beats `PROJECT_MARKERS.len()` stat calls per candidate).
+pub const PROJECT_MARKERS: &[&str] = &[
+    "package.json",
+    "Cargo.toml",
+    "pyproject.toml",
+    "requirements.txt",
+    ".tool-versions",
+    ".mise.toml",
+    "mise.toml",
+    ".node-version",
+    ".python-version",
+    "Brewfile",
+    "Package.swift",
+    "go.mod",
+];
+
 fn is_project(dir: &Path) -> bool {
-    [
-        "package.json",
-        "Cargo.toml",
-        "pyproject.toml",
-        "requirements.txt",
-        ".tool-versions",
-        ".mise.toml",
-        "mise.toml",
-        ".node-version",
-        ".python-version",
-        "Brewfile",
-        "Package.swift",
-        "go.mod",
-    ]
-    .iter()
-    .any(|m| dir.join(m).exists())
+    PROJECT_MARKERS.iter().any(|m| dir.join(m).exists())
 }
 
 fn node_local_binary(project: &Path, cmd: &str, pkg: Option<&str>) -> Option<LocalBinary> {
