@@ -10,6 +10,9 @@ struct StorageOverview: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 DiskHeaderCard()
+                if !store.hasFullDiskAccess {
+                    FullDiskAccessBanner(store: store)
+                }
                 RecommendationsCard()
                 CategoriesCard()
             }
@@ -46,9 +49,15 @@ struct CategoryStat: Identifiable, Hashable {
 struct StorageModel {
     let disk: DiskMetric?
     let categories: [CategoryStat]
+    /// The walked Disk tree's root allocation — `nil` until a Disk scan has
+    /// produced a tree.
+    let rootAlloc: UInt64?
+    let rootPath: String?
 
     init(store: AuditStore) {
         disk = store.findings(in: .system).lazy.compactMap(DiskMetric.init).first
+        rootAlloc = store.browser.root?.alloc
+        rootPath = store.browser.root?.path
         let fs = store.findings(in: .fs)
         let reclaimableFs = fs.filter { $0.severity == .reclaimable && $0.kind != .diskCategory }
         var out: [CategoryStat] = fs.compactMap { f in
@@ -81,15 +90,44 @@ struct StorageModel {
 
     var measuredBytes: UInt64 { categories.reduce(0) { $0 + $1.bytes } }
 
-    /// Used space the scanners did not attribute (macOS, other users, apps…).
-    var other: UInt64 {
-        guard let disk else { return 0 }
-        return disk.usedBytes > measuredBytes ? disk.usedBytes - measuredBytes : 0
+    /// Sum of every category *inside* the walked `/` tree — every fs
+    /// category plus Homebrew (`/opt/homebrew`) and Docker
+    /// (`~/Library/Containers`), which both live under `/`. Simulators are
+    /// excluded: their data (`~/Library/Developer`) is already counted
+    /// inside the "Apple developer data" fs category, so adding it again
+    /// would double-count against `rootAlloc`.
+    private var categoryBytesInTree: UInt64 {
+        categories.filter { $0.section != .simulator }.reduce(0) { $0 + $1.bytes }
     }
+
+    /// Splits whatever the categories don't already account for into what's
+    /// inside the walked tree ("other scanned") and what's outside it
+    /// entirely ("unscanned": other APFS volumes, local snapshots,
+    /// root-only folders) — see `StorageSplit`. Before the first Disk scan
+    /// (`rootAlloc == nil`) this falls back to a single combined `other`.
+    private var split: (otherScanned: UInt64?, unscanned: UInt64?, other: UInt64?) {
+        guard let disk else { return (nil, nil, nil) }
+        return StorageSplit.compute(used: disk.usedBytes, rootAlloc: rootAlloc, categoryBytes: categoryBytesInTree)
+    }
+
+    /// Used space inside the walked tree not attributed to any category.
+    var otherScanned: UInt64? { split.otherScanned }
+    /// Used space outside the walked tree entirely.
+    var unscanned: UInt64? { split.unscanned }
+    /// Fallback single bucket used before the first Disk scan.
+    var other: UInt64? { split.other }
 
     var segments: [BarSegment] {
         var out = categories.map(\.segment)
-        if other > 0 { out.append(BarSegment(name: "Other", bytes: other)) }
+        if let otherScanned, otherScanned > 0 {
+            out.append(BarSegment(name: "Other scanned", bytes: otherScanned))
+        }
+        if let unscanned, unscanned > 0 {
+            out.append(BarSegment(name: "Unscanned", bytes: unscanned))
+        }
+        if let other, other > 0 {
+            out.append(BarSegment(name: "Other (unscanned)", bytes: other))
+        }
         return out
     }
 
@@ -103,6 +141,11 @@ struct StorageModel {
         case "Documents": "doc"
         case "Pictures": "photo"
         case "Apple developer data": "hammer"
+        case "Package caches": "shippingbox.circle"
+        case "Applications": "app.badge"
+        case "macOS": "apple.logo"
+        case "System Library": "building.columns"
+        case "System data": "internaldrive"
         default: "folder"
         }
     }
@@ -138,7 +181,7 @@ private struct DiskHeaderCard: View {
                     capacity: d.capacityBytes,
                     trailingLabel: "\(Formatting.bytes(d.apfsFreeBytes)) free")
                 if let purgeable = d.purgeableBytes, purgeable > 0 {
-                    Text("macOS reports another \(Formatting.bytes(purgeable)) as purgeable (\(Formatting.bytes(d.macosAvailableBytes ?? 0)) available); local Time Machine snapshots\(d.timeMachineSnapshots.map { ": \($0)" } ?? "") and caches the system frees on demand.")
+                    Text("macOS reports another \(Formatting.bytes(purgeable)) as purgeable (\(Formatting.bytes(d.macosAvailableBytes ?? 0)) available); local Time Machine snapshots\(d.timeMachineSnapshots.map { ": \($0)" } ?? "") and caches the system frees on demand.\((model.unscanned ?? 0) > 0 ? " Unscanned space is other APFS volumes, local snapshots and folders only root can read." : "")")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -176,8 +219,16 @@ private struct CategoriesCard: View {
                         reclaimable: $0.reclaimable, reclaimableCount: $0.reclaimableCount,
                         section: $0.section, path: $0.path, muted: false)
         }
-        if model.other > 0 {
-            out.append(CategoryRow(name: "Other (macOS, apps, unscanned)", icon: "ellipsis.circle", bytes: model.other,
+        if let otherScanned = model.otherScanned, otherScanned > 0 {
+            out.append(CategoryRow(name: "Other scanned", icon: "folder.badge.questionmark", bytes: otherScanned,
+                                   reclaimable: 0, reclaimableCount: 0, section: nil, path: model.rootPath, muted: false))
+        }
+        if let unscanned = model.unscanned, unscanned > 0 {
+            out.append(CategoryRow(name: "Unscanned (system volumes, snapshots, root-only folders)", icon: "ellipsis.circle",
+                                   bytes: unscanned, reclaimable: 0, reclaimableCount: 0, section: nil, path: nil, muted: true))
+        }
+        if let other = model.other, other > 0 {
+            out.append(CategoryRow(name: "Other (unscanned)", icon: "ellipsis.circle", bytes: other,
                                    reclaimable: 0, reclaimableCount: 0, section: nil, path: nil, muted: true))
         }
         if let d = model.disk {
