@@ -129,6 +129,7 @@ final class UnavailableEngine: MacAuditEngine {
     func sections() -> [SectionMeta] { [] }
     func deleteMode() -> DeleteMode { .trash }
     func configPath() -> String { "" }
+    func fullDiskAccess() -> Bool { true }
     func startScan(sections: [SectionId], listener: ScanListener) -> UInt64 { 0 }
     func cancelScan() {}
     func findings(section: SectionId) -> [Finding] { [] }

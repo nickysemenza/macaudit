@@ -17,6 +17,9 @@ struct DirInspector: View {
         if let e = entry {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
+                    if !store.hasFullDiskAccess && e.errors > 0 {
+                        FullDiskAccessBanner(store: store, compact: true)
+                    }
                     header(e)
                     facts(e)
                     largestFiles(e)

@@ -305,6 +305,12 @@ impl Engine {
             .into_owned()
     }
 
+    /// Whether this process can read TCC-protected user data (Full Disk
+    /// Access). See `macaudit::scan::tcc`.
+    pub fn full_disk_access(&self) -> bool {
+        macaudit::scan::tcc::full_disk_access(&self.shared.manager.paths())
+    }
+
     /// The root of the first walked Disk tree, or `None` until a Disk scan
     /// has completed at least once.
     pub fn dir_root(&self) -> Option<DirEntry> {

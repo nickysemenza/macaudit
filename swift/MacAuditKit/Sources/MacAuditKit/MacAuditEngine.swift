@@ -7,6 +7,7 @@ public protocol MacAuditEngine: AnyObject, Sendable {
     func sections() -> [SectionMeta]
     func deleteMode() -> DeleteMode
     func configPath() -> String
+    func fullDiskAccess() -> Bool
     @discardableResult
     func startScan(sections: [SectionId], listener: ScanListener) -> UInt64
     func cancelScan()
