@@ -50,7 +50,6 @@ fn detail(_: &Finding, m: &mut MetaView<'_>) -> Vec<Field> {
             out.push(kv("Reclaim (at most)", fmt::bytes(r)));
         }
     }
-    m.skip("size_cached");
     out
 }
 

@@ -12,7 +12,7 @@
 //!
 //! Findings: one `GlobalTool` per installation (keyed
 //! `{manager}:{root}:{name}` so two copies of one package stay distinct and
-//! stable across snapshots), one `CommandResolution` per exported command
+//! stable across scans), one `CommandResolution` per exported command
 //! name (login shell vs this process), and one `ToolCoverage` row.
 
 pub mod bun;

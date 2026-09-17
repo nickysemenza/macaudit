@@ -30,6 +30,9 @@ pub enum Hit {
     StatusHint(Action),
     /// A row in the Overview's "sources" list that links to a section.
     OverviewSection(usize),
+    /// A row in the Overview's "Disk categories" list that opens Browse at
+    /// that category's path. The index is into `AppState::disk_categories()`.
+    OverviewCategory(usize),
 }
 
 /// Geometry recorded by the last `draw`.
@@ -138,7 +141,7 @@ impl RailMode {
     /// Columns the rail occupies, including its right border.
     pub fn width(self) -> u16 {
         match self {
-            RailMode::Full => 34,
+            RailMode::Full => 26,
             RailMode::Compact => 15,
             RailMode::Hidden => 0,
         }

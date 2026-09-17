@@ -44,6 +44,29 @@ fn draw_smoke_test_across_modes() {
     for w in [60, 80, 119, 120, 200] {
         render(&mut app, w, 30);
     }
+
+    // Browse mode: same width sweep, plus esc/q must return to Normal
+    // without quitting (unlike everywhere else `q` is bound).
+    app.apply(ScanEvent::DirTree {
+        scanner: ScannerId::Fs,
+        gen: 1,
+        tree: std::sync::Arc::new(fake::dir_tree()),
+    });
+    app.handle(Action::Char('b'));
+    assert_eq!(
+        app.mode,
+        Mode::Browse,
+        "b should enter Browse once a tree exists"
+    );
+    for w in [60, 80, 119, 120, 200] {
+        render(&mut app, w, 30);
+    }
+    app.handle(Action::Down);
+    app.handle(Action::Enter);
+    render(&mut app, 100, 40);
+    app.handle(Action::Esc);
+    assert_eq!(app.mode, Mode::Normal, "esc must leave Browse, not quit");
+    assert!(!app.should_quit);
 }
 
 /// An app with every section fully scanned from the fake fixtures.
@@ -221,4 +244,28 @@ fn golden_confirm_with_impact() {
     app.handle(Action::Char('x'));
     assert_eq!(app.mode, Mode::Confirm);
     insta::assert_snapshot!(render(&mut app, 160, 44));
+}
+
+/// Folder drill-down on the fake tree: the root listing, one descend, and a
+/// sort toggle — no wall-clock cells are involved (Browse shows no
+/// last-used column), so these stay stable across runs.
+#[test]
+fn golden_browse() {
+    let mut app = app_with_fixtures();
+    app.apply(ScanEvent::DirTree {
+        scanner: ScannerId::Fs,
+        gen: 1,
+        tree: std::sync::Arc::new(fake::dir_tree()),
+    });
+    app.handle(Action::Char('b'));
+    assert_eq!(app.mode, Mode::Browse);
+    insta::assert_snapshot!("golden_browse_root", render(&mut app, 160, 44));
+
+    // The cursor starts on the biggest child (`~/dev`, size sort), which has
+    // several subdirectories — a richer example than a single-child folder.
+    app.handle(Action::Enter);
+    insta::assert_snapshot!("golden_browse_descend", render(&mut app, 160, 44));
+
+    app.handle(Action::Char('s'));
+    insta::assert_snapshot!("golden_browse_sort_name", render(&mut app, 160, 44));
 }

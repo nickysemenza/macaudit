@@ -1,9 +1,9 @@
 //! Point-in-time macOS resource-health scanner.
 //!
 //! This intentionally is not a monitor: every invocation samples a bounded set
-//! of local commands once and emits ephemeral findings. The commands all flow
-//! through `CommandRunner`, making parsers fixture-testable and cancellation
-//! behave consistently with the rest of macaudit.
+//! of local commands once and emits point-in-time findings. The commands all
+//! flow through `CommandRunner`, making parsers fixture-testable and
+//! cancellation behave consistently with the rest of macaudit.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -54,7 +54,6 @@ impl Scanner for SystemScanner {
                         if cores > 0 { format!(" across {cores} cores") } else { String::new() }
                     ))
                     .severity(severity)
-                    .ephemeral()
                     .provenance("sysctl -n vm.loadavg; sysctl -n hw.ncpu")
                     .meta(json!({ "role": "cpu", "load_1": values[0], "load_5": values[1], "load_15": values[2], "cores": cores })),
             )
@@ -95,7 +94,6 @@ impl Scanner for SystemScanner {
                         None => format!("{} used; {} compressed{}", human(used), human(compressed), signal_detail),
                     })
                     .severity(severity)
-                    .ephemeral()
                     .provenance("sysctl -n hw.memsize; vm_stat; memory_pressure -Q")
                     .meta(json!({ "role": "memory", "used_bytes": used, "total_bytes": total, "compressed_bytes": compressed, "pressure_percent": signal.and_then(|s| s.pressure()), "free_percent": signal.and_then(|s| s.free()) })),
             )
@@ -115,7 +113,6 @@ impl Scanner for SystemScanner {
                 Finding::new(FindingKind::SystemMetric, "swap", "Swap")
                     .detail(format!("{} used of {}", human(swap.used), human(swap.total)))
                     .severity(severity)
-                    .ephemeral()
                     .provenance("sysctl -n vm.swapusage")
                     .meta(json!({ "role": "swap", "used_bytes": swap.used, "total_bytes": swap.total })),
             )
@@ -164,9 +161,6 @@ impl Scanner for SystemScanner {
                             human(disk.used), human(disk.capacity), human(disk.free)
                         ),
                     })
-                    // Root capacity is the one System metric that is useful
-                    // in history; the live CPU/memory/process observations
-                    // above remain ephemeral.
                     .size(disk.used)
                     .severity(severity)
                     .provenance("diskutil info -plist /; NSURLVolumeAvailableCapacityForImportantUsageKey via osascript")
@@ -206,14 +200,13 @@ impl Scanner for SystemScanner {
                         process.state
                     ))
                     .severity(severity)
-                    .ephemeral()
                     .provenance("ps -axo pid,user,%cpu,%mem,rss,state,comm")
                     .meta(json!({ "role": "process", "pid": process.pid, "user": process.user, "cpu_percent": process.cpu, "memory_percent": process.memory_percent, "rss_bytes": process.rss_bytes, "state": process.state, "command": process.command })),
                 )
                 .await;
             }
         }
-        ctx.progress("resource snapshot complete", 5, Some(5)).await;
+        ctx.progress("resource sample complete", 5, Some(5)).await;
         Ok(())
     }
 }
@@ -503,7 +496,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emits_ephemeral_live_data_and_durable_root_disk() {
+    async fn emits_live_data_and_root_disk_metrics() {
         let disk_xml = r#"<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>TotalSize</key><integer>1000</integer><key>APFSContainerFree</key><integer>250</integer></dict></plist>"#;
         let runner = MockCommandRunner::new()
             .on("sysctl", &["-n", "vm.loadavg"], "{ 2.00 1.50 1.25 }")
@@ -544,10 +537,8 @@ mod tests {
                 findings.push(*finding);
             }
         }
-        assert!(findings.iter().any(|f| f.title == "CPU load"
-            && f.snapshot_policy == crate::model::SnapshotPolicy::Ephemeral));
+        assert!(findings.iter().any(|f| f.title == "CPU load"));
         let root = findings.iter().find(|f| f.title == "Root disk").unwrap();
-        assert_eq!(root.snapshot_policy, crate::model::SnapshotPolicy::Durable);
         assert_eq!(root.size_bytes, Some(750));
         assert_eq!(root.meta["macos_available_bytes"], 500);
         assert_eq!(root.meta["estimated_reclaimable_bytes"], 250);

@@ -4,33 +4,47 @@ import SwiftUI
 struct ContentView: View {
     @Environment(AuditStore.self) private var store
     @State private var showInspector = true
-    @State private var showSnapshots = false
 
     var body: some View {
         @Bindable var store = store
         NavigationSplitView {
             SectionSidebar()
         } detail: {
-            switch store.selectedItem {
-            case .storage:
-                StorageOverview()
-                    .navigationTitle("Storage")
-                    .navigationSubtitle("\(Formatting.bytes(store.totalReclaimableBytes)) reclaimable across \(store.sections.count) sections")
-            case .section(let section):
-                if let meta = store.meta(for: section) {
-                    SectionDetail(meta: meta)
-                        .navigationTitle(meta.title)
-                        .navigationSubtitle(subtitle(for: section))
-                        .searchable(text: $store.searchText, placement: .toolbar, prompt: "Filter \(meta.title)")
+            Group {
+                switch store.selectedItem {
+                case .storage:
+                    StorageOverview()
+                        .navigationTitle("Storage")
+                        .navigationSubtitle("\(Formatting.bytes(store.totalReclaimableBytes)) reclaimable across \(store.sections.count) sections")
+                case .section(let section):
+                    if let meta = store.meta(for: section) {
+                        SectionDetail(meta: meta)
+                            .navigationTitle(meta.title)
+                            .navigationSubtitle(subtitle(for: section))
+                            .searchable(text: $store.searchText, placement: .toolbar, prompt: "Filter \(meta.title)")
+                    }
+                case .folders:
+                    FolderBrowserView()
+                        .navigationTitle("Folders")
+                        .navigationSubtitle(store.browser.current.map { PathDisplay.abbreviateHome($0.path) } ?? "")
+                case nil:
+                    ContentUnavailableView("Pick a section", systemImage: "sidebar.left")
                 }
-            case nil:
-                ContentUnavailableView("Pick a section", systemImage: "sidebar.left")
             }
+            .navigationSplitViewColumnWidth(min: 360, ideal: 640)
+            .stableColumnSize()
         }
         .onChange(of: store.selectedItem) { _, _ in store.searchText = "" }
         .inspector(isPresented: $showInspector) {
-            FindingInspector(finding: store.finding(store.selectedFinding))
-                .inspectorColumnWidth(min: 280, ideal: 340, max: 520)
+            Group {
+                if store.selectedItem == .folders {
+                    DirInspector(entry: store.browser.selectedEntry ?? store.browser.current)
+                } else {
+                    FindingInspector(finding: store.finding(store.selectedFinding))
+                }
+            }
+            .inspectorColumnWidth(min: 280, ideal: 340, max: 520)
+            .stableColumnSize()
         }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
@@ -67,13 +81,6 @@ struct ContentView: View {
                 .help("Plan and confirm the marked cleanup (⌘X)")
 
                 Button {
-                    store.refreshSnapshots()
-                    showSnapshots = true
-                } label: {
-                    Label("Snapshots", systemImage: "clock.arrow.circlepath")
-                }
-
-                Button {
                     showInspector.toggle()
                 } label: {
                     Label("Inspector", systemImage: "sidebar.right")
@@ -88,14 +95,14 @@ struct ContentView: View {
         .sheet(isPresented: Binding(get: { store.cleanup != nil }, set: { if !$0 { store.dismissCleanup() } })) {
             CleanupProgressView()
         }
-        .sheet(isPresented: $showSnapshots) {
-            SnapshotsView()
-        }
         .alert("Could not plan cleanup", isPresented: Binding(get: { store.planError != nil }, set: { _ in store.clearPlanError() })) {
             Button("OK") {}
         } message: {
             Text(store.planError ?? "")
         }
+        // Columns no longer contribute a minimum (see stableColumnSize), so the window
+        // keeps its own constant floor here.
+        .frame(minWidth: 900, minHeight: 520)
     }
 
     private func subtitle(for section: SectionId) -> String {

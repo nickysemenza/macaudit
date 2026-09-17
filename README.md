@@ -39,9 +39,6 @@ dev-environment sprawl, with safe, explicit remediation.
 - **Streaming, parallel scans.** Scanners run concurrently as async tasks
   (or in a blocking pool for the filesystem walk) and stream findings into
   the UI as they're discovered — nothing waits for the slowest scanner.
-- **Snapshots & diff.** Every full scan is auto-saved to a local SQLite
-  history so you can see what grew, what's new, and what disappeared since
-  last time (`macaudit snapshot diff`).
 - **Remediation with a Trash-first default.** Every finding that can be
   cleaned up carries an explicit remedy command; batch-executing marked
   items always shows you the exact command before it runs, and deletions go
@@ -83,16 +80,14 @@ packages touched, no settings changed. Honest fine print on what a scan
   executed *against* the phone: the only remedy is an `ideviceinstaller
   uninstall` command copied to the clipboard for you to run yourself. The
   tools are optional (`brew install libimobiledevice ideviceinstaller`);
-  without them, or without a phone, the section shows one row saying so. One
-  known wart: a scan with the phone unplugged saves a snapshot with no iOS
-  rows, so the next `snapshot diff` reports them all removed, then added.
+  without them, or without a phone, the section shows one row saying so.
 - **Health probes are explicit and bounded.** `--version` checks run only
   when you ask (`macaudit tools verify`, or the `Verify` alternative remedy
   on a tool), and after a cleanup for retained tools related to the batch —
   each capped by count and timeout, and always shown as a command.
-- **macaudit writes its own state**: size caches and the catalog cache
-  (`~/Library/Caches/macaudit`), and snapshot history
-  (`~/.local/state/macaudit`). Never anything outside its own directories.
+- **macaudit writes its own state**: the size cache and cleanup reports
+  (`~/.local/state/macaudit`), and the catalog cache
+  (`~/Library/Caches/macaudit`). Never anything outside its own directories.
 - **Nothing runs unseen.** Every remedy — delete, `brew upgrade`, `docker
   builder prune`, whatever — is rendered as a literal command string and
   shown to you (in the detail pane, and again in the confirm dialog) before
@@ -192,9 +187,6 @@ macaudit tools --class broken,duplicate,shadowed --json
 macaudit tools verify                 # explicit, bounded `--version` probes of every tool launcher
 macaudit brew why python@3.14         # why is it installed — who needs it, up to the roots you asked for
 macaudit brew deps wget               # what does it need (direct, then transitive)
-macaudit snapshot save                # scan and store a snapshot
-macaudit snapshot list                # list stored snapshots
-macaudit snapshot diff [A B] [--json] # diff two snapshots (defaults: latest two)
 macaudit config path                  # print the config file path
 macaudit config edit                  # open the config file in $EDITOR
 ```
@@ -229,7 +221,7 @@ keys always switch sections, and row-movement keys always move rows.
 | `x` | Execute marked remedies (confirm dialog; every target is re-checked before running) |
 | `c` | Reopen the last cleanup report |
 | `r` | Refresh current section's point-in-time sample |
-| `R` | Refresh all sections and save durable history |
+| `R` | Refresh all sections |
 | `/` | Filter by substring (`esc` clears) |
 | `s` | Cycle sort (size / name / severity) |
 | `H` | Toggle System apps visibility |
@@ -238,9 +230,9 @@ keys always switch sections, and row-movement keys always move rows.
 
 The detail pane shows automatically once the terminal is at least 120
 columns wide (`p` forces it either way), and the nav rail itself adapts to
-width: full (with finding counts, reclaimable size, and a `Δ` badge vs. the
-last snapshot) at 100+ columns, title-only from 70-99, and hidden below 70
-(the statusbar then names the current section instead).
+width: full (with finding counts and reclaimable size) at 100+ columns,
+title-only from 70-99, and hidden below 70 (the statusbar then names the
+current section instead).
 
 ### Mouse
 
@@ -266,9 +258,9 @@ file falls back to these defaults:
 roots = []                       # fs walk roots; empty -> [$HOME]
 ignore = []                      # paths to never descend into (tilde-expanded)
 large_file_threshold_gb = 1.0    # loose files larger than this are flagged
-# Cached sizes are reused while the tree root's mtime is unchanged AND the
-# entry is younger than this TTL. Deep-nested changes don't bump a root's
-# mtime, so a stale size can persist up to the TTL — lower it if that matters.
+# Applies to git worktree, Homebrew keg and Time Machine backup-set estimate
+# sizing only — the Disk section's single getattrlistbulk walk is never
+# cached, so this TTL has no effect on it.
 size_cache_ttl_hours = 24        # how long a cached artifact size stays fresh
 
 [artifacts]
@@ -312,15 +304,15 @@ include_apple_python = true      # /Library/Python sites: inventory only, never 
 
 | Section | What it finds |
 |---|---|
-| Resource Health | Manual CPU load, memory pressure/compression, swap, and current high-CPU/RAM processes. Root Disk explicitly distinguishes raw APFS free space from macOS available capacity, which includes purgeable space. It names the count of local Time Machine snapshots, but does not invent a byte size for them: macOS does not report a reliable per-snapshot or aggregate total. It is a point-in-time view, not a background monitor; live observations never enter snapshot diffs. |
+| Resource Health | Manual CPU load, memory pressure/compression, swap, and current high-CPU/RAM processes. Root Disk explicitly distinguishes raw APFS free space from macOS available capacity, which includes purgeable space. It names the count of local Time Machine snapshots, but does not invent a byte size for them: macOS does not report a reliable per-snapshot or aggregate total. It is a point-in-time view, not a background monitor. |
 | Apps | Installed applications, classified System / User / cask-managed / App Store / Unmanaged, with arch (Intel/Rosetta) and code-signing info. |
 | Brew | Installed formulae and casks as an origin-grouped dependency explorer (explicitly installed / installed as dependency / unknown origin / autoremove candidates / casks) built from `brew info --json=v2 --installed` install receipts; `d` flips between *needs* and *needed by*, direct and transitive rows are distinguished, cask `depends_on` and `binary` artifacts are included. Origin comes from Homebrew's `installed_on_request` flag — a leaf is never assumed to be user-requested or unneeded; `brew autoremove --dry-run` provides the confirmed-orphan signal. Uninstall remedies exist only for packages nothing installed still needs (never `--ignore-dependencies`); outdated packages keep `brew upgrade`. |
-| Global Tools | Every installation by npm, pnpm (hashed `global/v<N>` and legacy `global/<N>` layouts), cargo, pipx, uv, pip (Homebrew, Apple and user site-packages) and bun, keyed by manager + install root + package so two copies stay distinct and stable across snapshots. Per installation: version (or `unknown`), interpreter/runtime and whether it still exists, exported commands, launchers and their targets, resolution in your login shell vs this process, ownership, project evidence, and a classification. Includes one row per command name (shell vs process resolution with every PATH candidate and its owner) and a coverage row per manager. |
-| Disk | Build artifacts (`node_modules`, `target`, `.venv`, etc.), package-manager caches, and large loose files found by a parallel filesystem walk, plus bounded top-level allocation categories with explicit coverage labels. macOS packages (`.app`, `.xcodeproj`, Photos/Music/iMovie libraries, VM bundles, …) are opaque to the walk — nothing inside one is ever listed or offered for deletion; a large data library is reported as a single informational item ("Data libraries" group, Reveal in Finder only) so the disk picture is complete — it is never a cleanup candidate. A `target` dir is recognised by its sibling `Cargo.toml` *or* by cargo's own `.rustc_info.json`/`CACHEDIR.TAG` inside it (relocated target dirs, workspace members); its primary remedy is `cargo clean --manifest-path …` with Trash as the alternative. Artifacts inside a linked git worktree name the main repository they belong to. A pnpm-linked `node_modules` reports how much of its size is hard-linked from the pnpm store (reclaimed only by `pnpm store prune`) and estimates the real reclaim; APFS clones are not detectable and can make it smaller still. |
+| Global Tools | Every installation by npm, pnpm (hashed `global/v<N>` and legacy `global/<N>` layouts), cargo, pipx, uv, pip (Homebrew, Apple and user site-packages) and bun, keyed by manager + install root + package so two copies stay distinct and stable across scans. Per installation: version (or `unknown`), interpreter/runtime and whether it still exists, exported commands, launchers and their targets, resolution in your login shell vs this process, ownership, project evidence, and a classification. Includes one row per command name (shell vs process resolution with every PATH candidate and its owner) and a coverage row per manager. |
+| Disk | Build artifacts (`node_modules`, `target`, `.venv`, etc.), package-manager caches, and large loose files found by a single `getattrlistbulk`-based parallel filesystem walk of the home directory, plus top-level allocation categories (Documents, Caches, Application Support, …) measured exactly off that same walk rather than estimated. Unreadable, TCC-protected folders (Mail, Messages, Safari, … without Full Disk Access) are counted and surfaced as a coverage note on the affected category with a Full Disk Access hint, rather than silently under-reporting; a category is flagged for attention only once enough of it is unreadable to matter. A "Largest files" group lists the top 25 files on the scanned roots regardless of the size threshold, Reveal-in-Finder only — context for where the disk went, not a cleanup candidate. macOS packages (`.app`, `.xcodeproj`, Photos/Music/iMovie libraries, VM bundles, …) are opaque to the walk — nothing inside one is ever listed or offered for deletion; a large data library is reported as a single informational item ("Data libraries" group, Reveal in Finder only) so the disk picture is complete — it is never a cleanup candidate. A `target` dir is recognised by its sibling `Cargo.toml` *or* by cargo's own `.rustc_info.json`/`CACHEDIR.TAG` inside it (relocated target dirs, workspace members); its primary remedy is `cargo clean --manifest-path …` with Trash as the alternative. Artifacts inside a linked git worktree name the main repository they belong to. A pnpm-linked `node_modules` reports how much of its size is hard-linked from the pnpm store (reclaimed only by `pnpm store prune`) and estimates the real reclaim; APFS clones are not detectable and can make it smaller still. The full directory tree from the walk is also published (`ScanEvent::DirTree`) for a drill-down folder browser, which the app/TUI is building separately. |
 | Daemons | LaunchAgents/LaunchDaemons, flagging orphaned entries whose binary no longer exists. |
 | Shell | Your login shell's `$PATH` (fish/zsh/bash): duplicates, dead entries, system dirs shadowing Homebrew, which entries MacAudit's own process cannot see (agents and apps launch with a different environment), and shell startup time. |
 | Runtimes | Language version managers (nvm/fnm/volta/mise/asdf/pyenv/rustup) and their installed toolchain versions. |
-| Docker | Reclaimable space per category (images, containers, volumes, build cache) via `docker system df`, plus active container CPU/RAM samples via one-shot `docker stats`; active samples are not stored in history. |
+| Docker | Reclaimable space per category (images, containers, volumes, build cache) via `docker system df`, plus active container CPU/RAM samples via one-shot `docker stats`. |
 | Ports | Listening TCP ports with the owning process and PID. |
 | Git | Local repos with uncommitted work, unpushed commits (including branches with no upstream), stashes, and working-tree sizes; package-manager checkouts are filtered out. |
 | Simulators | iOS Simulator devices and runtimes, with targeted delete remedies for unavailable ones. |
@@ -417,9 +409,6 @@ confirm dialog is rebuilt so it can never reference a stale target.
   are inventory-only.
 - Login shells other than fish, zsh and bash fall back to the process PATH
   (the coverage row says so).
-- Snapshots written by this version carry new finding kinds and remedy
-  fields; older MacAudit binaries cannot read them (older snapshots still
-  load here).
 
 ## Cutting a release
 

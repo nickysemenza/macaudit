@@ -56,9 +56,12 @@ impl AppState {
                     self.handle(Action::Enter);
                 }
             }
-            // Hints are Normal-mode shortcuts; while filtering they'd just be
-            // typed into the box.
-            Hit::StatusHint(action) if self.mode == Mode::Normal => self.handle(action),
+            // Hints are Normal/Browse shortcuts; while filtering they'd just
+            // be typed into the box.
+            Hit::StatusHint(action) if matches!(self.mode, Mode::Normal | Mode::Browse) => {
+                self.handle(action)
+            }
+            Hit::OverviewCategory(i) => self.handle(Action::OpenBrowseCategory(i)),
             _ => {}
         }
     }
@@ -81,7 +84,7 @@ impl AppState {
                     self.handle(step);
                 }
             }
-            Hit::StatusHint(_) | Hit::ColumnHeader(_) => {}
+            Hit::StatusHint(_) | Hit::ColumnHeader(_) | Hit::OverviewCategory(_) => {}
         }
     }
 }

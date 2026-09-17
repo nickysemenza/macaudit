@@ -36,10 +36,12 @@ struct CleanupRun {
     var reportJSON: String?
 }
 
-/// What the sidebar can select: the Storage overview or a scanner section.
+/// What the sidebar can select: the Storage overview, a scanner section, or
+/// the Folders drill-down.
 enum SidebarItem: Hashable {
     case storage
     case section(SectionId)
+    case folders
 
     var section: SectionId? {
         if case .section(let id) = self { return id }
@@ -58,9 +60,8 @@ final class AuditStore {
     private(set) var findings: [SectionId: [UInt64: Finding]] = [:]
     private(set) var status: [SectionId: SectionStatus] = [:]
     private var expectedGen: [SectionId: UInt64] = [:]
-    private(set) var baseline: [SectionId: SectionBaseline] = [:]
     private(set) var activity: [String] = []
-    private(set) var lastSnapshotMessage: String?
+    let browser: DirBrowser
 
     var selectedItem: SidebarItem? = .storage
     var selectedFinding: UInt64?
@@ -75,9 +76,6 @@ final class AuditStore {
     private(set) var planError: String?
     private(set) var cleanup: CleanupRun?
 
-    private(set) var snapshots: [SnapshotMeta] = []
-    private(set) var snapshotError: String?
-
     let usingFakeData: Bool
     private var scanBridge: ScanBridge?
     private var scanTask: Task<Void, Never>?
@@ -86,8 +84,7 @@ final class AuditStore {
         self.engine = engine
         self.usingFakeData = usingFakeData
         self.sections = engine.sections()
-        self.baseline = Dictionary(
-            uniqueKeysWithValues: engine.baselineCounts().map { ($0.section, $0) })
+        self.browser = DirBrowser(engine: engine)
     }
 
     // MARK: - Reads
@@ -104,6 +101,15 @@ final class AuditStore {
 
     func findings(in id: SectionId) -> [Finding] {
         findings[id].map { Array($0.values) } ?? []
+    }
+
+    /// Findings from the fs section whose path is under (or equal to) `path`
+    /// — used by the Folders inspector to scope findings to a directory.
+    /// Disk findings at or below `path`, largest first.
+    func fsFindings(under path: String) -> [Finding] {
+        findings(in: .fs)
+            .filter { $0.path?.hasPrefix(path) == true }
+            .sorted { ($0.sizeBytes ?? 0) > ($1.sizeBytes ?? 0) }
     }
 
     /// `findings(in:)` narrowed by `searchText`.
@@ -143,13 +149,6 @@ final class AuditStore {
         findings(in: id)
             .filter { $0.severity == .reclaimable }
             .reduce(0) { $0 + ($1.sizeBytes ?? 0) }
-    }
-
-    /// Δ in reclaimable bytes vs the last snapshot, once the section is done.
-    func reclaimableDelta(in id: SectionId) -> Int64? {
-        guard case .done = status(of: id), let base = baseline[id] else { return nil }
-        let delta = Int64(reclaimableBytes(in: id)) - Int64(base.reclaimableBytes)
-        return delta == 0 ? nil : delta
     }
 
     var totalReclaimableBytes: UInt64 {
@@ -247,6 +246,10 @@ final class AuditStore {
             guard expectedGen[section] == gen else { return }
             status[section] = .done(durationMs: durationMs)
             dropStaleMarks(after: [section])
+            if section == .fs {
+                browser.refreshRoot()
+                browser.invalidate()
+            }
         case .sectionFailed(let section, let gen, let error):
             guard expectedGen[section] == gen else { return }
             status[section] = .failed(error)
@@ -255,14 +258,6 @@ final class AuditStore {
         case .correlated(_, let batch), .enriched(_, let batch):
             for f in batch {
                 findings[f.section, default: [:]][f.id] = f
-            }
-        case .snapshotSaved(let id, let message):
-            lastSnapshotMessage = message
-            push(message)
-            if id != nil {
-                baseline = Dictionary(
-                    uniqueKeysWithValues: engine.baselineCounts().map { ($0.section, $0) })
-                refreshSnapshots()
             }
         }
     }
@@ -275,6 +270,15 @@ final class AuditStore {
         marked.subtract(stale)
         for id in stale { remedyChoice[id] = nil }
         push("dropped \(stale.count) stale mark(s) after rescanning \(sections.map(\.slug).joined(separator: ", "))")
+    }
+
+    // MARK: - Folders
+
+    /// Switch the sidebar to Folders and drill the browser into `path`.
+    func browse(path: String) {
+        browser.navigate(to: path)
+        selectedItem = .folders
+        selectedFinding = nil
     }
 
     // MARK: - Marks
@@ -408,38 +412,6 @@ final class AuditStore {
             push(reportPath.map { "\(summary) — report \($0)" } ?? summary)
         }
         cleanup = run
-    }
-
-    // MARK: - Snapshots
-
-    func refreshSnapshots() {
-        do {
-            snapshots = try engine.snapshots().sorted { $0.id > $1.id }
-            snapshotError = nil
-        } catch {
-            snapshotError = "\(error)"
-        }
-    }
-
-    func saveSnapshot() {
-        do {
-            let id = try engine.saveSnapshot()
-            push("saved snapshot #\(id)")
-            refreshSnapshots()
-            baseline = Dictionary(
-                uniqueKeysWithValues: engine.baselineCounts().map { ($0.section, $0) })
-        } catch {
-            snapshotError = "\(error)"
-            push("snapshot save failed: \(error)")
-        }
-    }
-
-    func diff(_ a: Int64, _ b: Int64) -> Result<SnapshotDiff, Error> {
-        Result { try engine.diffSnapshots(a: a, b: b) }
-    }
-
-    func loadHistory() -> [SectionHistoryPoint] {
-        (try? engine.sectionHistory()) ?? []
     }
 
     // MARK: - Activity

@@ -2,11 +2,10 @@
 //! list — nothing in it takes focus. The current section is marked with `▸`
 //! and bold; `←/→`, digits, Tab, or a click switch sections.
 //!
-//! Full row layout (33 cells + right border = `RailMode::Full.width()`):
+//! Full row layout (25 cells + right border = `RailMode::Full.width()`):
 //!
 //! ```text
-//! ▸2⠇ Apps        142  2.1G  Δ-512M
-//! │││ │           │    │     └ change vs. last snapshot (7)
+//! ▸2⠇ Apps        142  2.1G
 //! │││ │           │    └ reclaimable, compact (5)
 //! │││ │           └ finding count (4)
 //! │││ └ short title (10)
@@ -115,22 +114,6 @@ fn row<'a>(app: &AppState, i: usize, meta: &registry::SectionMeta, mode: RailMod
         format!(" {count:>4} {size:>5}"),
         Style::default().fg(Color::DarkGray),
     ));
-    // "Δ since last snapshot" badge: growth red, shrink green.
-    match app.section_reclaimable_delta(meta.id) {
-        Some(delta) => {
-            let (sign, color) = if delta > 0 {
-                ("+", Color::Red)
-            } else {
-                ("-", Color::Green)
-            };
-            let badge = format!("Δ{sign}{}", fmt::bytes_compact(delta.unsigned_abs()));
-            spans.push(Span::styled(
-                format!(" {badge:>7}"),
-                Style::default().fg(color),
-            ));
-        }
-        None => spans.push(Span::raw(" ".repeat(8))),
-    }
     Line::from(spans)
 }
 
@@ -151,8 +134,7 @@ mod tests {
     }
 
     #[test]
-    fn rail_rows_fit_width_for_all_sections_with_delta_badges() {
-        use std::collections::HashMap;
+    fn rail_rows_fit_width_for_all_sections() {
         use std::time::Duration;
         use unicode_width::UnicodeWidthStr;
 
@@ -160,10 +142,9 @@ mod tests {
         use crate::ui::layout::RailMode;
 
         let mut app = crate::ui::testutil::app_with_gen(1);
-        let mut baseline = HashMap::new();
-        for (i, id) in ScannerId::ALL.iter().enumerate() {
+        for id in ScannerId::ALL.iter() {
             // Big, four-digit counts and multi-GiB reclaimable totals so every
-            // badge column is at its widest.
+            // column is at its widest.
             for n in 0..1200 {
                 let f = Finding::new(FindingKind::CacheDir, &format!("{id:?}/{n}"), "x")
                     .size(900 << 20)
@@ -179,10 +160,7 @@ mod tests {
                 gen: 1,
                 duration: Duration::from_secs(1),
             });
-            // Alternate growth/shrink so both badge signs are exercised.
-            baseline.insert(*id, (0, if i % 2 == 0 { 0 } else { 5000 << 30 }));
         }
-        app.set_baseline(baseline);
 
         for (i, meta) in registry::REGISTRY.iter().enumerate() {
             let line = row(&app, i, meta, RailMode::Full);
@@ -195,7 +173,6 @@ mod tests {
             );
             assert!(text.contains(meta.short_title), "{text:?}");
             assert_eq!(text.chars().nth(1), Some(hotkey(i)), "{text:?}");
-            assert!(text.contains('Δ'), "badge present: {text:?}");
         }
     }
 }

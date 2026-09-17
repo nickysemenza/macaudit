@@ -16,10 +16,14 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::model::{Finding, FindingKind, Guard, Remedy, RemedyCommand, ScannerId, Severity};
+use crate::model::{
+    Finding, FindingKind, Guard, Remedy, RemedyCommand, ScanEvent, ScannerId, Severity,
+};
+use crate::scan::walk::{BigFile, DirNode, DirTree};
 use crate::scan::{ScanCtx, Scanner};
 
-const MIB: u64 = 1024 * 1024;
+const KIB: u64 = 1024;
+const MIB: u64 = 1024 * KIB;
 const GIB: u64 = 1024 * MIB;
 
 /// `days` in the past, saturating at the Unix epoch rather than panicking —
@@ -80,14 +84,12 @@ pub fn fixtures(id: ScannerId) -> Vec<Finding> {
 }
 
 /// Mirrors `src/scan/system.rs`: 4 SystemMetric findings (`role` one of
-/// cpu/memory/swap/disk; disk alone is durable) plus a handful of
-/// ProcessResource findings, all ephemeral.
+/// cpu/memory/swap/disk) plus a handful of ProcessResource findings.
 fn system_fixtures() -> Vec<Finding> {
     vec![
         Finding::new(FindingKind::SystemMetric, "cpu-load", "CPU load")
             .detail("load average 6.42 / 4.10 / 3.05 across 8 cores")
             .severity(Severity::Attention)
-            .ephemeral()
             .meta(json!({
                 "role": "cpu",
                 "load_1": 6.42,
@@ -98,7 +100,6 @@ fn system_fixtures() -> Vec<Finding> {
         Finding::new(FindingKind::SystemMetric, "memory", "Memory pressure")
             .detail("14.2 GiB used of 16.0 GiB; 2.1 GiB compressed; 82% pressure")
             .severity(Severity::Warning)
-            .ephemeral()
             .meta(json!({
                 "role": "memory",
                 "used_bytes": 15 * GIB + 205 * MIB,
@@ -110,7 +111,6 @@ fn system_fixtures() -> Vec<Finding> {
         Finding::new(FindingKind::SystemMetric, "swap", "Swap")
             .detail("512.0 MiB used of 2.0 GiB")
             .severity(Severity::Info)
-            .ephemeral()
             .meta(json!({
                 "role": "swap",
                 "used_bytes": 512 * MIB,
@@ -137,7 +137,6 @@ fn system_fixtures() -> Vec<Finding> {
         Finding::new(FindingKind::ProcessResource, "4821:node", "node (pid 4821)")
             .detail("12.4% CPU · 180.0 MiB resident · dev · S")
             .severity(Severity::Info)
-            .ephemeral()
             .meta(json!({
                 "role": "process", "pid": 4821, "user": "dev", "cpu_percent": 12.4,
                 "memory_percent": 1.1, "rss_bytes": 180 * MIB, "state": "S", "command": "node",
@@ -145,7 +144,6 @@ fn system_fixtures() -> Vec<Finding> {
         Finding::new(FindingKind::ProcessResource, "512:Xcode", "Xcode (pid 512)")
             .detail("64.2% CPU · 2.1 GiB resident · dev · S")
             .severity(Severity::Attention)
-            .ephemeral()
             .meta(json!({
                 "role": "process", "pid": 512, "user": "dev", "cpu_percent": 64.2,
                 "memory_percent": 13.2, "rss_bytes": 2 * GIB + 100 * MIB, "state": "S",
@@ -158,7 +156,6 @@ fn system_fixtures() -> Vec<Finding> {
         )
         .detail("8.1% CPU · 512.0 MiB resident · dev · S")
         .severity(Severity::Info)
-        .ephemeral()
         .meta(json!({
             "role": "process", "pid": 933, "user": "dev", "cpu_percent": 8.1,
             "memory_percent": 3.2, "rss_bytes": 512 * MIB, "state": "S",
@@ -171,7 +168,6 @@ fn system_fixtures() -> Vec<Finding> {
         )
         .detail("132.5% CPU · 620.0 MiB resident · root · R")
         .severity(Severity::Warning)
-        .ephemeral()
         .meta(json!({
             "role": "process", "pid": 210, "user": "root", "cpu_percent": 132.5,
             "memory_percent": 3.9, "rss_bytes": 620 * MIB, "state": "R",
@@ -963,13 +959,212 @@ fn fs_fixtures() -> Vec<Finding> {
             .detail("45.2 GiB on disk")
             .size(45 * GIB + 200 * MIB)
             .severity(Severity::Info)
-            .provenance("bounded local directory walk; symlinks skipped, hard links deduplicated per category")
-            .coverage("Measured 18432 entries in the selected root.")
+            .provenance("exact directory walk; symlinks skipped, hard links deduplicated, mount points not crossed")
+            .coverage("Measured exactly: 16210 files in 2222 folders.")
             .meta(json!({
                 "group": "Disk allocation", "category": "Development", "entries": 18432,
-                "complete": true, "coverage": "Measured 18432 entries in the selected root.",
+                "files": 16210, "dirs": 2222, "errors": 0,
+                "complete": true, "coverage": "Measured exactly: 16210 files in 2222 folders.",
             })),
     ]
+}
+
+/// The synthetic home tree behind the Disk fixtures, so `--fake` runs have
+/// something to browse. Sizes agree with the fixtures where they overlap.
+pub fn dir_tree() -> DirTree {
+    fn dir(name: &str, own: &[(&str, u64)], children: Vec<DirNode>) -> DirNode {
+        let mut node = DirNode {
+            name: name.to_string(),
+            ..DirNode::default()
+        };
+        for (file, size) in own {
+            node.alloc += size;
+            node.apparent += size;
+            node.files += 1;
+            node.top_files.push((file.to_string(), *size));
+        }
+        node.top_files.sort_by_key(|f| std::cmp::Reverse(f.1));
+        node.top_files.truncate(3);
+        for c in &children {
+            node.alloc += c.alloc;
+            node.apparent += c.apparent;
+            node.files += c.files;
+            node.dirs += 1 + c.dirs;
+            node.errors += c.errors;
+        }
+        let mut children = children;
+        children.sort_by(|a, b| b.alloc.cmp(&a.alloc).then_with(|| a.name.cmp(&b.name)));
+        node.children = children;
+        node
+    }
+    let node = dir(
+        "/Users/dev",
+        &[(".zsh_history", 180 * KIB)],
+        vec![
+            dir(
+                "dev",
+                &[],
+                vec![
+                    dir(
+                        "cubby",
+                        &[("README.md", 12 * KIB)],
+                        vec![
+                            dir(
+                                "node_modules",
+                                &[],
+                                vec![dir(".pnpm", &[("lock", 2 * KIB)], vec![])],
+                            )
+                            .with_alloc(2 * GIB + 300 * MIB, 41_000),
+                            dir(
+                                "apps",
+                                &[],
+                                vec![dir(
+                                    "usda-api",
+                                    &[("usda.sqlite", 3 * GIB + 400 * MIB)],
+                                    vec![],
+                                )],
+                            ),
+                        ],
+                    ),
+                    dir(
+                        "macaudit",
+                        &[("Cargo.lock", 90 * KIB)],
+                        vec![dir("target", &[], vec![]).with_alloc(6 * GIB + 900 * MIB, 22_000)],
+                    ),
+                    dir(
+                        "dataproj",
+                        &[("notebook.ipynb", 4 * MIB)],
+                        vec![dir(".venv", &[], vec![]).with_alloc(GIB + 200 * MIB, 9_800)],
+                    ),
+                    dir(
+                        "archive",
+                        &[("backup-2019.tar.gz", 18 * GIB + 100 * MIB)],
+                        vec![],
+                    ),
+                    // Brings ~/dev to the 45.2 GiB the Development category reports.
+                    dir("old-projects", &[], vec![]).with_alloc(13 * GIB + 200 * MIB, 9_000),
+                ],
+            ),
+            dir(
+                "Library",
+                &[],
+                vec![
+                    dir(
+                        "Caches",
+                        &[],
+                        vec![
+                            dir("com.apple.dt.Xcode", &[], vec![])
+                                .with_alloc(3 * GIB + 200 * MIB, 5_400),
+                            dir("Homebrew", &[], vec![]).with_alloc(GIB + 100 * MIB, 640),
+                            dir("pip", &[], vec![]).with_alloc(800 * MIB, 2_100),
+                        ],
+                    ),
+                    dir(
+                        "Application Support",
+                        &[],
+                        vec![
+                            dir(
+                                "MobileSync",
+                                &[],
+                                vec![dir(
+                                    "Backup",
+                                    &[],
+                                    vec![dir("00008030-001A2D8E3699802E", &[], vec![])
+                                        .with_alloc(4 * GIB + 500 * MIB, 38_000)],
+                                )],
+                            ),
+                            dir("Slack", &[], vec![]).with_alloc(900 * MIB, 3_300),
+                        ],
+                    ),
+                    dir(
+                        "Developer",
+                        &[],
+                        vec![dir(
+                            "Xcode",
+                            &[],
+                            vec![dir("DerivedData", &[], vec![])
+                                .with_alloc(12 * GIB + 400 * MIB, 210_000)],
+                        )],
+                    ),
+                    dir("Mobile Documents", &[], vec![]).with_alloc(9 * GIB + 700 * MIB, 14_000),
+                ],
+            ),
+            dir(
+                "Movies",
+                &[
+                    ("wedding-raw.mov", 21 * GIB + 300 * MIB),
+                    ("vacation.mp4", 2 * GIB),
+                ],
+                vec![],
+            ),
+            dir(
+                "Downloads",
+                &[
+                    ("Xcode_16.xip", 7 * GIB + 200 * MIB),
+                    ("ubuntu.iso", 4 * GIB + 700 * MIB),
+                ],
+                vec![],
+            ),
+            dir(
+                "Documents",
+                &[("thesis.pdf", 40 * MIB)],
+                vec![dir("scans", &[], vec![]).with_alloc(2 * GIB + 100 * MIB, 1_900)],
+            ),
+            dir(
+                "Pictures",
+                &[],
+                vec![dir("Photos Library.photoslibrary", &[], vec![])
+                    .with_alloc(63 * GIB + 400 * MIB, 148_000)],
+            ),
+        ],
+    );
+    let top_files = vec![
+        ("/Users/dev/Movies/wedding-raw.mov", 21 * GIB + 300 * MIB),
+        (
+            "/Users/dev/dev/archive/backup-2019.tar.gz",
+            18 * GIB + 100 * MIB,
+        ),
+        ("/Users/dev/Downloads/Xcode_16.xip", 7 * GIB + 200 * MIB),
+        ("/Users/dev/Downloads/ubuntu.iso", 4 * GIB + 700 * MIB),
+        (
+            "/Users/dev/dev/cubby/apps/usda-api/usda.sqlite",
+            3 * GIB + 400 * MIB,
+        ),
+        ("/Users/dev/Movies/vacation.mp4", 2 * GIB),
+    ]
+    .into_iter()
+    .map(|(p, alloc)| BigFile {
+        path: PathBuf::from(p),
+        alloc,
+    })
+    .collect();
+    DirTree {
+        root: PathBuf::from("/Users/dev"),
+        files: node.files,
+        dirs: node.dirs,
+        bytes: node.alloc,
+        errors: node.errors,
+        node,
+        top_files,
+        complete: true,
+        scanned_at: SystemTime::now(),
+        elapsed: Duration::from_millis(6_400),
+    }
+}
+
+trait WithAlloc {
+    /// Pretend the subtree holds `alloc` bytes in `files` files without
+    /// modelling them individually.
+    fn with_alloc(self, alloc: u64, files: u64) -> Self;
+}
+
+impl WithAlloc for DirNode {
+    fn with_alloc(mut self, alloc: u64, files: u64) -> Self {
+        self.alloc += alloc;
+        self.apparent += alloc;
+        self.files += files;
+        self
+    }
 }
 
 /// Mirrors `src/scan/launchd.rs`: key = plist path, title = label, meta
@@ -1280,7 +1475,7 @@ fn runtimes_fixtures() -> Vec<Finding> {
 
 /// Mirrors `src/scan/docker.rs`: one DockerObject summary per type (Images/
 /// Containers/Local Volumes/Build Cache), Reclaimable + prune remedy only
-/// when reclaimable > 0, plus ephemeral active-container observations.
+/// when reclaimable > 0, plus active-container observations.
 fn docker_fixtures() -> Vec<Finding> {
     vec![
         Finding::new(
@@ -1375,7 +1570,6 @@ fn docker_fixtures() -> Vec<Finding> {
         )
         .detail("Up 3 hours · 4.2% CPU · 210.0 MiB RAM")
         .severity(Severity::Info)
-        .ephemeral()
         .meta(json!({
             "type": "active_container", "id": "a1b2c3d4", "name": "cubby-postgres-1",
             "status": "Up 3 hours", "cpu_percent": 4.2, "memory_bytes": 220 * MIB,
@@ -1387,7 +1581,6 @@ fn docker_fixtures() -> Vec<Finding> {
         )
         .detail("Up 2 days · 118.5% CPU · 2.3 GiB RAM")
         .severity(Severity::Warning)
-        .ephemeral()
         .meta(json!({
             "type": "active_container", "id": "e5f6a7b8", "name": "macaudit-redis-1",
             "status": "Up 2 days", "cpu_percent": 118.5, "memory_bytes": 2 * GIB + 300 * MIB,
@@ -2107,7 +2300,6 @@ fn time_machine_fixtures() -> Vec<Finding> {
                 "exists": true,
                 "complete": true,
                 "entries": 21_400,
-                "size_cached": false,
                 "group": "Exclusions",
             })),
         Finding::new(FindingKind::TmExclusion, "/Users/dev/.cache", "~/.cache")
@@ -2122,7 +2314,6 @@ fn time_machine_fixtures() -> Vec<Finding> {
                 "exists": true,
                 "complete": true,
                 "entries": 3_200,
-                "size_cached": false,
                 "group": "Exclusions",
             })),
         Finding::new(
@@ -2141,7 +2332,6 @@ fn time_machine_fixtures() -> Vec<Finding> {
             "exists": true,
             "complete": true,
             "entries": 58_000,
-            "size_cached": false,
             "group": "Exclusions",
         })),
         Finding::new(
@@ -2161,7 +2351,6 @@ fn time_machine_fixtures() -> Vec<Finding> {
             "reason": "regenerable_cache",
             "complete": true,
             "entries": 9_800,
-            "size_cached": false,
             "group": "Suggested exclusions",
         }))
         .remedy(Remedy {
@@ -2200,7 +2389,6 @@ fn time_machine_fixtures() -> Vec<Finding> {
             "reason": "cloud_synced",
             "complete": true,
             "entries": 15_200,
-            "size_cached": false,
             "group": "Suggested exclusions",
         }))
         .remedy(Remedy {
@@ -2284,6 +2472,16 @@ impl Scanner for FakeScanner {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 ctx.emit(full).await;
             }
+        }
+        if self.id == ScannerId::Fs && !ctx.cancelled() {
+            let _ = ctx
+                .tx
+                .send(ScanEvent::DirTree {
+                    scanner: ScannerId::Fs,
+                    gen: ctx.gen,
+                    tree: std::sync::Arc::new(dir_tree()),
+                })
+                .await;
         }
 
         Ok(())

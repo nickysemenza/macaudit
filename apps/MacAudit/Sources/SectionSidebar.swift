@@ -9,6 +9,8 @@ struct SectionSidebar: View {
         List(selection: $store.selectedItem) {
             Label("Storage", systemImage: "internaldrive")
                 .tag(SidebarItem.storage)
+            Label("Folders", systemImage: "folder")
+                .tag(SidebarItem.folders)
             Section("Sections") {
                 ForEach(store.sections, id: \.id) { meta in
                     SectionRow(meta: meta).tag(SidebarItem.section(meta.id))
@@ -45,6 +47,8 @@ struct SectionSidebar: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(.bar)
         }
+        // Outermost on purpose: the footer above is the sidebar's churn source.
+        .stableColumnSize()
     }
 }
 
@@ -93,12 +97,6 @@ private struct SectionRow: View {
             .help(msg.isEmpty ? "scanning" : msg)
         case .done:
             HStack(spacing: 4) {
-                if let delta = store.reclaimableDelta(in: meta.id) {
-                    Text(Formatting.delta(delta))
-                        .font(.caption2)
-                        .foregroundStyle(delta > 0 ? .orange : .green)
-                        .monospacedDigit()
-                }
                 Text("\(store.count(of: meta.id))")
                     .font(.caption)
                     .foregroundStyle(.secondary)

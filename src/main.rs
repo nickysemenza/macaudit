@@ -6,14 +6,12 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::Parser;
 
-use macaudit::cli::{
-    BrewCmd, CleanArgs, Cli, Command, ConfigCmd, ScanArgs, SnapshotCmd, ToolsArgs, ToolsCmd,
-};
+use macaudit::cli::{BrewCmd, CleanArgs, Cli, Command, ConfigCmd, ScanArgs, ToolsArgs, ToolsCmd};
 use macaudit::config::{Config, DeleteMode, Paths};
 use macaudit::engine::{Mode, ScannerManager};
 use macaudit::model::ScannerId;
+use macaudit::output;
 use macaudit::runner::{CommandRunner, RealCommandRunner};
-use macaudit::{output, snapshot};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -52,7 +50,6 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Clean(args)) => run_clean(&manager, &args).await,
         Some(Command::Tools(args)) => run_tools(&manager, &args).await,
         Some(Command::Brew(cmd)) => run_brew(&manager, cmd).await,
-        Some(Command::Snapshot(cmd)) => run_snapshot(&manager, &paths, cmd).await,
         Some(Command::Config(cmd)) => run_config(&paths, cmd),
     }
 }
@@ -255,93 +252,6 @@ async fn run_brew(manager: &ScannerManager, cmd: BrewCmd) -> anyhow::Result<()> 
         println!("{}", output::brew_tree_json(&graph, &name, dir, max_depth)?);
     } else {
         print!("{}", output::brew_tree_text(&graph, &name, dir, max_depth));
-    }
-    Ok(())
-}
-
-async fn run_snapshot(
-    manager: &ScannerManager,
-    paths: &Paths,
-    cmd: SnapshotCmd,
-) -> anyhow::Result<()> {
-    let mut store = snapshot::SnapshotStore::open(&paths.history_db())?;
-    match cmd {
-        SnapshotCmd::Save => {
-            let outcome = manager.run_to_completion(ScannerId::ALL).await;
-            if !outcome.failures.is_empty() {
-                // A partial snapshot would make the next diff report whole
-                // sections as removed — refuse rather than silently mislead.
-                let failed: Vec<&str> = outcome.failures.iter().map(|(id, _)| id.slug()).collect();
-                warn_failures(&outcome.failures);
-                anyhow::bail!(
-                    "not saving a partial snapshot: {} section(s) failed ({})",
-                    outcome.failures.len(),
-                    failed.join(", ")
-                );
-            }
-            let id = store.save(&snapshot::machine_name(), &outcome.findings)?;
-            println!("saved snapshot #{id} ({} findings)", outcome.findings.len());
-        }
-        SnapshotCmd::List => {
-            for m in store.list()? {
-                println!(
-                    "#{:<4} {}  {} findings  {}",
-                    m.id,
-                    m.machine,
-                    m.finding_count,
-                    humansize::format_size(m.total_bytes.max(0) as u64, humansize::BINARY)
-                );
-            }
-        }
-        SnapshotCmd::Diff { a, b, json } => {
-            let list = store.list()?;
-            let (a, b) = match (a, b) {
-                (Some(a), Some(b)) => (a, b),
-                (Some(_), None) | (None, Some(_)) => {
-                    anyhow::bail!("snapshot diff takes two ids or none (none = latest two)")
-                }
-                (None, None) if list.len() >= 2 => (list[1].id, list[0].id),
-                _ => anyhow::bail!("need at least two snapshots (or specify ids) to diff"),
-            };
-            let d = store.diff(a, b)?;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "a": a, "b": b,
-                        "added": d.added, "removed": d.removed,
-                        "grown": d.grown.iter().map(|(f, o, n)| serde_json::json!({ "finding": f, "old": o, "new": n })).collect::<Vec<_>>(),
-                        "changed": d.changed,
-                    }))?
-                );
-                return Ok(());
-            }
-            println!("diff #{a} → #{b}:");
-            println!(
-                "  {} added, {} removed, {} grown, {} changed",
-                d.added.len(),
-                d.removed.len(),
-                d.grown.len(),
-                d.changed.len()
-            );
-            for f in &d.added {
-                println!("  + {}", f.title);
-            }
-            for f in &d.removed {
-                println!("  - {}", f.title);
-            }
-            for (f, o, n) in &d.grown {
-                println!(
-                    "  ↑ {} {} → {}",
-                    f.title,
-                    humansize::format_size(*o, humansize::BINARY),
-                    humansize::format_size(*n, humansize::BINARY)
-                );
-            }
-            for c in &d.changed {
-                println!("  ~ {} {}: {} → {}", c.finding.title, c.field, c.old, c.new);
-            }
-        }
     }
     Ok(())
 }

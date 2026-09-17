@@ -113,7 +113,7 @@ pub trait Scanner: Send + Sync {
 Design notes:
 
 - `Finding.id` must be **stable across runs** (hash of kind + canonical path or
-  name) — this is what makes snapshot diffing (§8) work.
+  name) — the same artifact/app/daemon must produce the same id every scan.
 - Sizes: report **on-disk blocks** (`MetadataExt::blocks() * 512`), not
   `len()`. APFS clones and sparse files make apparent size a lie.
 - Remedies never take free-form input. Every executable path/arg comes from the
@@ -297,9 +297,8 @@ Design notes:
   Time Machine) — a map, not a focusable list. `←/→`, `h/l`, `Tab`/`Shift-Tab`,
   digits `1`-`9`/`0`, or a click always switch sections; row movement never
   touches it. Full rows (≥100 cols) show a status glyph (spinner / ⚠),
-  finding count, compact reclaimable size, and a `Δ±` badge vs. the last
-  snapshot; 70-99 cols shows title only; below 70 the rail is hidden and the
-  statusbar names the section instead.
+  finding count, and compact reclaimable size; 70-99 cols shows title only;
+  below 70 the rail is hidden and the statusbar names the section instead.
 - **Main panel**: a tree (Apps/Brew/Disk, ordered by total size) or flat
   sortable table for the rest, with columns specific to each section (e.g.
   Git: Repo · Branch · State · Size · Used · Path; Ports: Port · PID ·
@@ -366,7 +365,6 @@ Design notes:
 macaudit                # TUI (default)
 macaudit scan [--section apps,disk,…] --json    # machine-readable, for scripts
 macaudit clean --dry-run                        # print remedy commands, run nothing
-macaudit snapshot save|list|diff [A B]          # see §8
 macaudit config path|edit
 ```
 
@@ -377,9 +375,7 @@ Additional subcommands: `tools [--json] [--manager …] [--class …]`, `tools
 verify [--json] [--limit N]`, `brew why <name> [--json]`, `brew deps <name>
 [--json]`, `clean --dry-run [--select …] [--json]` (Brew/Tools rows listed
 only when evidence suggests removal unless selected; prints preflight
-refusals and Homebrew impact), `snapshot diff [--json]` (adds a `changed`
-list: version, classification, origin, autoremove, shell resolution,
-severity — only when both snapshots recorded the fact).
+refusals and Homebrew impact).
 
 ## 6. Config (`~/.config/macaudit/config.toml`)
 
@@ -423,21 +419,9 @@ aggregated), `project_roots`/`project_max_depth`/`project_time_budget_secs`,
 | Errors | `anyhow` (bin), `thiserror` (lib) |
 | Sizes | `humansize` |
 | Config | `toml`, `directories` |
-| Snapshot store | `rusqlite` (bundled) |
+| Size cache | `rusqlite` (bundled) |
 
-## 8. Snapshots & diff (the "audit" in audit tool)
-
-- `macaudit snapshot save` → serialize all Findings into SQLite at
-  `~/.local/state/macaudit/history.db` (one row per Finding, keyed by stable
-  `FindingId`, plus a snapshots table with timestamp + machine info).
-- `macaudit snapshot diff` → new / removed / grown Findings between two
-  snapshots: "node_modules total grew 6.1 GB since June 1", "3 new login
-  items appeared", "Rosetta app count: 4 → 2".
-- TUI: a "Δ since last snapshot" badge per section once ≥1 snapshot exists.
-- Auto-save a snapshot on every full scan completion (cheap; makes diff
-  useful without ceremony).
-
-## 9. Milestones (for Claude Code)
+## 8. Milestones (for Claude Code)
 
 1. **M1 – skeleton**: clap + tokio + ratatui shell, ScanEvent plumbing,
    ScannerManager with a fake scanner emitting synthetic findings, generation-
@@ -451,15 +435,14 @@ aggregated), `project_roots`/`project_max_depth`/`project_time_budget_secs`,
    default, activity log, post-remedy targeted rescan.
 5. **M5 – the long tail**: Launchd, ShellEnv, Runtimes, Docker, Ports, Git,
    Simulators, SshKeys, Time Machine(tmutil).
-6. **M6 – history**: SQLite snapshots + diff + TUI badges.
-7. **M7 (v1.1) – network**: formulae.brew.sh cask matching for unmanaged apps;
+6. **M6 (v1.1) – network**: formulae.brew.sh cask matching for unmanaged apps;
    GitHub-releases latest-version checks for Sparkle/unmanaged apps.
 
-- M8 — developer-tool audit: Brew graph explorer, Global Tools section,
+- M7 — developer-tool audit: Brew graph explorer, Global Tools section,
   login-shell resolution, evidence-based classification, ownership-aware
   cleanup with preflight/verification/reports. Done.
 
-## 10. Testing notes
+## 9. Testing notes
 
 - Scanners take a `ScanCtx`; unit-test them by injecting a mock command runner
   (trait over "run program, get stdout") and fixture JSON captured from real

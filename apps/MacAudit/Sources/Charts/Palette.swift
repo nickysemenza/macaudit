@@ -1,8 +1,8 @@
 import MacAuditKit
 import SwiftUI
 
-/// One colour system for every chart, so the Storage bar, the donuts and the
-/// history lines agree on what a category looks like.
+/// One colour system for every chart, so the Storage bar and the donuts
+/// agree on what a category looks like.
 enum Palette {
     /// Ordered categorical colours (Storage-bar spirit: warm → cool → grey).
     static let categorical: [Color] = [

@@ -39,9 +39,6 @@ pub enum Command {
     /// Homebrew dependency questions: why is X installed / what does X need.
     #[command(subcommand)]
     Brew(BrewCmd),
-    /// Manage snapshot history.
-    #[command(subcommand)]
-    Snapshot(SnapshotCmd),
     /// Show or edit configuration.
     #[command(subcommand)]
     Config(ConfigCmd),
@@ -129,22 +126,6 @@ pub enum BrewCmd {
         json: bool,
         #[arg(long, default_value_t = 8)]
         max_depth: u16,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum SnapshotCmd {
-    /// Scan and store a snapshot.
-    Save,
-    /// List stored snapshots.
-    List,
-    /// Diff two snapshots by id (defaults to the two most recent).
-    Diff {
-        a: Option<i64>,
-        b: Option<i64>,
-        /// Emit `{a, b, added, removed, grown, changed}` as JSON.
-        #[arg(long)]
-        json: bool,
     },
 }
 

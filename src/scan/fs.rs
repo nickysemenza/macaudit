@@ -1,31 +1,35 @@
-//! FsScanner — the parallel filesystem walk (lane S2).
+//! FsScanner — the single-pass filesystem index (lane S2).
 //!
-//! One `ignore::WalkParallel` pass over the configured roots feeds *many* cheap
-//! detectors: build-artifact dirs (each gated on a project marker), `.git`
-//! roots (piped to GitScanner), and large loose files. Artifact hits are emitted
-//! immediately with `size_bytes: None`, then re-emitted (same canonical key ⇒
-//! same `FindingId`) once a `rayon` sizing pass has summed their on-disk blocks.
-//! A fixed set of well-known cache/backup paths is sized directly, no walk.
+//! One `walk::walk` over the configured roots (getattrlistbulk listing,
+//! rayon recursion) builds a bounded-memory directory tree and feeds *many*
+//! cheap detectors on the way: build-artifact dirs (each gated on a project
+//! marker), `.git` roots (piped to GitScanner), data-library packages, large
+//! loose files. Artifact hits are emitted immediately with `size_bytes: None`
+//! and re-emitted (same canonical key ⇒ same `FindingId`) the moment their
+//! subtree is rolled up. Disk categories and the fixed cache/backup targets
+//! are read off the finished tree, so they are exact, and the tree itself is
+//! published as `ScanEvent::DirTree` for drill-down views.
 //!
-//! Concurrency contract (spec §1): the sync `WalkParallel` runs inside
-//! `spawn_blocking`; walker/rayon threads bridge back with `blocking_send`. The
-//! walk drops `repo_tx` the instant it finishes so GitScanner's channel closes
-//! before the (potentially long) sizing pass — the two run concurrently.
+//! Concurrency contract (spec §1): the sync walk runs inside
+//! `spawn_blocking`; rayon threads bridge back with `blocking_send`. The
+//! visitor (and with it `repo_tx`) is dropped the instant the walk finishes
+//! so GitScanner's channel closes before the post-walk derivations.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use ignore::{WalkBuilder, WalkState};
 use serde_json::json;
 
 use crate::model::{Finding, FindingKind, Remedy, RemedyCommand, ScanEvent, ScannerId, Severity};
 use crate::scan::pipe::{RepoDiscovery, RepoSender};
-use crate::scan::sizing::{du_blocks, du_blocks_bounded, on_disk_bytes};
+use crate::scan::sizing::{du_blocks, du_blocks_bounded, du_blocks_shared};
+use crate::scan::walk::{
+    self, DirAction, DirNode, DirTree, Entry, Flags, Kind, Visitor, WalkOptions, WalkStats,
+};
 use crate::scan::{ScanCtx, Scanner};
-use crate::size_cache::{self, CachedSize, SizeCache};
 
 #[derive(Default)]
 pub struct FsScanner;
@@ -44,16 +48,20 @@ const PROJECT_MARKERS: &[&str] = &[
     "build.gradle",
 ];
 
-/// An artifact directory awaiting a size computation + re-emit.
+/// How often the walk reports its live counters.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+/// The "Largest files" group: this many, regardless of the threshold.
+const LARGEST_FILES: usize = 25;
+/// Budget for sizing an opaque subtree such as `~/Library/CloudStorage`.
+const OPAQUE_BUDGET: Duration = Duration::from_secs(3);
+const OPAQUE_MAX_ENTRIES: u64 = 200_000;
+
+/// An artifact directory awaiting its rolled-up size.
 struct Hit {
-    path: PathBuf,
     label: String,
     last_used: Option<SystemTime>,
     stale: bool,
     ctx: ArtifactCtx,
-    /// `Some(label)` for a data-library package (Photos library, VM bundle…)
-    /// sized as one opaque item; `None` for a build artifact.
-    package: Option<&'static str>,
 }
 
 /// What we know about an artifact beyond its path: which marker justified
@@ -73,9 +81,8 @@ struct ArtifactCtx {
 }
 
 /// Inspect an artifact's surroundings (cheap: a few `exists`/reads).
-fn artifact_ctx(name: &str, path: &Path) -> ArtifactCtx {
-    let parent = path.parent();
-    let sibling = |file: &str| parent.map(|p| p.join(file).exists()).unwrap_or(false);
+fn artifact_ctx(name: &str, path: &Path, siblings: &[Entry]) -> ArtifactCtx {
+    let sibling = |file: &str| has_sibling(siblings, file);
     let inside = |file: &str| path.join(file).exists();
     let marker = match name {
         "target" if sibling("Cargo.toml") => Some("Cargo.toml".to_string()),
@@ -114,6 +121,13 @@ fn artifact_ctx(name: &str, path: &Path) -> ArtifactCtx {
     }
 }
 
+/// Is there a non-directory entry called `file` in this listing?
+fn has_sibling(siblings: &[Entry], file: &str) -> bool {
+    siblings
+        .iter()
+        .any(|e| e.kind != Kind::Dir && e.name == file)
+}
+
 /// Walk up from `path` to the nearest `.git`; a `.git` *file* names a linked
 /// worktree (`gitdir: <main>/.git/worktrees/<name>`).
 fn enclosing_repo(path: &Path) -> (Option<PathBuf>, Option<(PathBuf, String)>) {
@@ -146,25 +160,181 @@ fn enclosing_repo(path: &Path) -> (Option<PathBuf>, Option<(PathBuf, String)>) {
     (None, None)
 }
 
-/// Immutable state shared with every `WalkParallel` visitor closure. Held behind
-/// an `Arc` so per-thread visitors are cheap `'static` clones; dropping the last
-/// clone (after the walk) releases `repo_tx` and closes the fs→git pipe.
-struct WalkShared {
+/// Private walk flags: what kind of subtree we are inside. Below any of
+/// these no artifact, package or repository classification happens.
+const IN_LIBRARY: Flags = Flags(1 << 8);
+const IN_PACKAGE: Flags = Flags(1 << 9);
+const IN_GIT: Flags = Flags(1 << 10);
+const IN_ARTIFACT: Flags = Flags(1 << 11);
+const IN_TRASH: Flags = Flags(1 << 12);
+const CLASSIFIED: Flags =
+    Flags(IN_LIBRARY.0 | IN_PACKAGE.0 | IN_GIT.0 | IN_ARTIFACT.0 | IN_TRASH.0);
+
+/// Subtrees under `~/Library` that are listed opaquely: File Provider
+/// domains (Dropbox, Drive, OneDrive) enumerate on `opendir`, which can be
+/// slow and network-bound, so they get a bounded measurement instead.
+const OPAQUE_UNDER_LIBRARY: &[&str] = &["CloudStorage"];
+
+/// The walk's per-directory classifier. Shared by every rayon worker; the
+/// last clone to drop releases `repo_tx` and closes the fs→git pipe.
+struct FsVisitor {
     tx: tokio::sync::mpsc::Sender<ScanEvent>,
     gen: u64,
     token: tokio_util::sync::CancellationToken,
     config: Arc<crate::config::Config>,
     repo_tx: Option<RepoSender>,
-    /// Discovered artifact hits go here to be sized concurrently with the walk.
-    hit_tx: crossbeam_channel::Sender<Hit>,
-    /// Never descend into these (tilde-expanded ignore list).
-    ignore_paths: Vec<PathBuf>,
-    /// `~/Library` — skipped wholesale (fixed cache targets are sized directly).
+    /// `~/Library` — sized into the tree, never classified.
     library: PathBuf,
     large_file_threshold: u64,
     stale_after_days: u64,
-    /// git-only scan: feed `repo_tx` but emit no disk findings.
+    /// git-only scan: feed `repo_tx`, walk nothing else, emit no findings.
     discovery_only: bool,
+    /// Artifacts found so far, awaiting their rolled-up size.
+    hits: Mutex<HashMap<PathBuf, Hit>>,
+    /// Data-library packages found so far (path → label).
+    packages: Mutex<HashMap<PathBuf, &'static str>>,
+}
+
+impl FsVisitor {
+    fn emit(&self, f: Finding) {
+        let _ = self.tx.blocking_send(ScanEvent::Finding {
+            scanner: ScannerId::Fs,
+            gen: self.gen,
+            finding: Box::new(f),
+        });
+    }
+}
+
+impl Visitor for FsVisitor {
+    fn on_child_dir(
+        &self,
+        parent: &Path,
+        child: &Entry,
+        siblings: &[Entry],
+        flags: Flags,
+    ) -> DirAction {
+        let Some(name) = child.name.to_str() else {
+            return DirAction::Descend(flags);
+        };
+        if flags.contains(IN_LIBRARY)
+            && parent == self.library
+            && OPAQUE_UNDER_LIBRARY.contains(&name)
+        {
+            let r = du_blocks_bounded(
+                &parent.join(name),
+                OPAQUE_MAX_ENTRIES,
+                Instant::now() + OPAQUE_BUDGET,
+                &|| self.token.is_cancelled(),
+            );
+            return DirAction::Opaque {
+                alloc: r.bytes,
+                files: r.entries,
+                dirs: 0,
+            };
+        }
+        // Inside a classified subtree nothing below is a project of ours.
+        if flags.0 & CLASSIFIED.0 != 0 {
+            return DirAction::Descend(flags);
+        }
+        let path = parent.join(name);
+        // ~/Library is measured (categories live there) but never mined for
+        // artifacts or repositories.
+        if path == self.library {
+            return if self.discovery_only {
+                DirAction::Skip
+            } else {
+                DirAction::Descend(flags | IN_LIBRARY | Flags::NOT_LOOSE)
+            };
+        }
+        // Trash is already slated for deletion: measure it, report nothing
+        // in it, pipe none of its repos to GitScanner.
+        if name == ".Trash" {
+            return if self.discovery_only {
+                DirAction::Skip
+            } else {
+                DirAction::Descend(flags | IN_TRASH | Flags::NOT_LOOSE | Flags::NO_TOP)
+            };
+        }
+        // A repository root — feed GitScanner. Its internals count toward
+        // sizes (packfiles are real bytes) but are never loose large files.
+        if name == ".git" {
+            if let Some(tx) = self.repo_tx.as_ref() {
+                let _ = tx.blocking_send(RepoDiscovery {
+                    root: parent.to_path_buf(),
+                });
+            }
+            return if self.discovery_only {
+                DirAction::Skip
+            } else {
+                DirAction::Descend(flags | IN_GIT | Flags::NOT_LOOSE)
+            };
+        }
+        // A macOS package (app, project, Photos/Music library, VM bundle) is
+        // opaque: nothing inside it is a loose file or a project of its own.
+        // Data libraries are surfaced as one large item once sized.
+        if let Some(ext) = package_extension(name) {
+            if self.discovery_only {
+                return DirAction::Skip;
+            }
+            if let Some(label) = data_library_label(ext) {
+                self.packages.lock().unwrap().insert(path, label);
+            }
+            return DirAction::Descend(flags | IN_PACKAGE | Flags::NOT_LOOSE | Flags::NO_TOP);
+        }
+        if is_artifact(name, &path, siblings, &self.config) {
+            if self.discovery_only {
+                return DirAction::Skip;
+            }
+            let last_used = siblings_max_mtime(siblings);
+            let stale = is_stale(last_used, self.stale_after_days);
+            let ctx = artifact_ctx(name, &path, siblings);
+            self.emit(artifact_finding(
+                &path, name, last_used, stale, None, &ctx, None,
+            ));
+            self.hits.lock().unwrap().insert(
+                path,
+                Hit {
+                    label: name.to_string(),
+                    last_used,
+                    stale,
+                    ctx,
+                },
+            );
+            return DirAction::Descend(flags | IN_ARTIFACT | Flags::NOT_LOOSE | Flags::NO_TOP);
+        }
+        DirAction::Descend(flags)
+    }
+
+    fn on_dir_done(&self, dir: &Path, node: &DirNode, _flags: Flags) {
+        if self.token.is_cancelled() {
+            return;
+        }
+        // pnpm-linked node_modules are re-measured after the walk (per-tree
+        // hard-link accounting); everything else streams out right here.
+        let hit = self.hits.lock().unwrap();
+        if let Some(h) = hit.get(dir) {
+            if h.ctx.pnpm_store.is_none() {
+                self.emit(artifact_finding(
+                    dir,
+                    &h.label,
+                    h.last_used,
+                    h.stale,
+                    Some(node.alloc),
+                    &h.ctx,
+                    None,
+                ));
+            }
+            return;
+        }
+        drop(hit);
+        if let Some(label) = self.packages.lock().unwrap().get(dir) {
+            // TCC-protected libraries look empty to a process without access;
+            // an empty package is simply not reported.
+            if node.alloc > self.large_file_threshold {
+                self.emit(large_package_finding(dir, label, node.alloc));
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -185,7 +355,6 @@ impl Scanner for FsScanner {
                 .map(|r| ctx.paths.expand(r))
                 .collect()
         };
-
         let ignore_paths: Vec<PathBuf> = ctx
             .config
             .scan
@@ -194,255 +363,270 @@ impl Scanner for FsScanner {
             .map(|p| ctx.paths.expand(p))
             .collect();
 
-        // Handles kept out of `WalkShared` so they survive the drop that closes
-        // the fs→git pipe — the sizing pass below still needs them.
         let tx = ctx.tx.clone();
         let token = ctx.token.clone();
         let gen = ctx.gen;
         let paths = ctx.paths.clone();
         let config = ctx.config.clone();
         let discovery_only = ctx.fs_discovery_only;
-        let stale_after_days = ctx.config.behavior.stale_after_days;
 
         // The engine handed us `repo_tx` inside the ctx; TAKE it (not clone) so
-        // the only surviving senders live in `WalkShared`. Otherwise a leftover
-        // sender in `ctx` keeps the fs→git pipe open through the whole sizing
-        // pass, delaying GitScanner's completion until this scan returns.
+        // the only surviving sender lives in the visitor. Otherwise a leftover
+        // sender in `ctx` keeps the fs→git pipe open through the post-walk
+        // work, delaying GitScanner's completion until this scan returns.
         let repo_tx = ctx.repo_tx.take();
 
-        // Artifacts discovered by the walk are sized CONCURRENTLY with it: the
-        // walker sends each hit down this channel and a rayon-backed consumer
-        // du's them as they arrive, re-emitting the finding with its size. So
-        // sizes start streaming in almost immediately instead of only after the
-        // (potentially long) walk finishes.
-        let (hit_tx, hit_rx) = crossbeam_channel::unbounded::<Hit>();
-
-        // Sizes computed fresh this scan, accumulated here and flushed to the
-        // cache db once (after) the sizing pass finishes.
-        let fresh_entries: Arc<Mutex<Vec<(PathBuf, CachedSize)>>> =
-            Arc::new(Mutex::new(Vec::new()));
-
-        let sizing = if discovery_only {
-            // Discovery-only feeds the git pipe and emits no disk findings.
-            None
-        } else {
-            let tx_sz = tx.clone();
-            let token_sz = token.clone();
-            let fresh_sz = fresh_entries.clone();
-            let ttl_hours = config.scan.size_cache_ttl_hours;
-            let large_file_threshold_sz = config.large_file_threshold_bytes();
-
-            // Load the on-disk size cache before the walk starts. An
-            // unopenable/corrupt db (or any load failure) degrades to an empty
-            // cache — a scan must never fail because of it.
-            let paths_sz = paths.clone();
-            let cache: Arc<HashMap<PathBuf, CachedSize>> = Arc::new(
-                tokio::task::spawn_blocking(move || load_cache(&size_cache::db_path(&paths_sz)))
-                    .await
-                    .unwrap_or_default(),
-            );
-            let now_secs = SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-
-            Some(tokio::task::spawn_blocking(move || {
-                use rayon::iter::{ParallelBridge, ParallelIterator};
-                hit_rx.into_iter().par_bridge().for_each(|hit| {
-                    if token_sz.is_cancelled() {
-                        return;
-                    }
-                    let root_mtime = root_mtime_secs(&hit.path);
-                    let cached = cache
-                        .get(&hit.path)
-                        .copied()
-                        .filter(|c| is_fresh(c, root_mtime, now_secs, ttl_hours));
-
-                    // A package bundle: size it whole and report it as one
-                    // opaque large item (Reveal only) when over the threshold.
-                    if let Some(label) = hit.package {
-                        let size = match cached {
-                            Some(c) if c.size > 0 => c.size,
-                            _ => {
-                                let size = du_blocks(&hit.path, &|| token_sz.is_cancelled());
-                                if token_sz.is_cancelled() {
-                                    return;
-                                }
-                                // Libraries are TCC-protected: a process without
-                                // access sees an empty package. Never cache that
-                                // zero — the cache is shared with the app, which
-                                // may have access and would inherit the wrong size.
-                                if size > 0 {
-                                    fresh_sz.lock().unwrap().push((
-                                        hit.path.clone(),
-                                        CachedSize {
-                                            size,
-                                            computed_at: now_secs,
-                                            root_mtime,
-                                        },
-                                    ));
-                                }
-                                size
-                            }
-                        };
-                        if size > large_file_threshold_sz {
-                            let f = large_package_finding(&hit.path, label, size);
-                            let _ = tx_sz.blocking_send(ScanEvent::Finding {
-                                scanner: ScannerId::Fs,
-                                gen,
-                                finding: Box::new(f),
-                            });
-                        }
-                        return;
-                    }
-
-                    // pnpm-linked node_modules: also learn how much is
-                    // hard-linked from the store (cached under a sibling key).
-                    let shared_key = hit.path.join("#macaudit-external-links");
-                    let shared_cached = cache
-                        .get(&shared_key)
-                        .copied()
-                        .filter(|c| is_fresh(c, root_mtime, now_secs, ttl_hours))
-                        .map(|c| c.size);
-                    let mut shared_bytes: Option<u64> = None;
-                    let (size, was_cached) = match cached {
-                        Some(c) if hit.ctx.pnpm_store.is_none() || shared_cached.is_some() => {
-                            shared_bytes = shared_cached;
-                            (c.size, true)
-                        }
-                        _ if hit.ctx.pnpm_store.is_some() => {
-                            let s = crate::scan::sizing::du_blocks_shared(&hit.path, &|| {
-                                token_sz.is_cancelled()
-                            });
-                            if token_sz.is_cancelled() {
-                                return;
-                            }
-                            let mut fresh = fresh_sz.lock().unwrap();
-                            fresh.push((
-                                hit.path.clone(),
-                                CachedSize {
-                                    size: s.bytes,
-                                    computed_at: now_secs,
-                                    root_mtime,
-                                },
-                            ));
-                            fresh.push((
-                                shared_key.clone(),
-                                CachedSize {
-                                    size: s.externally_linked,
-                                    computed_at: now_secs,
-                                    root_mtime,
-                                },
-                            ));
-                            shared_bytes = Some(s.externally_linked);
-                            (s.bytes, false)
-                        }
-                        _ => {
-                            let size = du_blocks(&hit.path, &|| token_sz.is_cancelled());
-                            // A du interrupted by cancellation returns a PARTIAL
-                            // sum. Never record that: with an unchanged root
-                            // mtime it would be served as a "fresh" cache hit
-                            // (a wrong size) for up to the whole TTL. Skip the
-                            // emit too — the run is superseded anyway.
-                            if token_sz.is_cancelled() {
-                                return;
-                            }
-                            fresh_sz.lock().unwrap().push((
-                                hit.path.clone(),
-                                CachedSize {
-                                    size,
-                                    computed_at: now_secs,
-                                    root_mtime,
-                                },
-                            ));
-                            (size, false)
-                        }
-                    };
-
-                    let f = artifact_finding(
-                        &hit.path,
-                        &hit.label,
-                        hit.last_used,
-                        hit.stale,
-                        Some(size),
-                        was_cached,
-                        &hit.ctx,
-                        shared_bytes,
-                    );
-                    let _ = tx_sz.blocking_send(ScanEvent::Finding {
-                        scanner: ScannerId::Fs,
-                        gen,
-                        finding: Box::new(f),
-                    });
-                });
-            }))
-        };
-
-        let shared = Arc::new(WalkShared {
+        let visitor = Arc::new(FsVisitor {
             tx: tx.clone(),
             gen,
             token: token.clone(),
             config: config.clone(),
             repo_tx,
-            hit_tx,
-            ignore_paths,
             library: paths.home.join("Library"),
             large_file_threshold: config.large_file_threshold_bytes(),
-            stale_after_days,
+            stale_after_days: config.behavior.stale_after_days,
             discovery_only,
+            hits: Mutex::new(HashMap::new()),
+            packages: Mutex::new(HashMap::new()),
         });
+        let stats = Arc::new(WalkStats::default());
 
-        // Sync WalkParallel must run off the async runtime (spec §1).
-        let walk_shared = shared.clone();
-        let walk = tokio::task::spawn_blocking(move || run_walk(&walk_shared, &roots));
-        walk.await?;
-
-        // Dropping our WalkShared releases the last `repo_tx` (closing the fs→git
-        // pipe so GitScanner terminates) AND the last `hit_tx` (closing the
-        // sizing channel so the consumer drains and finishes).
-        drop(shared);
-
-        if let Some(sizing) = sizing {
-            sizing.await?;
-        }
-
-        // Persist freshly measured sizes for next time (best-effort — a save
-        // failure is silently ignored, the cache is never load-bearing).
-        // Belt-and-braces with the per-hit guard above: a cancelled scan
-        // persists nothing, so a partial du can never poison the cache.
-        let entries: Vec<(PathBuf, CachedSize)> = if token.is_cancelled() {
-            Vec::new()
+        // Live progress from the walk's counters, until the walk is done.
+        let progress_stop = token.child_token();
+        let progress = if discovery_only {
+            None
         } else {
-            std::mem::take(&mut *fresh_entries.lock().unwrap())
+            Some(tokio::spawn(report_progress(
+                tx.clone(),
+                gen,
+                stats.clone(),
+                progress_stop.clone(),
+                roots.first().cloned().unwrap_or_default(),
+            )))
         };
-        if !entries.is_empty() {
-            let paths_save = paths.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                save_cache(&size_cache::db_path(&paths_save), &entries)
-            })
-            .await;
+
+        // The sync walk must run off the async runtime (spec §1).
+        let walk_visitor = visitor.clone();
+        let walk_stats = stats.clone();
+        let walk_token = token.clone();
+        let opts = WalkOptions {
+            excludes: ignore_paths,
+            same_device: true,
+            deadline: None,
+            max_entries: None,
+            // Discovery-only reproduces the cheap git-root sweep: no tree, no
+            // largest-file bookkeeping, and the visitor skips everything else.
+            keep_tree: !discovery_only,
+            per_dir_top: if discovery_only { 0 } else { 3 },
+            top_n: if discovery_only { 0 } else { LARGEST_FILES * 4 },
+            threshold: if discovery_only {
+                None
+            } else {
+                Some(config.large_file_threshold_bytes())
+            },
+        };
+        let results = tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            for root in roots {
+                if walk_token.is_cancelled() {
+                    break;
+                }
+                if !root.exists() {
+                    continue;
+                }
+                let started = Instant::now();
+                let r = walk::walk(
+                    &root,
+                    opts.clone(),
+                    walk_visitor.as_ref(),
+                    Some(&walk_stats),
+                    &|| walk_token.is_cancelled(),
+                );
+                out.push((root, r, started));
+            }
+            out
+        })
+        .await?;
+
+        progress_stop.cancel();
+        if let Some(p) = progress {
+            let _ = p.await;
         }
 
-        if discovery_only {
+        // The walk is over: hand the remaining state to the post-walk pass
+        // and drop the visitor so `repo_tx` closes and GitScanner can finish.
+        let hits: Vec<(PathBuf, Hit)> = std::mem::take(&mut *visitor.hits.lock().unwrap())
+            .into_iter()
+            .collect();
+        drop(visitor);
+
+        if discovery_only || token.is_cancelled() {
             return Ok(());
         }
 
-        // Fixed cache/backup paths — sized directly, no walk.
+        let files: u64 = stats.files.load(std::sync::atomic::Ordering::Relaxed);
+        let dirs: u64 = stats.dirs.load(std::sync::atomic::Ordering::Relaxed);
+        let bytes: u64 = stats.bytes.load(std::sync::atomic::Ordering::Relaxed);
+        let elapsed: Duration = results
+            .iter()
+            .map(|(_, _, s)| s.elapsed())
+            .max()
+            .unwrap_or_default();
+        let _ = tx
+            .send(ScanEvent::Progress {
+                scanner: ScannerId::Fs,
+                gen,
+                msg: format!(
+                    "Indexed {} files in {} folders ({}) in {:.1}s",
+                    files,
+                    dirs,
+                    humansize::format_size(bytes, humansize::BINARY),
+                    elapsed.as_secs_f64()
+                ),
+                done: files,
+                total: None,
+            })
+            .await;
+
+        let tx2 = tx.clone();
+        let token2 = token.clone();
         let paths2 = paths.clone();
-        let tx3 = tx.clone();
-        let token3 = token.clone();
-        tokio::task::spawn_blocking(move || size_fixed_paths(&paths2, &tx3, gen, &token3)).await?;
-
-        // A small, explicitly bounded accounting pass complements artifact
-        // discovery. It never walks all of $HOME and labels partial numbers.
-        let paths3 = paths.clone();
-        let tx4 = tx.clone();
-        let token4 = token.clone();
-        tokio::task::spawn_blocking(move || size_disk_categories(&paths3, &tx4, gen, &token4))
-            .await?;
-
+        let threshold = config.large_file_threshold_bytes();
+        tokio::task::spawn_blocking(move || {
+            derive_from_trees(&paths2, &tx2, gen, &token2, results, hits, threshold)
+        })
+        .await?;
         Ok(())
     }
+}
+
+/// Emit `Progress` from the live counters every `PROGRESS_INTERVAL`.
+async fn report_progress(
+    tx: tokio::sync::mpsc::Sender<ScanEvent>,
+    gen: u64,
+    stats: Arc<WalkStats>,
+    stop: tokio_util::sync::CancellationToken,
+    root: PathBuf,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let label = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.display().to_string());
+    loop {
+        tokio::select! {
+            _ = stop.cancelled() => return,
+            _ = tokio::time::sleep(PROGRESS_INTERVAL) => {}
+        }
+        let files = stats.files.load(Relaxed);
+        let msg = format!(
+            "Indexing {label} — {} files, {} folders, {}",
+            files,
+            stats.dirs.load(Relaxed),
+            humansize::format_size(stats.bytes.load(Relaxed), humansize::BINARY)
+        );
+        if tx
+            .send(ScanEvent::Progress {
+                scanner: ScannerId::Fs,
+                gen,
+                msg,
+                done: files,
+                total: None,
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// Everything that reads off the finished trees: pnpm re-measurement, large
+/// and largest files, the fixed cache/backup targets, the disk categories,
+/// and finally the trees themselves.
+fn derive_from_trees(
+    paths: &crate::config::Paths,
+    tx: &tokio::sync::mpsc::Sender<ScanEvent>,
+    gen: u64,
+    token: &tokio_util::sync::CancellationToken,
+    results: Vec<(PathBuf, walk::WalkResult, Instant)>,
+    hits: Vec<(PathBuf, Hit)>,
+    threshold: u64,
+) {
+    let send = |f: Finding| {
+        let _ = tx.blocking_send(ScanEvent::Finding {
+            scanner: ScannerId::Fs,
+            gen,
+            finding: Box::new(f),
+        });
+    };
+    let cancelled = || token.is_cancelled();
+
+    // pnpm-linked node_modules: how much is hard-linked from the store is a
+    // per-tree question, so it gets its own bounded walk.
+    for (path, hit) in hits.iter().filter(|(_, h)| h.ctx.pnpm_store.is_some()) {
+        if cancelled() {
+            return;
+        }
+        let s = du_blocks_shared(path, &cancelled);
+        if cancelled() {
+            return;
+        }
+        send(artifact_finding(
+            path,
+            &hit.label,
+            hit.last_used,
+            hit.stale,
+            Some(s.bytes),
+            &hit.ctx,
+            Some(s.externally_linked),
+        ));
+    }
+
+    let trees: Vec<Arc<DirTree>> = results
+        .into_iter()
+        .map(|(root, r, started)| {
+            let mut threshold_files = r.threshold_files.clone();
+            let mut top_files = r.top_files.clone();
+            let tree = Arc::new(DirTree::from_result(root, r, started));
+            // Loose files over the threshold: Attention, trashable.
+            threshold_files.sort_by_key(|f| std::cmp::Reverse(f.alloc));
+            let over: HashSet<&Path> = threshold_files.iter().map(|f| f.path.as_path()).collect();
+            for f in &threshold_files {
+                if f.alloc > threshold {
+                    send(large_file_finding(&f.path, f.alloc));
+                }
+            }
+            // The largest files regardless of threshold: context only.
+            top_files.retain(|f| !over.contains(f.path.as_path()));
+            for (rank, f) in top_files.iter().take(LARGEST_FILES).enumerate() {
+                send(largest_file_finding(&f.path, f.alloc, rank + 1));
+            }
+            tree
+        })
+        .collect();
+    if cancelled() {
+        return;
+    }
+
+    size_fixed_paths(paths, &send, &cancelled, &trees);
+    size_disk_categories(paths, &send, &cancelled, &trees);
+
+    for tree in trees {
+        let _ = tx.blocking_send(ScanEvent::DirTree {
+            scanner: ScannerId::Fs,
+            gen,
+            tree,
+        });
+    }
+}
+
+/// The node for `path` in whichever tree contains it.
+fn find_node<'a>(trees: &'a [Arc<DirTree>], path: &Path) -> Option<&'a DirNode> {
+    trees
+        .iter()
+        .find(|t| path.starts_with(&t.root))
+        .and_then(|t| t.node.find(&t.root, path))
 }
 
 struct DiskCategory {
@@ -489,188 +673,53 @@ const DISK_CATEGORIES: &[DiskCategory] = &[
     },
 ];
 
-/// Measure a deliberately narrow, non-overlapping set of roots with one shared
-/// five-second budget. Missing/unreadable roots are omitted; unfinished roots
-/// are still emitted with a coverage warning so their partial number is never
-/// mistaken for a whole-disk answer.
+/// Unreadable directories a category may contain before it is flagged
+/// `Attention`. Every Mac without Full Disk Access has a handful of
+/// TCC-protected folders under `~/Library` (Mail, Messages, Safari…); that
+/// is a coverage note, not a warning.
+const PARTIAL_ATTENTION_DIRS: u64 = 25;
+
+/// Measure a deliberately narrow, non-overlapping set of roots, exactly,
+/// off the finished tree. A root outside every walked tree (custom
+/// `scan.roots`) falls back to a direct walk.
 fn size_disk_categories(
     paths: &crate::config::Paths,
-    tx: &tokio::sync::mpsc::Sender<ScanEvent>,
-    gen: u64,
-    token: &tokio_util::sync::CancellationToken,
+    send: &dyn Fn(Finding),
+    cancelled: &(dyn Fn() -> bool + Sync),
+    trees: &[Arc<DirTree>],
 ) {
-    let deadline = Instant::now() + Duration::from_secs(5);
     for category in DISK_CATEGORIES {
-        if token.is_cancelled() {
+        if cancelled() {
             return;
         }
         let root = paths.expand(category.rel);
         if !root.is_dir() {
             continue;
         }
-        let result = du_blocks_bounded(&root, 25_000, deadline, &|| token.is_cancelled());
-        let coverage = if result.complete {
-            format!("Measured {} entries in the selected root.", result.entries)
+        let (bytes, files, dirs, errors) = match find_node(trees, &root) {
+            Some(n) => (n.alloc, n.files, n.dirs, n.errors),
+            None => (du_blocks(&root, cancelled), 0, 0, 0),
+        };
+        let entries = files + dirs;
+        let complete = errors == 0;
+        let coverage = if complete {
+            format!("Measured exactly: {files} files in {dirs} folders.")
         } else {
             format!(
-                "Partial: measured {} entries before the shared 5s / 25,000-entry budget ended.",
-                result.entries
+                "{errors} folders could not be read — grant Full Disk Access to include them. Measured {files} files in {dirs} folders."
             )
         };
+        let attention = errors > PARTIAL_ATTENTION_DIRS || errors.saturating_mul(100) > entries;
         let f = Finding::new(FindingKind::DiskCategory, category.rel, category.title)
             .path(root)
-            .size(result.bytes)
-            .detail(format!("{} on disk", humansize::format_size(result.bytes, humansize::BINARY)))
-            .severity(if result.complete { Severity::Info } else { Severity::Attention })
-            .provenance("bounded local directory walk; symlinks skipped, hard links deduplicated per category")
+            .size(bytes)
+            .detail(format!("{} on disk", humansize::format_size(bytes, humansize::BINARY)))
+            .severity(if attention { Severity::Attention } else { Severity::Info })
+            .provenance("exact directory walk; symlinks skipped, hard links deduplicated, mount points not crossed")
             .coverage(coverage.clone())
-            .meta(json!({ "group": "Disk allocation", "category": category.title, "entries": result.entries, "complete": result.complete, "coverage": coverage }));
-        let _ = tx.blocking_send(ScanEvent::Finding {
-            scanner: ScannerId::Fs,
-            gen,
-            finding: Box::new(f),
-        });
+            .meta(json!({ "group": "Disk allocation", "category": category.title, "entries": entries, "files": files, "dirs": dirs, "errors": errors, "complete": complete, "coverage": coverage }));
+        send(f);
     }
-}
-
-/// Run the parallel walk, emitting unsized artifact findings + large-file
-/// findings and pushing artifact hits for later sizing.
-fn run_walk(shared: &Arc<WalkShared>, roots: &[PathBuf]) {
-    let mut builder: Option<WalkBuilder> = None;
-    for root in roots {
-        if !root.exists() {
-            continue;
-        }
-        match builder.as_mut() {
-            Some(b) => {
-                b.add(root);
-            }
-            None => {
-                let mut b = WalkBuilder::new(root);
-                // Walk *everything*: node_modules/target are usually gitignored,
-                // so all standard filters (hidden, gitignore, parents) are off.
-                b.standard_filters(false).follow_links(false);
-                builder = Some(b);
-            }
-        }
-    }
-    let Some(builder) = builder else {
-        return;
-    };
-
-    builder.build_parallel().run(|| {
-        let shared = shared.clone();
-        Box::new(move |result| visit(&shared, result))
-    });
-}
-
-/// Per-entry visitor. Cheap predicate checks, then either descend, skip, or
-/// emit. Returns `Quit` promptly on cancellation (spec §1).
-fn visit(shared: &WalkShared, result: Result<ignore::DirEntry, ignore::Error>) -> WalkState {
-    if shared.token.is_cancelled() {
-        return WalkState::Quit;
-    }
-    let entry = match result {
-        Ok(e) => e,
-        Err(_) => return WalkState::Continue,
-    };
-    let path = entry.path();
-    let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-
-    if is_dir {
-        // Never descend into ~/Library (fixed targets are sized directly).
-        if path == shared.library {
-            return WalkState::Skip;
-        }
-        if shared.ignore_paths.iter().any(|ig| path == ig) {
-            return WalkState::Skip;
-        }
-        // Never descend into Trash: everything in it is already slated for
-        // deletion — re-reporting trashed node_modules (or piping trashed
-        // repos to GitScanner) is noise, and a Trash remedy would be absurd.
-        if path.file_name().and_then(|n| n.to_str()) == Some(".Trash") {
-            return WalkState::Skip;
-        }
-
-        let name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n,
-            None => return WalkState::Continue,
-        };
-
-        // A repository root — feed GitScanner, then don't descend into .git.
-        if name == ".git" {
-            if let (Some(tx), Some(parent)) = (shared.repo_tx.as_ref(), path.parent()) {
-                let _ = tx.blocking_send(RepoDiscovery {
-                    root: parent.to_path_buf(),
-                });
-            }
-            return WalkState::Skip;
-        }
-
-        // A macOS package (app, project, Photos/Music library, VM bundle) is
-        // opaque: nothing inside it is a loose file or a project of its own.
-        // Data libraries are sized whole and surfaced as one large item.
-        if let Some(ext) = package_extension(name) {
-            if !shared.discovery_only {
-                if let Some(label) = data_library_label(ext) {
-                    let _ = shared.hit_tx.send(Hit {
-                        path: path.to_path_buf(),
-                        label: name.to_string(),
-                        last_used: None,
-                        stale: false,
-                        ctx: ArtifactCtx::default(),
-                        package: Some(label),
-                    });
-                }
-            }
-            return WalkState::Skip;
-        }
-
-        if is_artifact(name, path, &shared.config) {
-            if !shared.discovery_only {
-                let last_used = path.parent().and_then(parent_max_mtime);
-                let stale = is_stale(last_used, shared.stale_after_days);
-                let ctx = artifact_ctx(name, path);
-                let f = artifact_finding(path, name, last_used, stale, None, false, &ctx, None);
-                let _ = shared.tx.blocking_send(ScanEvent::Finding {
-                    scanner: ScannerId::Fs,
-                    gen: shared.gen,
-                    finding: Box::new(f),
-                });
-                // Hand the hit to the concurrent sizing consumer immediately so
-                // its size is computed while the walk continues.
-                let _ = shared.hit_tx.send(Hit {
-                    path: path.to_path_buf(),
-                    label: name.to_string(),
-                    last_used,
-                    stale,
-                    ctx,
-                    package: None,
-                });
-            }
-            // Whether or not we emit, do NOT descend into an artifact subtree.
-            return WalkState::Skip;
-        }
-        return WalkState::Continue;
-    }
-
-    // Large loose file.
-    if !shared.discovery_only {
-        if let Ok(meta) = entry.metadata() {
-            if meta.is_file() {
-                let sz = on_disk_bytes(&meta);
-                if sz > shared.large_file_threshold {
-                    let f = large_file_finding(path, sz);
-                    let _ = shared.tx.blocking_send(ScanEvent::Finding {
-                        scanner: ScannerId::Fs,
-                        gen: shared.gen,
-                        finding: Box::new(f),
-                    });
-                }
-            }
-        }
-    }
-    WalkState::Continue
 }
 
 /// Directory extensions macOS treats as packages. The walk never descends
@@ -784,11 +833,17 @@ fn large_package_finding(path: &Path, label: &str, size: u64) -> Finding {
     })
 }
 
-/// Is `name` (a directory) a recognized build artifact, given its marker? The
-/// caller guarantees `path` is the directory itself.
-fn is_artifact(name: &str, path: &Path, config: &crate::config::Config) -> bool {
-    let parent = path.parent();
-    let sibling = |file: &str| parent.map(|p| p.join(file).exists()).unwrap_or(false);
+/// Is `name` (a directory) a recognized build artifact, given its marker?
+/// `siblings` is the parent's listing, so marker files next to the candidate
+/// cost no syscall; only the probes *inside* `target`/`.venv` still touch
+/// the disk, and only for directories with exactly those names.
+fn is_artifact(
+    name: &str,
+    path: &Path,
+    siblings: &[Entry],
+    config: &crate::config::Config,
+) -> bool {
+    let sibling = |file: &str| has_sibling(siblings, file);
     let inside = |file: &str| path.join(file).exists();
 
     match name {
@@ -799,9 +854,7 @@ fn is_artifact(name: &str, path: &Path, config: &crate::config::Config) -> bool 
         "target" => sibling("Cargo.toml") || inside(".rustc_info.json") || inside("CACHEDIR.TAG"),
         ".venv" | "venv" => inside("pyvenv.cfg"),
         "__pycache__" => true,
-        "build" | "dist" => parent
-            .map(|p| PROJECT_MARKERS.iter().any(|m| p.join(m).exists()))
-            .unwrap_or(false),
+        "build" | "dist" => PROJECT_MARKERS.iter().any(|m| sibling(m)),
         ".next" | ".turbo" | ".wrangler" => sibling("package.json"),
         "Pods" => sibling("Podfile"),
         other => config
@@ -813,17 +866,13 @@ fn is_artifact(name: &str, path: &Path, config: &crate::config::Config) -> bool 
 }
 
 /// Build an artifact finding. `None` size marks the initial (pending) emit; the
-/// re-emit passes `Some` — same `(kind, key)` ⇒ same `FindingId`. `cached`
-/// marks a re-emit whose size came from the size cache rather than a fresh
-/// `du_blocks` (surfaced to the UI via `meta.size_cached`).
-#[allow(clippy::too_many_arguments)]
+/// re-emit passes `Some` — same `(kind, key)` ⇒ same `FindingId`.
 fn artifact_finding(
     path: &Path,
     label: &str,
     last_used: Option<SystemTime>,
     stale: bool,
     size: Option<u64>,
-    cached: bool,
     ctx: &ArtifactCtx,
     shared_bytes: Option<u64>,
 ) -> Finding {
@@ -847,9 +896,6 @@ fn artifact_finding(
         "worktree_of": ctx.worktree.as_ref().map(|(m, _)| m.clone()),
         "worktree_name": ctx.worktree.as_ref().map(|(_, n)| n.clone()),
     });
-    if cached {
-        meta["size_cached"] = json!(true);
-    }
     // What trashing actually reclaims: pnpm links package files from its
     // store, so the store keeps most of these bytes alive.
     let reclaim = match (size, shared_bytes) {
@@ -988,23 +1034,43 @@ fn large_file_finding(path: &Path, size: u64) -> Finding {
         })
 }
 
-/// Cheap staleness heuristic: max mtime of the *files* directly in `parent`
-/// (artifact subdirs, being directories, are naturally excluded).
-fn parent_max_mtime(parent: &Path) -> Option<SystemTime> {
-    let mut max: Option<SystemTime> = None;
-    for entry in std::fs::read_dir(parent).ok()?.flatten() {
-        let Ok(meta) = entry.metadata() else { continue };
-        if !meta.is_file() {
-            continue;
-        }
-        if let Ok(t) = meta.modified() {
-            max = Some(match max {
-                Some(cur) if cur >= t => cur,
-                _ => t,
-            });
-        }
-    }
-    max
+/// One of the largest files on the walked roots, threshold or not. `Info`,
+/// in its own group, Reveal only: context for where the disk went, not a
+/// cleanup candidate (files over the threshold are reported separately as
+/// trashable "Large files" and excluded from this group).
+fn largest_file_finding(path: &Path, size: u64, rank: usize) -> Finding {
+    let key = format!("top:{}", path.to_string_lossy());
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Finding::new(FindingKind::LargeFile, &key, format!("Largest — {name}"))
+        .path(path.to_path_buf())
+        .detail(format!("#{rank} largest file on the scanned roots"))
+        .size(size)
+        .severity(Severity::Info)
+        .meta(json!({ "group": "Largest files", "rank": rank }))
+        .remedy(Remedy {
+            label: "Reveal in Finder".into(),
+            command: RemedyCommand::RevealInFinder {
+                path: path.to_path_buf(),
+            },
+            reclaims_bytes: None,
+            destructive: false,
+            alternative: false,
+            guard: None,
+        })
+}
+
+/// Cheap staleness heuristic: max mtime of the *files* directly next to an
+/// artifact, straight from the parent's listing.
+fn siblings_max_mtime(siblings: &[Entry]) -> Option<SystemTime> {
+    siblings
+        .iter()
+        .filter(|e| e.kind == Kind::File)
+        .map(|e| e.mtime_secs)
+        .max()
+        .map(|secs| UNIX_EPOCH + Duration::from_secs(secs.max(0) as u64))
 }
 
 fn is_stale(last_used: Option<SystemTime>, stale_after_days: u64) -> bool {
@@ -1119,15 +1185,17 @@ const FIXED_TARGETS: &[FixedTarget] = &[
     },
 ];
 
-/// Size the fixed cache/backup targets that exist and emit a finding for each.
+/// Size the fixed cache/backup targets that exist and emit a finding for each,
+/// from the tree where possible (a target outside every walked root is
+/// walked directly).
 fn size_fixed_paths(
     paths: &crate::config::Paths,
-    tx: &tokio::sync::mpsc::Sender<ScanEvent>,
-    gen: u64,
-    token: &tokio_util::sync::CancellationToken,
+    send: &dyn Fn(Finding),
+    cancelled: &(dyn Fn() -> bool + Sync),
+    trees: &[Arc<DirTree>],
 ) {
     for target in FIXED_TARGETS {
-        if token.is_cancelled() {
+        if cancelled() {
             return;
         }
         let root = paths.expand(target.rel);
@@ -1135,32 +1203,38 @@ fn size_fixed_paths(
             continue;
         }
         if target.per_subdir {
-            let Ok(rd) = std::fs::read_dir(&root) else {
-                continue;
-            };
-            for entry in rd.flatten() {
-                let p = entry.path();
-                if !p.is_dir() {
-                    continue;
+            match find_node(trees, &root) {
+                Some(node) => {
+                    for child in &node.children {
+                        let p = root.join(&child.name);
+                        send(fixed_finding(&p, target.kind, &target.remedy, child.alloc));
+                    }
                 }
-                let size = du_blocks(&p, &|| token.is_cancelled());
-                emit_fixed(tx, gen, &p, target.kind, &target.remedy, size);
+                None => {
+                    let Ok(rd) = std::fs::read_dir(&root) else {
+                        continue;
+                    };
+                    for entry in rd.flatten() {
+                        let p = entry.path();
+                        if !p.is_dir() {
+                            continue;
+                        }
+                        let size = du_blocks(&p, cancelled);
+                        send(fixed_finding(&p, target.kind, &target.remedy, size));
+                    }
+                }
             }
         } else {
-            let size = du_blocks(&root, &|| token.is_cancelled());
-            emit_fixed(tx, gen, &root, target.kind, &target.remedy, size);
+            let size = match find_node(trees, &root) {
+                Some(node) => node.alloc,
+                None => du_blocks(&root, cancelled),
+            };
+            send(fixed_finding(&root, target.kind, &target.remedy, size));
         }
     }
 }
 
-fn emit_fixed(
-    tx: &tokio::sync::mpsc::Sender<ScanEvent>,
-    gen: u64,
-    path: &Path,
-    kind: FindingKind,
-    fixed_remedy: &FixedRemedy,
-    size: u64,
-) {
+fn fixed_finding(path: &Path, kind: FindingKind, fixed_remedy: &FixedRemedy, size: u64) -> Finding {
     let key = path.to_string_lossy();
     let name = path
         .file_name()
@@ -1218,45 +1292,13 @@ fn emit_fixed(
         FindingKind::IosBackup => "iOS Backups",
         _ => "Caches",
     };
-    let f = Finding::new(kind, &key, name)
+    Finding::new(kind, &key, name)
         .path(path.to_path_buf())
         .size(size)
         .severity(severity)
         .meta(json!({ "group": group }))
-        .remedy(remedy);
-    let _ = tx.blocking_send(ScanEvent::Finding {
-        scanner: ScannerId::Fs,
-        gen,
-        finding: Box::new(f),
-    });
+        .remedy(remedy)
 }
-
-// --- Artifact size cache integration -------------------------------------
-//
-// The cache is consulted per-`Hit` in the sizing consumer above: a hit is
-// re-used (no `du_blocks`) when its cached entry is both within the TTL and
-// keyed to the artifact root's current mtime; otherwise it's measured fresh
-// and queued for a single batched `upsert_batch` after the sizing pass ends.
-
-/// Best-effort cache open + load. An unopenable or corrupt db degrades to an
-/// empty cache rather than failing the scan.
-fn load_cache(path: &Path) -> HashMap<PathBuf, CachedSize> {
-    SizeCache::open(path)
-        .and_then(|c| c.load_all())
-        .unwrap_or_default()
-}
-
-/// Best-effort persistence of freshly measured sizes. Failure is silently
-/// ignored — the cache is a performance optimization, never load-bearing.
-fn save_cache(path: &Path, entries: &[(PathBuf, CachedSize)]) {
-    if let Ok(mut cache) = SizeCache::open(path) {
-        let _ = cache.upsert_batch(entries);
-    }
-}
-
-// Freshness/mtime helpers live in `size_cache` so GitScanner's repo sizing can
-// share the exact same staleness semantics.
-use crate::size_cache::{is_fresh, root_mtime_secs};
 
 #[cfg(test)]
 mod tests {
@@ -1267,6 +1309,7 @@ mod tests {
     use crate::scan::pipe::repo_channel;
     use std::collections::HashMap;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
@@ -1306,12 +1349,6 @@ mod tests {
             fs_discovery_only: discovery_only,
         };
         (ctx, rx, repo_rx)
-    }
-
-    fn unix_secs(t: SystemTime) -> i64 {
-        t.duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0)
     }
 
     /// Collect all findings from the receiver into path→findings.
@@ -1643,9 +1680,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn library_is_not_descended() {
+    async fn library_yields_no_artifact_findings() {
         let home = tempfile::tempdir().unwrap();
-        // A node_modules buried in ~/Library must be ignored by the walk.
+        // A node_modules buried in ~/Library is sized but never classified.
         let lib = home.path().join("Library/weird");
         fs::create_dir_all(lib.join("node_modules")).unwrap();
         fs::write(lib.join("package.json"), "{}").unwrap();
@@ -1657,7 +1694,7 @@ mod tests {
             !drain(rx)
                 .iter()
                 .any(|f| f.path.as_deref() == Some(lib.join("node_modules").as_path())),
-            "~/Library must be skipped by the walk"
+            "nothing under ~/Library may become an artifact finding"
         );
     }
 
@@ -1686,187 +1723,16 @@ mod tests {
         );
     }
 
-    /// Build a fixture tree with one sizeable `node_modules` artifact. Returns
-    /// its path.
-    fn fixture_node_modules(home: &Path) -> PathBuf {
-        let proj = home.join("app");
-        fs::create_dir_all(proj.join("node_modules/pkg")).unwrap();
-        fs::write(proj.join("package.json"), "{}").unwrap();
-        fs::write(proj.join("node_modules/pkg/blob.bin"), vec![7u8; 4096]).unwrap();
-        proj.join("node_modules")
-    }
-
-    #[tokio::test]
-    async fn cold_scan_populates_size_cache_db() {
-        let home = tempfile::tempdir().unwrap();
-        let nm = fixture_node_modules(home.path());
-
-        let (ctx, rx, _) = ctx_for(home.path(), false, false, vec![]);
-        FsScanner.scan(ctx).await.unwrap();
-
-        let findings = drain(rx);
-        let sized = findings
-            .iter()
-            .find(|f| {
-                f.path.as_deref() == Some(nm.as_path()) && f.size_bytes.is_some_and(|v| v > 0)
-            })
-            .expect("expected a sized node_modules finding");
-        assert!(
-            sized.meta.get("size_cached").is_none(),
-            "a cold scan must not claim a cached size"
-        );
-
-        // The size we just computed should now be persisted in the cache db.
-        let db = size_cache::db_path(&Paths::from_home(home.path()));
-        let cache = SizeCache::open(&db).unwrap();
-        let all = cache.load_all().unwrap();
-        let entry = all
-            .get(&nm)
-            .expect("expected a node_modules row in the size cache db");
-        assert!(entry.size > 0);
-        assert_eq!(entry.size, sized.size_bytes.unwrap());
-    }
-
-    /// Regression: a scan cancelled mid-sizing must not persist anything — a
-    /// du interrupted by cancellation returns a PARTIAL sum, and with the root
-    /// mtime unchanged it would be served as a "fresh" (wrong) cached size for
-    /// up to the whole TTL on subsequent scans.
-    #[tokio::test]
-    async fn cancelled_scan_never_persists_sizes() {
-        let home = tempfile::tempdir().unwrap();
-        let _nm = fixture_node_modules(home.path());
-
-        let (ctx, _rx, _) = ctx_for(home.path(), false, false, vec![]);
-        // Cancel before the scan even starts sizing — every du is "interrupted".
-        ctx.token.cancel();
-        FsScanner.scan(ctx).await.unwrap();
-
-        let db = size_cache::db_path(&Paths::from_home(home.path()));
-        // Either no db was created, or it contains no rows — never a partial size.
-        if let Ok(cache) = SizeCache::open(&db) {
-            assert!(
-                cache.load_all().unwrap().is_empty(),
-                "cancelled scan must not write size-cache rows"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn warm_cache_within_ttl_and_matching_mtime_is_reused() {
-        let home = tempfile::tempdir().unwrap();
-        let nm = fixture_node_modules(home.path());
-        let root_mtime = root_mtime_secs(&nm);
-        let now = unix_secs(SystemTime::now());
-
-        let db = size_cache::db_path(&Paths::from_home(home.path()));
-        {
-            let mut cache = SizeCache::open(&db).unwrap();
-            cache
-                .upsert_batch(&[(
-                    nm.clone(),
-                    CachedSize {
-                        size: 999_999,
-                        computed_at: now,
-                        root_mtime,
-                    },
-                )])
-                .unwrap();
-        }
-
-        let (ctx, rx, _) = ctx_for(home.path(), false, false, vec![]);
-        FsScanner.scan(ctx).await.unwrap();
-
-        let findings = drain(rx);
-        let hit = findings
-            .iter()
-            .find(|f| f.path.as_deref() == Some(nm.as_path()) && f.size_bytes == Some(999_999))
-            .expect("expected the cached size to be reused verbatim");
-        assert_eq!(hit.meta["size_cached"], serde_json::json!(true));
-    }
-
-    #[tokio::test]
-    async fn cache_entry_with_wrong_root_mtime_is_ignored() {
-        let home = tempfile::tempdir().unwrap();
-        let nm = fixture_node_modules(home.path());
-        let now = unix_secs(SystemTime::now());
-
-        let db = size_cache::db_path(&Paths::from_home(home.path()));
-        {
-            let mut cache = SizeCache::open(&db).unwrap();
-            cache
-                .upsert_batch(&[(
-                    nm.clone(),
-                    CachedSize {
-                        size: 999_999,
-                        computed_at: now,
-                        root_mtime: 1, // deliberately wrong — the tree "changed"
-                    },
-                )])
-                .unwrap();
-        }
-
-        let (ctx, rx, _) = ctx_for(home.path(), false, false, vec![]);
-        FsScanner.scan(ctx).await.unwrap();
-
-        let findings = drain(rx);
-        let hit = findings
-            .iter()
-            .find(|f| {
-                f.path.as_deref() == Some(nm.as_path()) && f.size_bytes.is_some_and(|v| v > 0)
-            })
-            .expect("expected a re-measured sized finding");
-        assert_ne!(
-            hit.size_bytes,
-            Some(999_999),
-            "a cache entry with a stale root_mtime must be re-du'd"
-        );
-        assert!(hit.meta.get("size_cached").is_none());
-    }
-
-    #[tokio::test]
-    async fn cache_entry_older_than_ttl_is_ignored() {
-        let home = tempfile::tempdir().unwrap();
-        let nm = fixture_node_modules(home.path());
-        let root_mtime = root_mtime_secs(&nm);
-
-        let db = size_cache::db_path(&Paths::from_home(home.path()));
-        {
-            let mut cache = SizeCache::open(&db).unwrap();
-            cache
-                .upsert_batch(&[(
-                    nm.clone(),
-                    CachedSize {
-                        size: 999_999,
-                        computed_at: 0, // unix epoch — far past the default 24h TTL
-                        root_mtime,
-                    },
-                )])
-                .unwrap();
-        }
-
-        let (ctx, rx, _) = ctx_for(home.path(), false, false, vec![]);
-        FsScanner.scan(ctx).await.unwrap();
-
-        let findings = drain(rx);
-        let hit = findings
-            .iter()
-            .find(|f| {
-                f.path.as_deref() == Some(nm.as_path()) && f.size_bytes.is_some_and(|v| v > 0)
-            })
-            .expect("expected a re-measured sized finding");
-        assert_ne!(
-            hit.size_bytes,
-            Some(999_999),
-            "an expired cache entry must be re-du'd"
-        );
-        assert!(hit.meta.get("size_cached").is_none());
-    }
-
-    /// `ctx_for` with a ~100-byte large-file threshold so small fixtures count.
+    /// `ctx_for` with a tiny large-file threshold so small fixtures count as
+    /// "large" without multi-GB files. 16 KiB: well below `big_file`'s 64 KiB
+    /// (still triggers every existing "is this reported as large" check) but
+    /// above a single filesystem block (4 KiB on APFS), so a one- or
+    /// two-block loose file can sit *below* it — see
+    /// `largest_files_group_excludes_threshold_files`.
     fn ctx_tiny_threshold(home: &Path) -> (ScanCtx, mpsc::Receiver<ScanEvent>) {
         let (mut ctx, rx, _) = ctx_for(home, false, false, vec![]);
         let mut config = (*ctx.config).clone();
-        config.scan.large_file_threshold_gb = 1e-7;
+        config.scan.large_file_threshold_gb = 16384.0 / (1024.0 * 1024.0 * 1024.0);
         ctx.config = Arc::new(config);
         (ctx, rx)
     }
@@ -2000,5 +1866,398 @@ mod tests {
             f.remedies[1].command,
             RemedyCommand::RevealInFinder { .. }
         ));
+    }
+
+    /// Restores a set of paths' permissions to `0o755` on drop, including on
+    /// panic/unwind, so a failed assertion never leaves a chmod-000 directory
+    /// behind for the rest of the test suite (or a later `tempdir` cleanup)
+    /// to trip over.
+    struct PermRestoreGuard(Vec<PathBuf>);
+    impl Drop for PermRestoreGuard {
+        fn drop(&mut self) {
+            for p in &self.0 {
+                let _ = fs::set_permissions(p, fs::Permissions::from_mode(0o755));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn categories_are_exact_and_complete() {
+        let home = tempfile::tempdir().unwrap();
+        let docs = home.path().join("Documents");
+        fs::create_dir_all(docs.join("a/b")).unwrap();
+        fs::create_dir_all(docs.join("c")).unwrap();
+        fs::write(docs.join("a/b/f1"), vec![0u8; 4096]).unwrap();
+        fs::write(docs.join("c/f2"), vec![0u8; 4096]).unwrap();
+        fs::write(docs.join("f3"), vec![0u8; 4096]).unwrap();
+
+        let (ctx, rx, _) = ctx_for(home.path(), false, false, vec![]);
+        FsScanner.scan(ctx).await.unwrap();
+        let findings = drain(rx);
+
+        let cats: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.kind == FindingKind::DiskCategory && f.title == "Documents")
+            .collect();
+        assert_eq!(cats.len(), 1, "{cats:?}");
+        let f = cats[0];
+        let expected = crate::scan::sizing::du_blocks(&docs, &|| false);
+        assert_eq!(f.size_bytes, Some(expected));
+        assert_eq!(f.meta["complete"], true);
+        assert_eq!(f.meta["errors"], 0);
+        assert_eq!(f.meta["files"], 3);
+        assert_eq!(f.severity, Severity::Info);
+        assert!(f
+            .coverage
+            .as_deref()
+            .unwrap()
+            .starts_with("Measured exactly"));
+    }
+
+    #[tokio::test]
+    async fn category_with_unreadable_subdir_is_flagged_partial() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root reads everything; the permission bits are moot.
+        }
+        let home = tempfile::tempdir().unwrap();
+        let docs = home.path().join("Documents");
+        fs::create_dir_all(&docs).unwrap();
+        // Plenty of readable entries: one unreadable folder among ~150
+        // entries is under the 1%-of-entries tolerance, not just under the
+        // absolute `PARTIAL_ATTENTION_DIRS` cap.
+        for i in 0..150 {
+            fs::write(docs.join(format!("f{i}")), vec![0u8; 128]).unwrap();
+        }
+        let locked = docs.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("secret"), vec![0u8; 4096]).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let _guard = PermRestoreGuard(vec![locked.clone()]);
+
+        let (ctx, rx, _) = ctx_for(home.path(), false, false, vec![]);
+        FsScanner.scan(ctx).await.unwrap();
+        let findings = drain(rx);
+
+        let f = findings
+            .iter()
+            .find(|f| f.kind == FindingKind::DiskCategory && f.title == "Documents")
+            .expect("Documents category");
+        assert_eq!(f.meta["complete"], false);
+        assert_eq!(f.meta["errors"], 1);
+        // One unreadable folder is under the tolerant threshold.
+        assert_eq!(f.severity, Severity::Info);
+        assert!(f.coverage.as_deref().unwrap().contains("Full Disk Access"));
+    }
+
+    #[tokio::test]
+    async fn category_flagged_attention_when_many_dirs_unreadable() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root reads everything; the permission bits are moot.
+        }
+        let home = tempfile::tempdir().unwrap();
+        let docs = home.path().join("Documents");
+        fs::create_dir_all(&docs).unwrap();
+        let mut locked_dirs = Vec::new();
+        for i in 0..30 {
+            let d = docs.join(format!("locked{i}"));
+            fs::create_dir_all(&d).unwrap();
+            fs::set_permissions(&d, fs::Permissions::from_mode(0o000)).unwrap();
+            locked_dirs.push(d);
+        }
+        let _guard = PermRestoreGuard(locked_dirs);
+
+        let (ctx, rx, _) = ctx_for(home.path(), false, false, vec![]);
+        FsScanner.scan(ctx).await.unwrap();
+        let findings = drain(rx);
+
+        let f = findings
+            .iter()
+            .find(|f| f.kind == FindingKind::DiskCategory && f.title == "Documents")
+            .expect("Documents category");
+        assert_eq!(f.severity, Severity::Attention);
+    }
+
+    #[tokio::test]
+    async fn library_contents_are_sized_but_yield_no_artifacts() {
+        let home = tempfile::tempdir().unwrap();
+        let weird = home.path().join("Library/Caches/weird");
+        fs::create_dir_all(weird.join("node_modules")).unwrap();
+        fs::write(weird.join("package.json"), "{}").unwrap();
+        fs::write(weird.join("blob"), vec![0u8; 8192]).unwrap();
+
+        let (ctx, rx, _) = ctx_for(home.path(), false, false, vec![]);
+        FsScanner.scan(ctx).await.unwrap();
+        let findings = drain(rx);
+
+        assert!(
+            !findings.iter().any(|f| f.kind == FindingKind::BuildArtifact
+                && f.path.as_deref() == Some(weird.join("node_modules").as_path())),
+            "nothing under ~/Library may become an artifact finding: {findings:?}"
+        );
+        let cache = findings
+            .iter()
+            .find(|f| f.kind == FindingKind::DiskCategory && f.title == "App caches")
+            .expect("App caches category");
+        assert!(cache.size_bytes.unwrap() >= 8192);
+        assert_eq!(cache.meta["complete"], true);
+    }
+
+    #[tokio::test]
+    async fn discovery_only_skips_library_and_artifacts() {
+        let home = tempfile::tempdir().unwrap();
+        let proj = home.path().join("proj");
+        fs::create_dir_all(proj.join(".git")).unwrap();
+        let proj2 = home.path().join("proj2");
+        fs::create_dir_all(proj2.join("node_modules")).unwrap();
+        fs::write(proj2.join("package.json"), "{}").unwrap();
+        fs::create_dir_all(home.path().join("Library/x/.git")).unwrap();
+
+        let (ctx, mut rx, repo_rx) = ctx_for(home.path(), true, true, vec![]);
+        FsScanner.scan(ctx).await.unwrap();
+
+        let mut repo_rx = repo_rx.unwrap();
+        let mut roots = Vec::new();
+        while let Ok(d) = repo_rx.try_recv() {
+            roots.push(d.root);
+        }
+        assert_eq!(roots, vec![proj]);
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert_eq!(
+            events.len(),
+            0,
+            "discovery-only must emit no events at all (no findings, no Progress, no DirTree)"
+        );
+    }
+
+    #[tokio::test]
+    async fn largest_files_group_excludes_threshold_files() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("stuff");
+        // Above the (tiny) threshold: a real "Large files" candidate.
+        let huge = dir.join("huge.bin");
+        big_file(&huge);
+        // Below the threshold: one and two filesystem blocks respectively,
+        // both non-zero, neither ever offered as a "large" file.
+        let medium = dir.join("medium.bin");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&medium, vec![0u8; 8192]).unwrap();
+        let small = dir.join("small.bin");
+        fs::write(&small, vec![0u8; 4096]).unwrap();
+
+        let (ctx, rx) = ctx_tiny_threshold(home.path());
+        FsScanner.scan(ctx).await.unwrap();
+        let findings = drain(rx);
+
+        let large: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.kind == FindingKind::LargeFile && f.meta["group"] == "Large files")
+            .collect();
+        assert_eq!(
+            large
+                .iter()
+                .filter(|f| f.path.as_deref() == Some(huge.as_path()))
+                .count(),
+            1,
+            "{large:?}"
+        );
+        assert_eq!(large[0].severity, Severity::Attention);
+        assert!(matches!(
+            large[0].remedies[0].command,
+            RemedyCommand::Trash { .. }
+        ));
+        assert!(!findings.iter().any(
+            |f| f.meta["group"] == "Largest files" && f.path.as_deref() == Some(huge.as_path())
+        ));
+
+        let largest: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.meta["group"] == "Largest files")
+            .collect();
+        assert!(
+            largest
+                .iter()
+                .all(|f| f.id != FindingId::new(FindingKind::LargeFile, &huge.to_string_lossy())),
+            "the over-threshold file must never appear in Largest files: {largest:?}"
+        );
+        let medium_f = largest
+            .iter()
+            .find(|f| f.path.as_deref() == Some(medium.as_path()))
+            .expect("medium file in Largest files");
+        let small_f = largest
+            .iter()
+            .find(|f| f.path.as_deref() == Some(small.as_path()))
+            .expect("small file in Largest files");
+        assert_eq!(medium_f.severity, Severity::Info);
+        assert_eq!(small_f.severity, Severity::Info);
+        assert!(medium_f.title.starts_with("Largest — "));
+        assert!(small_f.title.starts_with("Largest — "));
+        assert_eq!(medium_f.meta["rank"], 1);
+        assert_eq!(small_f.meta["rank"], 2);
+        assert_eq!(medium_f.remedies.len(), 1);
+        assert_eq!(small_f.remedies.len(), 1);
+        assert!(matches!(
+            medium_f.remedies[0].command,
+            RemedyCommand::RevealInFinder { .. }
+        ));
+        assert!(matches!(
+            small_f.remedies[0].command,
+            RemedyCommand::RevealInFinder { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn git_internals_are_not_loose_large_files_but_count_in_categories() {
+        let home = tempfile::tempdir().unwrap();
+        let pack = home
+            .path()
+            .join("Documents/repo/.git/objects/pack/big.pack");
+        big_file(&pack);
+
+        let (ctx, rx) = ctx_tiny_threshold(home.path());
+        FsScanner.scan(ctx).await.unwrap();
+        let findings = drain(rx);
+
+        // `.git` internals are NOT_LOOSE (never a threshold "Large files"
+        // finding) but not NO_TOP, so the pack may still legitimately show up
+        // in the unrelated "Largest files" context group — only the
+        // threshold-based classification is excluded here.
+        assert!(
+            !findings.iter().any(|f| f.kind == FindingKind::LargeFile
+                && f.meta["group"] == "Large files"
+                && f.path.as_deref() == Some(pack.as_path())),
+            "git pack internals must never be a loose large file: {findings:?}"
+        );
+        let docs = findings
+            .iter()
+            .find(|f| f.kind == FindingKind::DiskCategory && f.title == "Documents")
+            .expect("Documents category");
+        assert!(docs.size_bytes.unwrap() >= 64 * 1024);
+    }
+
+    #[tokio::test]
+    async fn progress_events_are_emitted_for_fs() {
+        let home = tempfile::tempdir().unwrap();
+        fs::write(home.path().join("f"), vec![0u8; 4096]).unwrap();
+
+        let (ctx, mut rx, _) = ctx_for(home.path(), false, false, vec![]);
+        FsScanner.scan(ctx).await.unwrap();
+
+        let mut found = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let ScanEvent::Progress { scanner, msg, .. } = &ev {
+                if *scanner == ScannerId::Fs && msg.starts_with("Indexed ") {
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "expected a final 'Indexed ...' progress summary");
+    }
+
+    #[tokio::test]
+    async fn dir_tree_event_carries_root_totals() {
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir_all(home.path().join("Documents")).unwrap();
+        fs::write(home.path().join("Documents/f"), vec![0u8; 4096]).unwrap();
+
+        let (ctx, mut rx, _) = ctx_for(home.path(), false, false, vec![]);
+        FsScanner.scan(ctx).await.unwrap();
+
+        let mut trees = Vec::new();
+        let mut findings = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                ScanEvent::DirTree { tree, .. } => trees.push(tree),
+                ScanEvent::Finding { finding, .. } => findings.push(*finding),
+                _ => {}
+            }
+        }
+        assert_eq!(trees.len(), 1, "{trees:?}");
+        let tree = &trees[0];
+        let cat_sum: u64 = findings
+            .iter()
+            .filter(|f| f.kind == FindingKind::DiskCategory)
+            .map(|f| f.size_bytes.unwrap_or(0))
+            .sum();
+        assert!(tree.node.alloc >= cat_sum);
+        assert!(tree.complete);
+        assert!(tree
+            .node
+            .find(&tree.root, &home.path().join("Documents"))
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn fixed_target_per_subdir_reads_children_from_tree() {
+        let home = tempfile::tempdir().unwrap();
+        let caches = home.path().join("Library/Caches");
+        fs::create_dir_all(caches.join("a")).unwrap();
+        fs::create_dir_all(caches.join("b")).unwrap();
+        fs::write(caches.join("a/f1"), vec![0u8; 4096]).unwrap();
+        fs::write(caches.join("b/f2"), vec![0u8; 8192]).unwrap();
+
+        let (ctx, rx, _) = ctx_for(home.path(), false, false, vec![]);
+        FsScanner.scan(ctx).await.unwrap();
+        let findings = drain(rx);
+
+        let cache_findings: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.kind == FindingKind::CacheDir)
+            .collect();
+        let a = cache_findings
+            .iter()
+            .find(|f| f.path.as_deref() == Some(caches.join("a").as_path()))
+            .expect("a cache dir");
+        let b = cache_findings
+            .iter()
+            .find(|f| f.path.as_deref() == Some(caches.join("b").as_path()))
+            .expect("b cache dir");
+        assert_eq!(
+            a.size_bytes,
+            Some(crate::scan::sizing::du_blocks(&caches.join("a"), &|| false))
+        );
+        assert_eq!(
+            b.size_bytes,
+            Some(crate::scan::sizing::du_blocks(&caches.join("b"), &|| false))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_scan_emits_nothing_after_the_walk() {
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir_all(home.path().join("Documents")).unwrap();
+        fs::write(home.path().join("Documents/f"), vec![0u8; 4096]).unwrap();
+
+        let (ctx, mut rx, _) = ctx_for(home.path(), false, false, vec![]);
+        ctx.token.cancel();
+        FsScanner.scan(ctx).await.unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ScanEvent::DirTree { .. })),
+            "cancelled scan must not emit DirTree: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                ScanEvent::Finding { finding, .. } if finding.kind == FindingKind::DiskCategory
+            )),
+            "cancelled scan must not emit DiskCategory findings: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                ScanEvent::Finding { finding, .. } if finding.meta["group"] == "Largest files"
+            )),
+            "cancelled scan must not emit Largest files findings: {events:?}"
+        );
     }
 }

@@ -25,7 +25,7 @@ use macaudit::engine::{Mode, ScannerManager};
 use macaudit::model::{Finding as CoreFinding, FindingId, Remedy as CoreRemedy, ScannerId};
 use macaudit::remedy::{execution_remedies, PlannedAction, RealClipboard, RealTrash, RemedyEngine};
 use macaudit::runner::{CommandRunner, RealCommandRunner};
-use macaudit::snapshot::SnapshotStore;
+use macaudit::scan::walk::DirNodeSummary;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -41,8 +41,6 @@ pub enum MacAuditError {
     /// Config or paths could not be loaded.
     #[error("config: {0}")]
     Config(String),
-    #[error("snapshot: {0}")]
-    Snapshot(String),
     /// A cleanup batch is already running.
     #[error("busy: {0}")]
     Busy(String),
@@ -141,6 +139,7 @@ impl Engine {
             session: Mutex::new(Session::default()),
             listener: Mutex::new(None),
             tx,
+            dir_trees: std::sync::RwLock::new(Vec::new()),
         });
         runtime().spawn(session::pump(rx, Arc::downgrade(&shared)));
 
@@ -296,53 +295,6 @@ impl Engine {
         }
     }
 
-    pub fn snapshots(&self) -> Result<Vec<SnapshotMeta>, MacAuditError> {
-        let store = self.store()?;
-        let list = store.list().map_err(snapshot_err)?;
-        Ok(list.iter().map(SnapshotMeta::from).collect())
-    }
-
-    /// Persist the current findings. Refused while any section of the last
-    /// scan failed — a partial snapshot would diff as wholesale removals.
-    pub fn save_snapshot(&self) -> Result<i64, MacAuditError> {
-        let (findings, failed) = {
-            let session = self.shared.session.lock().unwrap();
-            (
-                session.all_findings(),
-                session.failed_sections(ScannerId::ALL),
-            )
-        };
-        if !failed.is_empty() {
-            let names: Vec<&str> = failed.iter().map(|id| id.slug()).collect();
-            return Err(MacAuditError::Snapshot(format!(
-                "{} section(s) failed ({})",
-                failed.len(),
-                names.join(", ")
-            )));
-        }
-        session::save_snapshot(&self.shared.manager, &findings).map_err(snapshot_err)
-    }
-
-    pub fn diff_snapshots(&self, a: i64, b: i64) -> Result<SnapshotDiff, MacAuditError> {
-        let store = self.store()?;
-        store
-            .diff(a, b)
-            .map(SnapshotDiff::from)
-            .map_err(snapshot_err)
-    }
-
-    /// Per-section totals for every snapshot, oldest first (history chart).
-    pub fn section_history(&self) -> Result<Vec<SectionHistoryPoint>, MacAuditError> {
-        let store = self.store()?;
-        let rows = store.section_history().map_err(snapshot_err)?;
-        Ok(rows.iter().map(SectionHistoryPoint::from).collect())
-    }
-
-    /// Per-section counts from the latest snapshot, for Δ badges.
-    pub fn baseline_counts(&self) -> Vec<SectionBaseline> {
-        session::baseline(&self.shared.manager)
-    }
-
     /// Where the user's config file lives (for the Settings pane).
     pub fn config_path(&self) -> String {
         self.shared
@@ -352,16 +304,96 @@ impl Engine {
             .to_string_lossy()
             .into_owned()
     }
-}
 
-impl Engine {
-    fn store(&self) -> Result<SnapshotStore, MacAuditError> {
-        SnapshotStore::open(&self.shared.manager.paths().history_db()).map_err(snapshot_err)
+    /// The root of the first walked Disk tree, or `None` until a Disk scan
+    /// has completed at least once.
+    pub fn dir_root(&self) -> Option<DirEntry> {
+        let trees = self.shared.dir_trees.read().unwrap();
+        let tree = trees.first()?;
+        tree.summary_at(&tree.root, 0).as_ref().map(DirEntry::from)
+    }
+
+    /// The single directory at `path`, with no children expanded.
+    pub fn dir_entry(&self, path: String) -> Option<DirEntry> {
+        let path = std::path::PathBuf::from(path);
+        let trees = self.shared.dir_trees.read().unwrap();
+        let tree = trees.iter().find(|t| path.starts_with(&t.root))?;
+        tree.summary_at(&path, 0).as_ref().map(DirEntry::from)
+    }
+
+    /// `path`'s direct children, already sorted by allocated size descending.
+    /// Empty when `path` is unknown or a leaf.
+    pub fn dir_children(&self, path: String) -> Vec<DirEntry> {
+        let path = std::path::PathBuf::from(path);
+        let trees = self.shared.dir_trees.read().unwrap();
+        let Some(tree) = trees.iter().find(|t| path.starts_with(&t.root)) else {
+            return Vec::new();
+        };
+        let Some(summary) = tree.summary_at(&path, 1) else {
+            return Vec::new();
+        };
+        summary.children.iter().map(DirEntry::from).collect()
+    }
+
+    /// `path`'s subtree, expanded `depth` levels and flattened preorder,
+    /// capped at `max_nodes` entries.
+    pub fn dir_subtree(&self, path: String, depth: u32, max_nodes: u32) -> Vec<DirEntry> {
+        let path = std::path::PathBuf::from(path);
+        let trees = self.shared.dir_trees.read().unwrap();
+        let Some(tree) = trees.iter().find(|t| path.starts_with(&t.root)) else {
+            return Vec::new();
+        };
+        let Some(summary) = tree.summary_at(&path, depth as usize) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        flatten_preorder(&summary, max_nodes as usize, &mut out);
+        out
+    }
+
+    /// The largest files across every walked root, allocated size descending.
+    pub fn largest_files(&self, n: u32) -> Vec<TopFile> {
+        let trees = self.shared.dir_trees.read().unwrap();
+        let mut merged: Vec<TopFile> = trees
+            .iter()
+            .flat_map(|t| t.largest_files(n as usize))
+            .map(|f| TopFile::from(&f))
+            .collect();
+        merged.sort_by_key(|f| std::cmp::Reverse(f.alloc));
+        merged.truncate(n as usize);
+        merged
+    }
+
+    /// Summary counters for the first walked root, for the Disk section's
+    /// header/status. `None` until a Disk scan has completed at least once.
+    pub fn dir_tree_stats(&self) -> Option<DirTreeStats> {
+        let trees = self.shared.dir_trees.read().unwrap();
+        let tree = trees.first()?;
+        Some(DirTreeStats {
+            root: tree.root.to_string_lossy().into_owned(),
+            files: tree.files,
+            dirs: tree.dirs,
+            bytes: tree.bytes,
+            errors: tree.errors,
+            complete: tree.complete,
+            elapsed_ms: tree.elapsed.as_millis() as u64,
+        })
     }
 }
 
-fn snapshot_err(e: anyhow::Error) -> MacAuditError {
-    MacAuditError::Snapshot(e.to_string())
+/// Depth-first, parent-before-children flatten of a summary tree, stopping
+/// once `out` reaches `max_nodes`.
+fn flatten_preorder(node: &DirNodeSummary, max_nodes: usize, out: &mut Vec<DirEntry>) {
+    if out.len() >= max_nodes {
+        return;
+    }
+    out.push(DirEntry::from(node));
+    for child in &node.children {
+        if out.len() >= max_nodes {
+            return;
+        }
+        flatten_preorder(child, max_nodes, out);
+    }
 }
 
 impl Drop for Engine {
@@ -433,19 +465,6 @@ mod tests {
     fn fake_scan_streams_every_section_and_matches_pull() {
         let (engine, _home) = fake_engine();
         let collector = scan_all(&engine);
-        // Auto-snapshot lands after the last terminal event; wait for it so
-        // the assertion below sees the full event stream.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !collector
-            .0
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|e| matches!(e, ScanEvent::SnapshotSaved { .. }))
-        {
-            assert!(Instant::now() < deadline, "no auto-snapshot");
-            std::thread::sleep(Duration::from_millis(20));
-        }
         let events = collector.0.lock().unwrap().clone();
 
         for id in ScannerId::ALL {
@@ -471,17 +490,7 @@ mod tests {
                 engine.findings(section).iter().map(|f| f.id).collect();
             assert_eq!(pulled, expected, "pull for {}", id.slug());
         }
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, ScanEvent::SnapshotSaved { id: Some(_), .. })));
-        assert_eq!(engine.snapshots().unwrap().len(), 1);
         assert_eq!(engine.sections().len(), ScannerId::ALL.len());
-        let history = engine.section_history().unwrap();
-        let sections: std::collections::HashSet<SectionId> =
-            history.iter().map(|p| p.section).collect();
-        // Every section with durable fixtures shows up once for the one snapshot.
-        assert!(sections.contains(&SectionId::Fs) && sections.contains(&SectionId::Brew));
-        assert!(history.iter().all(|p| p.snapshot_id == 1));
     }
 
     #[test]
@@ -572,5 +581,57 @@ mod tests {
             engine.execute(plan, Arc::new(Sink)),
             Err(MacAuditError::Busy(_))
         ));
+    }
+
+    fn scan_fs(engine: &Engine) -> Arc<Collector> {
+        let collector = Arc::new(Collector(Mutex::new(Vec::new())));
+        let listener: Arc<dyn ScanListener> = collector.clone();
+        engine.start_scan(vec![SectionId::Fs], listener);
+        collector.wait_for_terminal(1);
+        collector
+    }
+
+    #[test]
+    fn dir_tree_is_absent_before_a_scan() {
+        let (engine, _home) = fake_engine();
+        assert!(engine.dir_root().is_none());
+        assert!(engine.dir_tree_stats().is_none());
+        assert!(engine.dir_entry("/Users/dev".to_string()).is_none());
+        assert!(engine.dir_children("/Users/dev".to_string()).is_empty());
+        assert!(engine
+            .dir_subtree("/Users/dev".to_string(), 2, 5)
+            .is_empty());
+        assert!(engine.largest_files(3).is_empty());
+    }
+
+    #[test]
+    fn fake_scan_exposes_dir_tree() {
+        let (engine, _home) = fake_engine();
+        scan_fs(&engine);
+
+        let root = engine.dir_root().expect("dir tree after a Disk scan");
+        assert_eq!(root.path, "/Users/dev");
+
+        let children = engine.dir_children(root.path.clone());
+        assert!(!children.is_empty());
+        assert!(children
+            .iter()
+            .all(|c| c.path.starts_with(&root.path) && c.path != root.path));
+        assert!(children.windows(2).all(|w| w[0].alloc >= w[1].alloc));
+
+        assert!(engine.dir_entry("/nope".to_string()).is_none());
+
+        let leaf = children
+            .iter()
+            .find(|c| !c.has_children)
+            .expect("a leaf directory in the fake tree");
+        assert!(engine.dir_children(leaf.path.clone()).is_empty());
+
+        let subtree = engine.dir_subtree(root.path.clone(), 2, 5);
+        assert!(subtree.len() <= 5);
+
+        let largest = engine.largest_files(3);
+        assert!(largest.len() <= 3);
+        assert!(largest.windows(2).all(|w| w[0].alloc >= w[1].alloc));
     }
 }

@@ -6,7 +6,7 @@
 //! definition, mode dispatch, and the top-level `draw()`. The reducer itself
 //! is further split by concern:
 //! - `state.rs`: scan-event ingestion (`apply`, `begin_scan`, ...) and
-//!   section-status/baseline read-only queries.
+//!   section-status read-only queries.
 //! - `view.rs`: read-only row/selection queries (sort, filter, tree
 //!   flattening, "what's under the cursor").
 //! - `nav.rs`: cursor movement, section switching, and the Normal/Filter/Help
@@ -22,6 +22,8 @@
 //! ctrl-c, which always quits) do anything.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -35,7 +37,9 @@ use crate::ui::keys::Action;
 use crate::ui::layout::{self, DetailMode, Hit, RailMode, Viewport};
 use crate::ui::present::{CellCtx, SortSpec};
 use crate::ui::rows::{self, RowsView};
-use crate::ui::{activity, cleanup_view, confirm, detail, help, overview, sidebar, statusbar};
+use crate::ui::{
+    activity, browse, cleanup_view, confirm, detail, help, overview, sidebar, statusbar,
+};
 
 /// Per-section scan status shown in the sidebar.
 #[derive(Clone, Debug, PartialEq)]
@@ -70,6 +74,10 @@ pub enum Mode {
     Cleanup,
     /// The completion report of the last cleanup (`c` reopens it).
     Report,
+    /// Folder drill-down: `b` from Normal, or Enter on a Disk category
+    /// finding / the Overview's "Disk categories" list. Not modal — the
+    /// sidebar, statusbar, and mouse all keep working (see `nav.rs`).
+    Browse,
 }
 
 /// What the confirm dialog shows: the actions that passed the in-memory
@@ -119,6 +127,13 @@ pub struct AppState {
     /// Findings per section, upserted by stable id (last write wins — this is the
     /// invariant that makes deferred size updates correct).
     pub(super) findings: HashMap<ScannerId, BTreeMap<FindingId, Finding>>,
+    /// Directory trees from the last Disk walk, keyed by root; cleared when
+    /// the Disk section restarts.
+    pub(super) dir_trees: BTreeMap<PathBuf, Arc<crate::scan::walk::DirTree>>,
+    /// Folder drill-down cursor/sort/breadcrumb, live only while `mode ==
+    /// Mode::Browse` but kept around otherwise so leaving and re-entering
+    /// Browse (without navigating) reopens where it left off.
+    pub(super) browse: browse::BrowseState,
     pub(super) status: HashMap<ScannerId, SectionStatus>,
     pub(super) marked: HashSet<FindingId>,
 
@@ -174,10 +189,6 @@ pub struct AppState {
     pub(super) delete_mode: DeleteMode,
     pub(crate) activity: Vec<String>,
 
-    /// Per-section baseline (count, reclaimable bytes) from the most recent
-    /// snapshot at startup, used to render "Δ since last snapshot" badges.
-    pub(super) baseline: HashMap<ScannerId, (usize, u64)>,
-
     /// Per-section generation whose events we accept (exact match — see
     /// `apply`). Absent ⇒ no scan has been requested for that section yet;
     /// its events are dropped.
@@ -212,6 +223,8 @@ impl Default for AppState {
             .collect();
         AppState {
             findings: HashMap::new(),
+            dir_trees: BTreeMap::new(),
+            browse: browse::BrowseState::default(),
             status,
             marked: HashSet::new(),
             selected_section: 0,
@@ -234,7 +247,6 @@ impl Default for AppState {
             brew_version: 0,
             delete_mode: DeleteMode::Trash,
             activity: Vec::new(),
-            baseline: HashMap::new(),
             expected_gen: HashMap::new(),
             tick: 0,
             should_quit: false,
@@ -260,6 +272,7 @@ impl AppState {
             Mode::Preview => self.handle_preview(action),
             Mode::Cleanup => self.handle_cleanup(action),
             Mode::Report => self.handle_report(action),
+            Mode::Browse => self.handle_browse(action),
         }
     }
 
@@ -298,9 +311,12 @@ impl AppState {
             .split(cols[1]);
 
         // The Overview has no selectable rows, so a detail pane there would
-        // only squeeze its cards.
+        // only squeeze its cards — except in Browse, which is never the
+        // Overview's own view but always wants its detail pane when there's
+        // room.
         let show_detail = vp.detail_visible
-            && registry::section(self.selected_section_id()).view != ViewKind::Overview;
+            && (self.mode == Mode::Browse
+                || registry::section(self.selected_section_id()).view != ViewKind::Overview);
         if show_detail {
             let split = Layout::default()
                 .direction(Direction::Horizontal)
@@ -308,18 +324,22 @@ impl AppState {
                 .split(main[0]);
             self.draw_main_panel(frame, split[0], vp);
             vp.push(split[1], Hit::Detail);
-            let chosen = self
-                .selected_finding()
-                .and_then(|f| self.remedy_choice_for(f.id));
-            detail::draw(
-                frame,
-                split[1],
-                self.selected_finding(),
-                self.selected_section_id(),
-                self.delete_mode,
-                self.detail_scroll,
-                chosen,
-            );
+            if self.mode == Mode::Browse {
+                browse::draw_detail(self, frame, split[1]);
+            } else {
+                let chosen = self
+                    .selected_finding()
+                    .and_then(|f| self.remedy_choice_for(f.id));
+                detail::draw(
+                    frame,
+                    split[1],
+                    self.selected_finding(),
+                    self.selected_section_id(),
+                    self.delete_mode,
+                    self.detail_scroll,
+                    chosen,
+                );
+            }
         } else {
             self.draw_main_panel(frame, main[0], vp);
         }
@@ -350,6 +370,10 @@ impl AppState {
         let id = self.selected_section_id();
         let section = registry::section(id);
         vp.push(area, Hit::MainPanel);
+        if self.mode == Mode::Browse {
+            browse::draw(self, frame, area, vp);
+            return;
+        }
         if section.view == ViewKind::Overview {
             overview::draw(self, frame, area, vp);
             return;

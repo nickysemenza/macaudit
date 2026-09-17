@@ -7,8 +7,7 @@
 //! phone: the only remedy is an `ideviceinstaller uninstall` command copied to
 //! the clipboard. The tools are optional Homebrew formulae, so every way the
 //! scan can come up empty — tools missing, no device, device locked or not
-//! trusted — is one Info finding, never a failed section. Those status rows
-//! are `Ephemeral` so plugging the phone in and out does not churn history.
+//! trusted — is one Info finding, never a failed section.
 
 use std::time::Duration;
 
@@ -261,9 +260,7 @@ fn outcome_text(o: &CmdOutcome) -> String {
 }
 
 fn status(key: &str, title: &str) -> Finding {
-    Finding::new(FindingKind::IosDevice, key, title)
-        .severity(Severity::Info)
-        .ephemeral()
+    Finding::new(FindingKind::IosDevice, key, title).severity(Severity::Info)
 }
 
 fn copy_remedy(label: &str, text: &str) -> Remedy {
@@ -355,8 +352,6 @@ pub(crate) fn app_finding(udid: &str, info: &DeviceInfo, app: &AppUsage) -> Find
         "device": info.name,
         "bundle_id": app.bundle_id,
         "app_type": app.app_type,
-        // Not `version`: that key is a tracked snapshot field and every
-        // auto-update would show up as a change.
         "app_version": app.version,
         "static_bytes": app.static_bytes,
         "dynamic_bytes": app.dynamic_bytes,
@@ -433,7 +428,7 @@ fn parse_apps(xml: &[u8]) -> Vec<AppUsage> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ScanEvent, SnapshotPolicy};
+    use crate::model::ScanEvent;
     use crate::runner::MockCommandRunner;
 
     const UDID: &str = "00008150-001915442138401C";
@@ -498,7 +493,6 @@ mod tests {
         let f = &findings[0];
         assert_eq!(f.kind, FindingKind::IosDevice);
         assert_eq!(f.severity, Severity::Info);
-        assert_eq!(f.snapshot_policy, SnapshotPolicy::Ephemeral);
         assert_eq!(f.title, "libimobiledevice not installed");
         assert_eq!(copied_text(f), vec![INSTALL_ALL]);
         assert!(f.remedies.iter().all(|r| !r.destructive));
@@ -510,7 +504,6 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].title, "No iOS device connected");
         assert!(findings[0].remedies.is_empty());
-        assert_eq!(findings[0].snapshot_policy, SnapshotPolicy::Ephemeral);
     }
 
     #[tokio::test]
@@ -549,7 +542,6 @@ mod tests {
         let status = &findings[1];
         assert!(status.title.contains("ideviceinstaller not installed"));
         assert_eq!(copied_text(status), vec![INSTALL_LISTER]);
-        assert_eq!(status.snapshot_policy, SnapshotPolicy::Ephemeral);
     }
 
     #[tokio::test]
@@ -565,7 +557,6 @@ mod tests {
         let last = findings.last().unwrap();
         assert_eq!(last.kind, FindingKind::IosDevice);
         assert_eq!(last.id, findings[0].id, "re-emit must upsert the same row");
-        assert_eq!(last.snapshot_policy, SnapshotPolicy::Durable);
         assert_eq!(last.title, "Nicky iPhone · iPhone18,1 · iOS 27.0");
 
         let apps: Vec<&Finding> = findings
@@ -573,9 +564,6 @@ mod tests {
             .filter(|f| f.kind == FindingKind::IosApp)
             .collect();
         assert_eq!(apps.len(), 4);
-        assert!(apps
-            .iter()
-            .all(|f| f.snapshot_policy == SnapshotPolicy::Durable));
         assert!(apps.iter().all(|f| f.meta.get("version").is_none()));
 
         let spotify = apps.iter().find(|f| f.title == "Spotify").unwrap();

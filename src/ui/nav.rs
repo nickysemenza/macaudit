@@ -2,8 +2,11 @@
 //! reducers. `Mode::Confirm`'s reducer (`handle_confirm`) lives in
 //! `marking.rs`, alongside the confirm-dialog planning it feeds.
 
-use crate::model::ScannerId;
+use std::path::PathBuf;
+
+use crate::model::{FindingKind, ScannerId};
 use crate::ui::app::{AppState, Mode, RescanRequest};
+use crate::ui::browse::{self, BrowseSort};
 use crate::ui::keys::Action;
 use crate::ui::layout::DetailMode;
 use crate::ui::rows::RenderRow;
@@ -49,8 +52,139 @@ impl AppState {
             Action::SortBy(col) => self.set_sort(self.presenter().click_sort(self.sort(), col)),
             Action::Char('H') => self.show_system = !self.show_system,
             Action::Char('?') => self.mode = Mode::Help,
+            Action::Char('b') => self.open_browse(),
+            Action::OpenBrowseCategory(i) => self.open_browse_at_category(i),
             _ => {}
         }
+    }
+
+    /// `Mode::Browse`: navigate the Disk section's directory trees.
+    /// Not modal — `?` still opens Help, but Esc/`q`/`b` return to Normal
+    /// rather than quitting (Browse is a view, not a confirmation gate).
+    pub(super) fn handle_browse(&mut self, action: Action) {
+        match action {
+            Action::CtrlC => self.should_quit = true,
+            Action::Esc | Action::Char('q') | Action::Char('b') => {
+                self.mode = Mode::Normal;
+                self.detail_scroll = 0;
+            }
+            Action::Up | Action::Char('k') => self.browse_move(-1),
+            Action::Down | Action::Char('j') => self.browse_move(1),
+            Action::PageUp => self.browse_move(-(self.viewport.page_size() as isize)),
+            Action::PageDown => self.browse_move(self.viewport.page_size() as isize),
+            Action::SelectRow(i) => self.browse_select_row(i),
+            Action::Enter | Action::Right | Action::Char('l') => self.browse_descend(),
+            Action::Backspace | Action::Left | Action::Char('h') => self.browse_up(),
+            Action::Char('s') => self.browse_toggle_sort(),
+            Action::Char('p') => self.toggle_detail(),
+            Action::Char('?') => self.mode = Mode::Help,
+            _ => {}
+        }
+    }
+
+    /// `b` (Normal mode): open Browse at the first loaded tree's root. With
+    /// no Disk tree yet (no scan has finished), log an activity line and
+    /// stay in Normal rather than opening an empty/panicking view.
+    fn open_browse(&mut self) {
+        let Some(root) = self.dir_trees.keys().next().cloned() else {
+            self.push_activity("disk tree not ready — scan Disk first".to_string());
+            return;
+        };
+        self.enter_browse(root);
+    }
+
+    /// Overview click on a "Disk categories" row: open Browse at that
+    /// category's path.
+    fn open_browse_at_category(&mut self, i: usize) {
+        if let Some(path) = self.disk_categories().get(i).and_then(|f| f.path.clone()) {
+            self.open_browse_at_path(path);
+        }
+    }
+
+    /// Enter Browse at `path` if some loaded tree resolves it, else log the
+    /// same "not ready" activity line `open_browse` does.
+    fn open_browse_at_path(&mut self, path: PathBuf) {
+        if browse::node_at(&self.dir_trees, &path).is_none() {
+            self.push_activity("disk tree not ready — scan Disk first".to_string());
+            return;
+        }
+        self.enter_browse(path);
+    }
+
+    fn enter_browse(&mut self, path: PathBuf) {
+        self.browse.path = path;
+        self.browse.cursor = 0;
+        self.browse.sort = BrowseSort::Size;
+        self.browse.stack.clear();
+        self.mode = Mode::Browse;
+        self.detail_scroll = 0;
+    }
+
+    fn browse_entries_len(&self) -> usize {
+        browse::node_at(&self.dir_trees, &self.browse.path)
+            .map(|n| browse::entries(n, self.browse.sort).len())
+            .unwrap_or(0)
+    }
+
+    fn browse_move(&mut self, delta: isize) {
+        let n = self.browse_entries_len();
+        self.browse.cursor = if n == 0 {
+            0
+        } else {
+            (self.browse.cursor as isize + delta).clamp(0, n as isize - 1) as usize
+        };
+    }
+
+    fn browse_select_row(&mut self, row: usize) {
+        let n = self.browse_entries_len();
+        self.browse.cursor = row.min(n.saturating_sub(1));
+    }
+
+    /// Enter the entry under the cursor, when it has subdirectories of its
+    /// own — a leaf directory (files only) has nothing to drill into, so
+    /// Enter there is a no-op; its stats are already in the detail pane.
+    fn browse_descend(&mut self) {
+        let Some(node) = browse::node_at(&self.dir_trees, &self.browse.path) else {
+            return;
+        };
+        let entries = browse::entries(node, self.browse.sort);
+        let Some(child) = entries.get(self.browse.cursor) else {
+            return;
+        };
+        if child.children.is_empty() {
+            return;
+        }
+        let child_path = self.browse.path.join(&child.name);
+        self.browse
+            .stack
+            .push((self.browse.path.clone(), self.browse.cursor));
+        self.browse.path = child_path;
+        self.browse.cursor = 0;
+    }
+
+    /// Backspace: pop the breadcrumb stack when we descended here through
+    /// Browse itself, else walk up the filesystem one component at a time —
+    /// but never past the tree root, since nothing above it was walked.
+    fn browse_up(&mut self) {
+        if let Some((parent, cursor)) = self.browse.stack.pop() {
+            self.browse.path = parent;
+            self.browse.cursor = cursor;
+            return;
+        }
+        if let Some(parent) = self.browse.path.parent() {
+            if browse::node_at(&self.dir_trees, parent).is_some() {
+                self.browse.path = parent.to_path_buf();
+                self.browse.cursor = 0;
+            }
+        }
+    }
+
+    fn browse_toggle_sort(&mut self) {
+        self.browse.sort = match self.browse.sort {
+            BrowseSort::Size => BrowseSort::Name,
+            BrowseSort::Name => BrowseSort::Size,
+        };
+        self.browse.cursor = 0;
     }
 
     /// `Mode::Help`: only closing keys (and ctrl-c, handled above every
@@ -221,7 +355,8 @@ impl AppState {
         }
     }
 
-    /// Enter: "activate" the row — a group header folds/unfolds, a leaf opens
+    /// Enter: "activate" the row — a group header folds/unfolds, a Disk
+    /// category finding opens Browse at its path, and any other leaf opens
     /// the detail pane (forcing it on even below the auto-show width).
     fn on_enter(&mut self) {
         if self.is_tree_view() {
@@ -233,6 +368,16 @@ impl AppState {
             if let Some((key, _)) = self.node_at_cursor() {
                 self.toggle_node(key);
                 return;
+            }
+        }
+        if self.selected_section_id() == ScannerId::Fs {
+            if let Some(f) = self.selected_finding() {
+                if f.kind == FindingKind::DiskCategory {
+                    if let Some(path) = f.path.clone() {
+                        self.open_browse_at_path(path);
+                        return;
+                    }
+                }
             }
         }
         self.detail_mode = DetailMode::ForceOn;
@@ -257,10 +402,23 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use crate::fake;
+    use crate::model::{ScanEvent, ScannerId};
     use crate::ui::app::{AppState, Mode};
     use crate::ui::keys::Action;
     use crate::ui::layout::DetailMode;
     use crate::ui::testutil::*;
+
+    fn apply_fake_tree(app: &mut AppState) {
+        app.apply(ScanEvent::DirTree {
+            scanner: ScannerId::Fs,
+            gen: 1,
+            tree: Arc::new(fake::dir_tree()),
+        });
+    }
 
     #[test]
     fn tab_and_backtab_cycle_sections() {
@@ -515,5 +673,94 @@ mod tests {
         app.detail_scroll = 15;
         app.handle(Action::Char('p')); // toggles the detail pane
         assert_eq!(app.detail_scroll, 0, "toggling detail resets scroll");
+    }
+
+    #[test]
+    fn b_enters_browse_only_once_a_tree_exists() {
+        let mut app = app_with_gen(1);
+        app.handle(Action::Char('b'));
+        assert_eq!(app.mode, Mode::Normal, "no tree yet: stays in Normal");
+        assert!(
+            app.activity.iter().any(|l| l.contains("not ready")),
+            "should explain why nothing happened"
+        );
+
+        apply_fake_tree(&mut app);
+        app.handle(Action::Char('b'));
+        assert_eq!(app.mode, Mode::Browse);
+        assert_eq!(app.browse.path, PathBuf::from("/Users/dev"));
+    }
+
+    #[test]
+    fn descend_pushes_the_stack_and_backspace_pops_it() {
+        let mut app = app_with_gen(1);
+        apply_fake_tree(&mut app);
+        app.handle(Action::Char('b'));
+        let root = app.browse.path.clone();
+
+        app.handle(Action::Enter); // cursor starts on the biggest child
+        assert_ne!(app.browse.path, root, "should have descended");
+        assert_eq!(app.browse.stack.len(), 1);
+        assert_eq!(app.browse.cursor, 0);
+
+        app.handle(Action::Backspace);
+        assert_eq!(app.browse.path, root, "backspace restores the parent");
+        assert!(app.browse.stack.is_empty());
+
+        // Above the tree root, backspace has nowhere to go and is a no-op.
+        app.handle(Action::Backspace);
+        assert_eq!(app.browse.path, root);
+        assert_eq!(app.mode, Mode::Browse);
+    }
+
+    #[test]
+    fn esc_and_q_return_to_normal_without_quitting_from_browse() {
+        let mut app = app_with_gen(1);
+        apply_fake_tree(&mut app);
+
+        app.handle(Action::Char('b'));
+        assert_eq!(app.mode, Mode::Browse);
+        app.handle(Action::Esc);
+        assert_eq!(app.mode, Mode::Normal, "esc leaves Browse");
+        assert!(!app.should_quit, "esc must not quit from Browse");
+
+        app.handle(Action::Char('b'));
+        assert_eq!(app.mode, Mode::Browse);
+        app.handle(Action::Char('q'));
+        assert_eq!(app.mode, Mode::Normal, "q leaves Browse");
+        assert!(!app.should_quit, "q must not quit from Browse");
+
+        // q still quits once we're back in Normal.
+        app.handle(Action::Char('q'));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn enter_on_disk_category_finding_opens_browse_at_its_path() {
+        let mut app = app_with_gen(1);
+        let idx = crate::registry::REGISTRY
+            .iter()
+            .position(|s| s.id == ScannerId::Fs)
+            .unwrap();
+        app.handle(Action::JumpSection(idx));
+        for f in fake::fixtures(ScannerId::Fs) {
+            app.apply(ScanEvent::Finding {
+                scanner: ScannerId::Fs,
+                gen: 1,
+                finding: Box::new(f),
+            });
+        }
+        apply_fake_tree(&mut app);
+
+        let row = app
+            .rows_titles()
+            .iter()
+            .position(|t| t.as_deref() == Some("Development"))
+            .expect("the Development DiskCategory row is present");
+        app.handle(Action::SelectRow(row));
+        app.handle(Action::Enter);
+
+        assert_eq!(app.mode, Mode::Browse);
+        assert_eq!(app.browse.path, PathBuf::from("/Users/dev/dev"));
     }
 }

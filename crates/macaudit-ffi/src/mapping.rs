@@ -6,7 +6,7 @@
 //! no fixed shape to mirror. Paths cross as strings (UniFFI has no path type).
 
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use macaudit::brewgraph::RemovalPreview;
 use macaudit::cleanup::{self, PreflightReport};
@@ -14,7 +14,7 @@ use macaudit::config::DeleteMode as CoreDeleteMode;
 use macaudit::model::{self, FindingId, ScannerId};
 use macaudit::registry::{self, ViewKind as CoreViewKind};
 use macaudit::remedy::PlannedAction;
-use macaudit::snapshot;
+use macaudit::scan::walk::{BigFile, DirNodeSummary};
 
 /// One sidebar section; mirrors `ScannerId`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, uniffi::Enum)]
@@ -306,7 +306,6 @@ pub struct Finding {
     pub last_used: Option<SystemTime>,
     pub severity: Severity,
     pub remedies: Vec<Remedy>,
-    pub ephemeral: bool,
     pub provenance: Option<String>,
     pub coverage: Option<String>,
     /// Scanner-specific extras as a JSON document (`{}` when absent).
@@ -327,7 +326,6 @@ impl From<&model::Finding> for Finding {
             last_used: f.last_used,
             severity: f.severity.into(),
             remedies: f.remedies.iter().map(Remedy::from).collect(),
-            ephemeral: f.snapshot_policy == model::SnapshotPolicy::Ephemeral,
             provenance: f.provenance.clone(),
             coverage: f.coverage.clone(),
             meta_json: if f.meta.is_null() {
@@ -398,11 +396,6 @@ pub enum ScanEvent {
     Enriched {
         gen: u64,
         findings: Vec<Finding>,
-    },
-    /// A full scan completed and was persisted (or not — see `message`).
-    SnapshotSaved {
-        id: Option<i64>,
-        message: String,
     },
 }
 
@@ -595,116 +588,73 @@ impl From<cleanup::ExecEvent> for ExecEvent {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct SnapshotMeta {
-    pub id: i64,
-    pub created_at: SystemTime,
-    pub machine: String,
-    pub finding_count: u64,
-    pub total_bytes: u64,
-}
-
-impl From<&snapshot::SnapshotMeta> for SnapshotMeta {
-    fn from(m: &snapshot::SnapshotMeta) -> Self {
-        SnapshotMeta {
-            id: m.id,
-            created_at: UNIX_EPOCH + Duration::from_secs(m.created_at.max(0) as u64),
-            machine: m.machine.clone(),
-            finding_count: m.finding_count.max(0) as u64,
-            total_bytes: m.total_bytes.max(0) as u64,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct GrownFinding {
-    pub finding: Finding,
-    pub old_bytes: u64,
-    pub new_bytes: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct FindingChange {
-    pub finding: Finding,
-    pub field: String,
-    pub old: String,
-    pub new: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct SnapshotDiff {
-    pub added: Vec<Finding>,
-    pub removed: Vec<Finding>,
-    pub grown: Vec<GrownFinding>,
-    pub changed: Vec<FindingChange>,
-}
-
-impl From<snapshot::SnapshotDiff> for SnapshotDiff {
-    fn from(d: snapshot::SnapshotDiff) -> Self {
-        SnapshotDiff {
-            added: findings(d.added),
-            removed: findings(d.removed),
-            grown: d
-                .grown
-                .iter()
-                .map(|(f, old, new)| GrownFinding {
-                    finding: f.into(),
-                    old_bytes: *old,
-                    new_bytes: *new,
-                })
-                .collect(),
-            changed: d
-                .changed
-                .iter()
-                .map(|c| FindingChange {
-                    finding: (&c.finding).into(),
-                    field: c.field.clone(),
-                    old: c.old.clone(),
-                    new: c.new.clone(),
-                })
-                .collect(),
-        }
-    }
-}
-
-/// One section's totals in one snapshot — the history chart's input.
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct SectionHistoryPoint {
-    pub snapshot_id: i64,
-    pub created_at: SystemTime,
-    pub section: SectionId,
-    pub finding_count: u64,
-    pub total_bytes: u64,
-    pub reclaimable_bytes: u64,
-}
-
-impl From<&snapshot::SectionTotals> for SectionHistoryPoint {
-    fn from(t: &snapshot::SectionTotals) -> Self {
-        SectionHistoryPoint {
-            snapshot_id: t.snapshot_id,
-            created_at: UNIX_EPOCH + Duration::from_secs(t.created_at.max(0) as u64),
-            section: t.section.into(),
-            finding_count: t.finding_count.max(0) as u64,
-            total_bytes: t.total_bytes.max(0) as u64,
-            reclaimable_bytes: t.reclaimable_bytes.max(0) as u64,
-        }
-    }
-}
-
-/// Per-section counts from the latest saved snapshot, for Δ badges.
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct SectionBaseline {
-    pub section: SectionId,
-    pub finding_count: u64,
-    pub reclaimable_bytes: u64,
-}
-
 pub fn finding_id(id: u64) -> FindingId {
     FindingId(id)
 }
 
 fn path_string(p: &Path) -> String {
     p.to_string_lossy().into_owned()
+}
+
+/// One of a directory's largest own files (absolute path).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct TopFile {
+    pub path: String,
+    pub alloc: u64,
+}
+
+impl From<&BigFile> for TopFile {
+    fn from(f: &BigFile) -> Self {
+        TopFile {
+            path: path_string(&f.path),
+            alloc: f.alloc,
+        }
+    }
+}
+
+/// One directory in the Disk tree, flat (no nested children) — the UI
+/// queries one level at a time via `Engine::dir_children`/`dir_subtree`.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct DirEntry {
+    pub path: String,
+    pub name: String,
+    pub alloc: u64,
+    pub apparent: u64,
+    pub files: u64,
+    pub dirs: u64,
+    pub errors: u64,
+    /// Whether this directory has any subdirectories (`child_count > 0`).
+    pub has_children: bool,
+    /// Largest own files, largest first.
+    pub top_files: Vec<TopFile>,
+}
+
+impl From<&DirNodeSummary> for DirEntry {
+    fn from(s: &DirNodeSummary) -> Self {
+        DirEntry {
+            path: path_string(&s.path),
+            name: s.name.clone(),
+            alloc: s.alloc,
+            apparent: s.apparent,
+            files: s.files,
+            dirs: s.dirs,
+            errors: s.errors,
+            has_children: s.child_count > 0,
+            top_files: s.top_files.iter().map(TopFile::from).collect(),
+        }
+    }
+}
+
+/// Summary counters for one walked root — the Disk section's header/status.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct DirTreeStats {
+    pub root: String,
+    pub files: u64,
+    pub dirs: u64,
+    pub bytes: u64,
+    pub errors: u64,
+    pub complete: bool,
+    pub elapsed_ms: u64,
 }
 
 #[cfg(test)]
@@ -823,5 +773,48 @@ mod tests {
                 other => panic!("variant changed shape: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn dir_entry_maps_field_by_field() {
+        let summary = DirNodeSummary {
+            name: "dev".to_string(),
+            path: std::path::PathBuf::from("/Users/dev/dev"),
+            alloc: 45 * 1024 * 1024 * 1024,
+            apparent: 45 * 1024 * 1024 * 1024,
+            files: 16_210,
+            dirs: 2_222,
+            errors: 3,
+            top_files: vec![
+                BigFile {
+                    path: std::path::PathBuf::from("/Users/dev/dev/.zsh_history"),
+                    alloc: 180 * 1024,
+                },
+                BigFile {
+                    path: std::path::PathBuf::from("/Users/dev/dev/Cargo.lock"),
+                    alloc: 90 * 1024,
+                },
+            ],
+            child_count: 4,
+            children: Vec::new(),
+        };
+        let entry = DirEntry::from(&summary);
+        assert_eq!(entry.path, "/Users/dev/dev");
+        assert_eq!(entry.name, "dev");
+        assert_eq!(entry.alloc, summary.alloc);
+        assert_eq!(entry.apparent, summary.apparent);
+        assert_eq!(entry.files, summary.files);
+        assert_eq!(entry.dirs, summary.dirs);
+        assert_eq!(entry.errors, summary.errors);
+        assert!(entry.has_children);
+        assert_eq!(entry.top_files.len(), 2);
+        assert_eq!(entry.top_files[0].path, "/Users/dev/dev/.zsh_history");
+        assert_eq!(entry.top_files[0].alloc, 180 * 1024);
+        assert_eq!(entry.top_files[1].path, "/Users/dev/dev/Cargo.lock");
+        assert_eq!(entry.top_files[1].alloc, 90 * 1024);
+
+        let mut leaf = summary;
+        leaf.child_count = 0;
+        assert!(!DirEntry::from(&leaf).has_children);
     }
 }

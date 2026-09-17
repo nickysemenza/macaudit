@@ -13,6 +13,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::registry;
 use crate::ui::app::{AppState, Mode};
+use crate::ui::browse::BrowseSort;
 use crate::ui::fmt;
 use crate::ui::keys::Action;
 use crate::ui::layout::{Hit, RailMode, Viewport};
@@ -32,6 +33,23 @@ fn hints(app: &AppState) -> Vec<(&'static str, String, Action)> {
         ("H", "sys-apps".into(), Action::Char('H')),
         ("?", "help".into(), Action::Char('?')),
         ("q", "quit".into(), Action::Char('q')),
+    ]
+}
+
+/// Key hints for `Mode::Browse` — a different surface (no marking/exec/
+/// filter here), so it gets its own hint set rather than reusing `hints`.
+fn browse_hints(app: &AppState) -> Vec<(&'static str, String, Action)> {
+    let sort = match app.browse.sort {
+        BrowseSort::Size => "size",
+        BrowseSort::Name => "name",
+    };
+    vec![
+        ("⏎", "open".into(), Action::Enter),
+        ("⌫", "up".into(), Action::Backspace),
+        ("s", format!("sort:{sort}"), Action::Char('s')),
+        ("p", "detail".into(), Action::Char('p')),
+        ("b", "back".into(), Action::Char('b')),
+        ("?", "help".into(), Action::Char('?')),
     ]
 }
 
@@ -71,7 +89,12 @@ pub fn draw(app: &AppState, frame: &mut Frame, area: Rect, rail: RailMode, vp: &
     }
     spans.push(Span::styled(" ", base));
     x += 1;
-    for (key, label, action) in hints(app) {
+    let hint_list = if app.mode == Mode::Browse {
+        browse_hints(app)
+    } else {
+        hints(app)
+    };
+    for (key, label, action) in hint_list {
         let w = (key.width() + 1 + label.width()) as u16;
         if x + w > bar[0].right() {
             break;

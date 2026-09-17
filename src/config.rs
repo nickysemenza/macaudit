@@ -2,7 +2,7 @@
 //!
 //! `Paths` is the **single** place that reads the environment for HOME. Every
 //! scanner resolves user paths through it, so tests can redirect the whole tool
-//! at a fixture HOME by setting `$MACAUDIT_HOME` (spec §10). No scanner should
+//! at a fixture HOME by setting `$MACAUDIT_HOME` (spec §9). No scanner should
 //! read `$HOME` or use `directories` directly.
 
 use std::path::{Path, PathBuf};
@@ -95,11 +95,6 @@ impl Paths {
     /// Path to the config file.
     pub fn config_file(&self) -> PathBuf {
         self.config_dir.join("config.toml")
-    }
-
-    /// Path to the snapshot history database.
-    pub fn history_db(&self) -> PathBuf {
-        self.state_dir.join("history.db")
     }
 
     /// Adopt the login shell's PATH into this process, returning the entries
@@ -412,10 +407,6 @@ mod tests {
         assert_eq!(
             p.config_file(),
             PathBuf::from("/tmp/fixture/.config/macaudit/config.toml")
-        );
-        assert_eq!(
-            p.history_db(),
-            PathBuf::from("/tmp/fixture/.local/state/macaudit/history.db")
         );
     }
 

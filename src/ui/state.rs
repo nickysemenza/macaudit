@@ -1,14 +1,14 @@
-//! Scan-event ingestion and section-status/baseline bookkeeping: the
-//! reducer's "what did the scanners report" half. `apply`, `begin_scan`, and
-//! `apply_enriched` are the sole mutation paths for `findings` — upsert-by-id
-//! keeps sizes/dedup correct. The read-only helpers here (`status_of`,
+//! Scan-event ingestion and section-status bookkeeping: the reducer's "what
+//! did the scanners report" half. `apply`, `begin_scan`, and `apply_enriched`
+//! are the sole mutation paths for `findings` — upsert-by-id keeps
+//! sizes/dedup correct. The read-only helpers here (`status_of`,
 //! `section_count`, ...) back the sidebar, the Resource Health overview, and
-//! the run loop's snapshot/rescan bookkeeping.
+//! the run loop's rescan bookkeeping.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use crate::config::DeleteMode;
-use crate::model::{Finding, FindingId, ScanEvent, ScannerId, Severity};
+use crate::model::{Finding, FindingId, FindingKind, ScanEvent, ScannerId, Severity};
 use crate::ui::app::{AppState, SectionStatus};
 
 pub use crate::correlate::CORRELATED_SECTIONS;
@@ -24,28 +24,6 @@ impl AppState {
         self.delete_mode = mode;
     }
 
-    /// Install the per-section baseline (count, reclaimable bytes) from the most
-    /// recent snapshot so the sidebar can show Δ badges.
-    pub fn set_baseline(&mut self, baseline: HashMap<ScannerId, (usize, u64)>) {
-        self.baseline = baseline;
-    }
-
-    /// Δ in reclaimable bytes for a section vs the last snapshot, if a baseline
-    /// exists and the section has finished scanning. `None` ⇒ no badge.
-    pub(crate) fn section_reclaimable_delta(&self, id: ScannerId) -> Option<i64> {
-        if !matches!(self.status_of(id), SectionStatus::Done { .. }) {
-            return None;
-        }
-        let (_, base) = self.baseline.get(&id)?;
-        let now = self.section_reclaimable(id);
-        let delta = now as i64 - *base as i64;
-        if delta == 0 {
-            None
-        } else {
-            Some(delta)
-        }
-    }
-
     /// Which section currently holds a finding, for post-remedy targeted rescan.
     pub fn section_of(&self, id: FindingId) -> Option<ScannerId> {
         self.findings
@@ -54,7 +32,7 @@ impl AppState {
             .map(|(s, _)| *s)
     }
 
-    /// A flat snapshot of every current finding, keyed by id — for `snapshot save`.
+    /// A flat copy of every current finding, keyed by id.
     pub fn all_findings(&self) -> BTreeMap<FindingId, Finding> {
         let mut out = BTreeMap::new();
         for m in self.findings.values() {
@@ -63,21 +41,6 @@ impl AppState {
             }
         }
         out
-    }
-
-    /// Whether every section in `sections` has reached a terminal status
-    /// (Done or Failed) — i.e. the scan is complete.
-    pub fn scan_complete(&self, sections: &[ScannerId]) -> bool {
-        self.sections_terminal(sections)
-    }
-
-    /// Sections among `sections` whose latest scan FAILED.
-    pub fn failed_sections(&self, sections: &[ScannerId]) -> Vec<ScannerId> {
-        sections
-            .iter()
-            .copied()
-            .filter(|id| matches!(self.status_of(*id), SectionStatus::Failed { .. }))
-            .collect()
     }
 
     /// Whether every listed section is Done or Failed.
@@ -90,7 +53,7 @@ impl AppState {
         })
     }
 
-    /// A merged snapshot of the correlated section maps — the input to both
+    /// A merged copy of the correlated section maps — the input to both
     /// sync correlation and the async network-enrichment task.
     pub fn apps_brew_findings(&self) -> BTreeMap<FindingId, Finding> {
         let mut merged: BTreeMap<FindingId, Finding> = BTreeMap::new();
@@ -108,8 +71,7 @@ impl AppState {
     /// equivalent of the headless path's `correlate()` call): merge the Apps +
     /// Brew section maps, correlate, write mutated findings back to their
     /// sections. Sync and cheap (hundreds of items); call once both sections
-    /// are terminal so cask labels appear in the TUI and in auto-saved
-    /// snapshots.
+    /// are terminal so cask labels appear in the TUI.
     pub fn correlate_now(&mut self) {
         let mut merged = self.apps_brew_findings();
         if merged.is_empty() {
@@ -159,6 +121,9 @@ impl AppState {
         match ev {
             ScanEvent::Started { scanner, .. } => {
                 self.findings.entry(scanner).or_default().clear();
+                if scanner == ScannerId::Fs {
+                    self.dir_trees.clear();
+                }
                 if scanner == ScannerId::Brew {
                     self.brew_version += 1;
                 }
@@ -205,6 +170,9 @@ impl AppState {
             ScanEvent::Failed { scanner, error, .. } => {
                 self.status.insert(scanner, SectionStatus::Failed { error });
                 self.drop_stale_marks(scanner);
+            }
+            ScanEvent::DirTree { tree, .. } => {
+                self.dir_trees.insert(tree.root.clone(), tree);
             }
         }
     }
@@ -297,6 +265,16 @@ impl AppState {
             .get(&id)
             .map(|m| m.values().collect())
             .unwrap_or_default()
+    }
+
+    /// The Disk section's `DiskCategory` findings, in their section order —
+    /// the source for both the Overview's "Disk categories" list and its
+    /// click-to-Browse indices (`Hit::OverviewCategory`).
+    pub(crate) fn disk_categories(&self) -> Vec<&Finding> {
+        self.overview_findings(ScannerId::Fs)
+            .into_iter()
+            .filter(|f| f.kind == FindingKind::DiskCategory)
+            .collect()
     }
 
     pub(crate) fn marked_total(&self) -> (usize, u64) {
