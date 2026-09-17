@@ -52,6 +52,13 @@ fn build_fixture_home() -> tempfile::TempDir {
     std::fs::write(dev_proj.join("package.json"), r#"{"name":"proj"}"#).unwrap();
     std::fs::write(dev_proj.join("main.js"), "console.log(2)\n").unwrap();
 
+    // The Disk walk defaults to the whole boot volume; pin it to the fixture
+    // so the test neither walks the real disk nor sees the real system
+    // categories.
+    let config_dir = root.join(".config/macaudit");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(config_dir.join("config.toml"), "[scan]\nroots = [\"~\"]\n").unwrap();
+
     home
 }
 

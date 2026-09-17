@@ -277,7 +277,7 @@ pub fn draw_detail(app: &AppState, frame: &mut Frame, area: Rect) {
         (node, app.browse.path.clone())
     } else {
         let idx = app.browse.cursor.min(kids.len() - 1);
-        (kids[idx], app.browse.path.join(&kids[idx].name))
+        (kids[idx], app.browse.path.join(&*kids[idx].name))
     };
     let fields = detail_fields(app, target, &path);
     let inner_width = block.inner(area).width;
@@ -291,7 +291,7 @@ pub fn draw_detail(app: &AppState, frame: &mut Frame, area: Rect) {
 fn detail_fields(app: &AppState, node: &DirNode, path: &Path) -> Vec<Field> {
     let mut fields = vec![
         Field::Header(""),
-        Field::Text(node.name.clone()),
+        Field::Text(node.name.to_string()),
         Field::Blank,
         kv("Allocated", fmt::bytes(node.alloc)),
         kv("Apparent", fmt::bytes(node.apparent)),
@@ -304,11 +304,17 @@ fn detail_fields(app: &AppState, node: &DirNode, path: &Path) -> Vec<Field> {
         kv("Unreadable", "0")
     });
 
-    if !node.top_files.is_empty() {
+    // Listed live (one directory, no recursion) rather than kept in the tree.
+    let top = crate::scan::walk::top_files_in(path, 3);
+    if !top.is_empty() {
         fields.push(Field::Blank);
         fields.push(Field::Header("Largest files"));
-        for (name, size) in &node.top_files {
-            fields.push(kv(fmt::bytes(*size), name.clone()));
+        for f in &top {
+            let name = f
+                .path
+                .file_name()
+                .map_or_else(|| f.path.to_string_lossy(), |n| n.to_string_lossy());
+            fields.push(kv(fmt::bytes(f.alloc), name.into_owned()));
         }
     }
 
@@ -364,11 +370,11 @@ mod tests {
     fn node_at_resolves_root_nested_and_outside() {
         let trees = trees();
         let root = PathBuf::from("/Users/dev");
-        assert_eq!(node_at(&trees, &root).unwrap().name, "/Users/dev");
+        assert_eq!(&*node_at(&trees, &root).unwrap().name, "/Users/dev");
 
         let nested = root.join("dev/cubby");
         let node = node_at(&trees, &nested).expect("nested path resolves");
-        assert_eq!(node.name, "cubby");
+        assert_eq!(&*node.name, "cubby");
 
         assert!(node_at(&trees, Path::new("/Users/other")).is_none());
     }

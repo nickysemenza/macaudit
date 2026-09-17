@@ -7,6 +7,7 @@ public protocol MacAuditEngine: AnyObject, Sendable {
     func sections() -> [SectionMeta]
     func deleteMode() -> DeleteMode
     func configPath() -> String
+    func fullDiskAccess() -> Bool
     @discardableResult
     func startScan(sections: [SectionId], listener: ScanListener) -> UInt64
     func cancelScan()
@@ -18,6 +19,7 @@ public protocol MacAuditEngine: AnyObject, Sendable {
     func dirEntry(path: String) -> DirEntry?
     func dirChildren(path: String) -> [DirEntry]
     func dirSubtree(path: String, depth: UInt32, maxNodes: UInt32) -> [DirEntry]
+    func dirTopFiles(path: String, n: UInt32) -> [TopFile]
     func largestFiles(n: UInt32) -> [TopFile]
     func dirTreeStats() -> DirTreeStats?
 }

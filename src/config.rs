@@ -64,9 +64,17 @@ impl Paths {
         }
     }
 
-    /// Default filesystem walk roots when config doesn't specify any.
+    /// Default project-indexing roots when config doesn't specify any.
     pub fn default_roots(&self) -> Vec<PathBuf> {
         vec![self.home.clone()]
+    }
+
+    /// Default Disk-walk roots when `[scan] roots` is empty: the whole boot
+    /// volume. Mount points are never crossed, so other volumes, the VM and
+    /// Preboot volumes and `/System/Volumes/Data` (reached through firmlinks
+    /// instead) stay out; `roots = ["~"]` restores a home-only walk.
+    pub fn default_disk_roots() -> Vec<PathBuf> {
+        vec![PathBuf::from("/")]
     }
 
     /// The `$PATH` of *this* process, split into entries. Kept here so the
@@ -206,7 +214,8 @@ pub struct ToolsConfig {
     /// Opt in to aggregated shell-history evidence (counts and last-used
     /// dates per command only — raw history lines are never stored or shown).
     pub shell_history_evidence: bool,
-    /// Repository roots to correlate against. Empty ⇒ `scan.roots` ⇒ `[home]`.
+    /// Repository roots to correlate against. Empty ⇒ `scan.roots` ⇒ `[home]`
+    /// (the project indexer never defaults to the whole disk).
     pub project_roots: Vec<String>,
     /// How deep below a root to look for project manifests.
     pub project_max_depth: usize,
@@ -294,7 +303,8 @@ impl Default for TimeMachineConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ScanConfig {
-    /// Filesystem walk roots (tilde-expanded at use). Empty ⇒ `[home]`.
+    /// Disk-walk roots (tilde-expanded at use). Empty ⇒ `["/"]`, the whole
+    /// boot volume; `["~"]` limits the Disk section to the home directory.
     pub roots: Vec<String>,
     /// Never descend into these (tilde-expanded).
     pub ignore: Vec<String>,

@@ -36,10 +36,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 /// One directory and the totals for everything beneath it.
+///
+/// Kept for every directory of the walked roots (~750 k on a full disk), so
+/// the layout is deliberately lean: boxed name and children (no `Vec`
+/// capacity slack) and no per-directory file list — the largest files in a
+/// directory are listed live by [`top_files_in`] when a view asks.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DirNode {
     /// The directory's own name — for the root, its full path.
-    pub name: String,
+    pub name: Box<str>,
     /// Allocated bytes of the whole subtree.
     pub alloc: u64,
     /// Apparent (logical) bytes of the whole subtree.
@@ -51,12 +56,9 @@ pub struct DirNode {
     /// Directories in the subtree that could not be read, plus entries the
     /// kernel could not stat — usually a missing Full Disk Access grant.
     pub errors: u64,
-    /// Largest files directly inside this directory, as `(name, alloc)`,
-    /// largest first.
-    pub top_files: Vec<(String, u64)>,
     /// Subdirectories, sorted by `alloc` descending then name. Empty when the
     /// walk ran with `keep_tree: false`.
-    pub children: Vec<DirNode>,
+    pub children: Box<[DirNode]>,
 }
 
 impl DirNode {
@@ -67,7 +69,7 @@ impl DirNode {
         let mut node = self;
         for component in rel.components() {
             let name = component.as_os_str().to_string_lossy();
-            node = node.children.iter().find(|c| c.name == name)?;
+            node = node.children.iter().find(|c| *c.name == *name)?;
         }
         Some(node)
     }
@@ -75,28 +77,20 @@ impl DirNode {
     /// A depth-limited, path-annotated copy of the subtree at `path`.
     fn summary(&self, path: &Path, depth: usize) -> DirNodeSummary {
         DirNodeSummary {
-            name: self.name.clone(),
+            name: self.name.to_string(),
             path: path.to_path_buf(),
             alloc: self.alloc,
             apparent: self.apparent,
             files: self.files,
             dirs: self.dirs,
             errors: self.errors,
-            top_files: self
-                .top_files
-                .iter()
-                .map(|(n, a)| BigFile {
-                    path: path.join(n),
-                    alloc: *a,
-                })
-                .collect(),
             child_count: self.children.len() as u64,
             children: if depth == 0 {
                 Vec::new()
             } else {
                 self.children
                     .iter()
-                    .map(|c| c.summary(&path.join(&c.name), depth - 1))
+                    .map(|c| c.summary(&path.join(&*c.name), depth - 1))
                     .collect()
             },
         }
@@ -121,8 +115,6 @@ pub struct DirNodeSummary {
     pub files: u64,
     pub dirs: u64,
     pub errors: u64,
-    /// Largest files directly inside, absolute paths, largest first.
-    pub top_files: Vec<BigFile>,
     /// Number of subdirectories, even when `children` is not expanded.
     pub child_count: u64,
     /// Expanded to the requested depth; empty beyond it.
@@ -204,8 +196,6 @@ pub enum DirAction {
     Descend(Flags),
     /// Do not list it; it contributes nothing.
     Skip,
-    /// Record it with these totals without listing it.
-    Opaque { alloc: u64, files: u64, dirs: u64 },
 }
 
 /// Per-directory hooks. Every rayon worker calls these concurrently.
@@ -245,8 +235,9 @@ pub struct WalkOptions {
     pub max_entries: Option<u64>,
     /// Keep `DirNode::children`; false rolls them up and drops them.
     pub keep_tree: bool,
-    /// Largest own files remembered per directory; 0 disables.
-    pub per_dir_top: usize,
+    /// Flags the root's own children are visited with — what the visitor
+    /// would have chosen for the root had it been a child of something.
+    pub root_flags: Flags,
     /// Size of the global largest-files heap; 0 disables.
     pub top_n: usize,
     /// Collect every loose file at least this large.
@@ -261,7 +252,7 @@ impl Default for WalkOptions {
             deadline: None,
             max_entries: None,
             keep_tree: true,
-            per_dir_top: 3,
+            root_flags: Flags::NONE,
             top_n: 0,
             threshold: None,
         }
@@ -300,7 +291,7 @@ impl WalkResult {
     fn empty(root: &Path, errors: u64) -> Self {
         WalkResult {
             root: DirNode {
-                name: root.to_string_lossy().into_owned(),
+                name: root.to_string_lossy().into(),
                 errors,
                 ..DirNode::default()
             },
@@ -388,8 +379,8 @@ pub fn walk(
         errors: AtomicU64::new(0),
     };
 
-    let mut node = walk.scan_listed(&resolved, first, Flags::NONE);
-    node.name = root.to_string_lossy().into_owned();
+    let mut node = walk.scan_listed(&resolved, first, walk.opts.root_flags);
+    node.name = root.to_string_lossy().into();
 
     let externally_linked = walk
         .links
@@ -484,8 +475,6 @@ impl Walk<'_> {
 
         let entries = listing.entries;
         let mut subdirs: Vec<(PathBuf, Flags)> = Vec::new();
-        let mut opaque: Vec<DirNode> = Vec::new();
-        let mut top: Vec<(String, u64)> = Vec::with_capacity(self.opts.per_dir_top + 1);
         let mut own_files = 0u64;
         let mut own_bytes = 0u64;
 
@@ -511,14 +500,6 @@ impl Walk<'_> {
                     match self.visitor.on_child_dir(path, e, &entries, flags) {
                         DirAction::Descend(f) => subdirs.push((child, f)),
                         DirAction::Skip => {}
-                        DirAction::Opaque { alloc, files, dirs } => opaque.push(DirNode {
-                            name: e.name.to_string_lossy().into_owned(),
-                            alloc,
-                            apparent: alloc,
-                            files,
-                            dirs,
-                            ..DirNode::default()
-                        }),
                     }
                 }
                 Kind::File | Kind::Other => {
@@ -545,10 +526,6 @@ impl Walk<'_> {
                     own_bytes += e.alloc;
                     node.apparent += e.apparent;
                     if e.kind == Kind::File {
-                        let name = e.name.to_string_lossy();
-                        if self.opts.per_dir_top > 0 {
-                            remember_top(&mut top, &name, e.alloc, self.opts.per_dir_top);
-                        }
                         if self.opts.top_n > 0
                             && !flags.contains(Flags::NO_TOP)
                             && e.alloc >= self.top_min.load(Ordering::Relaxed)
@@ -584,7 +561,6 @@ impl Walk<'_> {
 
         node.files = own_files;
         node.alloc = own_bytes;
-        node.top_files = top;
 
         // rayon's work stealing is what keeps every core busy on a tree whose
         // branches differ in size by four orders of magnitude.
@@ -592,7 +568,6 @@ impl Walk<'_> {
             .into_par_iter()
             .map(|(p, f)| self.scan_dir(&p, f))
             .collect();
-        children.extend(opaque);
         for c in &children {
             node.alloc += c.alloc;
             node.apparent += c.apparent;
@@ -601,11 +576,11 @@ impl Walk<'_> {
             node.errors += c.errors;
         }
         children.sort_by(|a, b| b.alloc.cmp(&a.alloc).then_with(|| a.name.cmp(&b.name)));
-        node.children = children;
+        node.children = children.into_boxed_slice();
 
         self.visitor.on_dir_done(path, &node, flags);
         if !self.opts.keep_tree {
-            node.children = Vec::new();
+            node.children = Box::default();
         }
         node
     }
@@ -636,22 +611,33 @@ impl Walk<'_> {
 }
 
 /// Keep the `k` largest `(name, size)` pairs seen so far, largest first.
-fn remember_top(top: &mut Vec<(String, u64)>, name: &str, size: u64, k: usize) {
-    if size == 0 {
-        return;
+/// The `n` largest files directly inside `dir`, largest first (ties by name),
+/// from a live listing: one `getattrlistbulk` pass, no recursion. Zero-byte
+/// files are left out. An unreadable or missing directory yields an empty
+/// list — the caller already knows about it from the tree's `errors`.
+pub fn top_files_in(dir: &Path, n: usize) -> Vec<BigFile> {
+    if n == 0 {
+        return Vec::new();
     }
-    if top.len() < k || size > top.last().map_or(0, |t| t.1) {
-        top.push((name.to_owned(), size));
-        top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        top.truncate(k);
-    }
+    let mut files: Vec<BigFile> = listing::list(dir)
+        .map(|l| l.entries)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| e.kind == Kind::File && e.alloc > 0)
+        .map(|e| BigFile {
+            path: dir.join(&e.name),
+            alloc: e.alloc,
+        })
+        .collect();
+    files.sort_by(|a, b| b.alloc.cmp(&a.alloc).then_with(|| a.path.cmp(&b.path)));
+    files.truncate(n);
+    files
 }
 
-fn name_of(p: &Path) -> String {
-    p.file_name().map_or_else(
-        || p.to_string_lossy().into_owned(),
-        |n| n.to_string_lossy().into_owned(),
-    )
+fn name_of(p: &Path) -> Box<str> {
+    p.file_name()
+        .map_or_else(|| p.to_string_lossy(), |n| n.to_string_lossy())
+        .into()
 }
 
 #[cfg(test)]
@@ -758,15 +744,15 @@ mod tests {
         };
         let result = walk(root, opts, &NoVisitor, None, &|| false);
 
-        assert!(!result.root.children.iter().any(|c| c.name == "excluded"));
+        assert!(!result.root.children.iter().any(|c| &*c.name == "excluded"));
         let keep = result
             .root
             .children
             .iter()
-            .find(|c| c.name == "keep")
+            .find(|c| &*c.name == "keep")
             .expect("keep present");
         assert!(
-            keep.children.iter().any(|c| c.name == "excluded"),
+            keep.children.iter().any(|c| &*c.name == "excluded"),
             "nested directory with the same name must not be excluded"
         );
         // Only keep/excluded/file2 is counted; excluded/file is not.
@@ -810,33 +796,27 @@ mod tests {
     }
 
     #[test]
-    fn per_dir_top_keeps_k_largest_own_files_sorted() {
+    fn top_files_in_lists_one_directory_live() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let sizes = [4096, 8192, 12288, 16384, 20480];
         for (i, sz) in sizes.iter().enumerate() {
             write_file(&root.join(format!("f{i}")), *sz);
         }
+        write_file(&root.join("empty"), 0);
+        // Files in subdirectories are not this directory's own files.
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        write_file(&root.join("sub/bigger"), 1 << 20);
 
-        let opts = WalkOptions {
-            per_dir_top: 3,
-            ..WalkOptions::default()
-        };
-        let result = walk(root, opts, &NoVisitor, None, &|| false);
-        let top = &result.root.top_files;
-
-        assert_eq!(top.len(), 3);
-        assert_eq!(top[0].0, "f4");
-        assert_eq!(top[1].0, "f3");
-        assert_eq!(top[2].0, "f2");
-        assert!(top.windows(2).all(|w| w[0].1 >= w[1].1));
-
-        let opts0 = WalkOptions {
-            per_dir_top: 0,
-            ..WalkOptions::default()
-        };
-        let result0 = walk(root, opts0, &NoVisitor, None, &|| false);
-        assert!(result0.root.top_files.is_empty());
+        let top = top_files_in(root, 3);
+        let names: Vec<_> = top
+            .iter()
+            .map(|f| f.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["f4", "f3", "f2"]);
+        assert!(top.windows(2).all(|w| w[0].alloc >= w[1].alloc));
+        assert!(top_files_in(root, 0).is_empty());
+        assert!(top_files_in(&root.join("missing"), 3).is_empty());
     }
 
     #[test]
@@ -925,18 +905,17 @@ mod tests {
     }
 
     #[test]
-    fn visitor_skip_and_opaque() {
+    fn visitor_skip_omits_the_subtree() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join("skipme")).unwrap();
-        write_file(&root.join("skipme/file"), 4096);
-        std::fs::create_dir_all(root.join("opaque")).unwrap();
-        // Deliberately large: if the walker ever descended into `opaque`
+        // Deliberately large: if the walker ever descended into `skipme`
         // despite the visitor's answer, this would show up in `root.alloc`.
-        write_file(&root.join("opaque/huge"), 1_000_000);
+        write_file(&root.join("skipme/huge"), 1_000_000);
+        write_file(&root.join("kept"), 4096);
 
-        struct SkipOpaque;
-        impl Visitor for SkipOpaque {
+        struct SkipOne;
+        impl Visitor for SkipOne {
             fn on_child_dir(
                 &self,
                 _parent: &Path,
@@ -944,37 +923,59 @@ mod tests {
                 _siblings: &[Entry],
                 flags: Flags,
             ) -> DirAction {
-                match child.name.to_string_lossy().as_ref() {
-                    "skipme" => DirAction::Skip,
-                    "opaque" => DirAction::Opaque {
-                        alloc: 1234,
-                        files: 5,
-                        dirs: 2,
-                    },
-                    _ => DirAction::Descend(flags),
+                if child.name == "skipme" {
+                    DirAction::Skip
+                } else {
+                    DirAction::Descend(flags)
                 }
             }
         }
 
-        let result = walk(root, WalkOptions::default(), &SkipOpaque, None, &|| false);
+        let result = walk(root, WalkOptions::default(), &SkipOne, None, &|| false);
 
-        assert!(!result.root.children.iter().any(|c| c.name == "skipme"));
-        let opaque = result
-            .root
-            .children
-            .iter()
-            .find(|c| c.name == "opaque")
-            .expect("opaque present in children");
-        assert_eq!(opaque.alloc, 1234);
-        assert_eq!(opaque.files, 5);
+        assert!(!result.root.children.iter().any(|c| &*c.name == "skipme"));
+        assert_eq!(result.root.alloc, 4096);
+        assert_eq!(result.root.files, 1);
+        assert_eq!(result.root.dirs, 0);
+    }
+
+    #[test]
+    fn root_flags_reach_root_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("child/grandchild")).unwrap();
+
+        struct Recorder(Mutex<Vec<(PathBuf, Flags)>>);
+        impl Visitor for Recorder {
+            fn on_child_dir(
+                &self,
+                parent: &Path,
+                child: &Entry,
+                _siblings: &[Entry],
+                flags: Flags,
+            ) -> DirAction {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((parent.join(&child.name), flags));
+                DirAction::Descend(flags)
+            }
+        }
+
+        let marker = Flags(1 << 20);
+        let recorder = Recorder(Mutex::new(Vec::new()));
+        let opts = WalkOptions {
+            root_flags: marker,
+            ..WalkOptions::default()
+        };
+        walk(root, opts, &recorder, None, &|| false);
+
+        let seen = recorder.0.into_inner().unwrap();
+        assert_eq!(seen.len(), 2);
         assert!(
-            opaque.children.is_empty(),
-            "opaque subtree must not be listed"
+            seen.iter().all(|(_, f)| f.contains(marker)),
+            "root children and their descendants inherit root_flags: {seen:?}"
         );
-        assert_eq!(result.root.alloc, 1234);
-        assert_eq!(result.root.files, 5);
-        // Rolled up as 1 (the opaque node itself) + the 2 it reported.
-        assert_eq!(result.root.dirs, 1 + 2);
     }
 
     #[test]
@@ -1132,7 +1133,7 @@ mod tests {
         let root = Path::new("/System/Volumes");
         let result = walk(root, WalkOptions::default(), &NoVisitor, None, &|| false);
         assert!(
-            !result.root.children.iter().any(|c| c.name == "Data"),
+            !result.root.children.iter().any(|c| &*c.name == "Data"),
             "/System/Volumes/Data is a mount point and must be skipped"
         );
     }

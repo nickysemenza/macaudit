@@ -25,6 +25,7 @@ pub mod shell_env;
 pub mod simulator;
 pub mod ssh_keys;
 pub mod system;
+pub mod tcc;
 pub mod time_machine;
 pub mod volume;
 

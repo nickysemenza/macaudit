@@ -9,10 +9,17 @@ struct DirInspector: View {
     @Environment(AuditStore.self) private var store
     let entry: DirEntry?
 
+    /// The selected directory's own largest loose files, fetched live
+    /// (directories no longer carry a per-node file list).
+    @State private var topFiles: [TopFile] = []
+
     var body: some View {
         if let e = entry {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
+                    if !store.hasFullDiskAccess && e.errors > 0 {
+                        FullDiskAccessBanner(store: store, compact: true)
+                    }
                     header(e)
                     facts(e)
                     largestFiles(e)
@@ -21,9 +28,21 @@ struct DirInspector: View {
                 .padding()
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .task(id: entry?.path) {
+                await loadTopFiles(for: e.path)
+            }
         } else {
             ContentUnavailableView("No selection", systemImage: "folder")
         }
+    }
+
+    private func loadTopFiles(for path: String) async {
+        let engine = store.engine
+        let files = await Task.detached { engine.dirTopFiles(path: path, n: 5) }.value
+        // The selection may have changed while this awaited; drop a stale
+        // result rather than showing files for the wrong directory.
+        guard path == entry?.path else { return }
+        topFiles = files
     }
 
     private func header(_ e: DirEntry) -> some View {
@@ -75,13 +94,13 @@ struct DirInspector: View {
         .font(.callout)
     }
 
-    private func largestFiles(_ e: DirEntry) -> some View {
+    private func largestFiles(_: DirEntry) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Largest files here").font(.headline)
-            if e.topFiles.isEmpty {
+            if topFiles.isEmpty {
                 Text("none").font(.callout).foregroundStyle(.secondary)
             } else {
-                ForEach(e.topFiles) { f in
+                ForEach(topFiles) { f in
                     HStack(spacing: 6) {
                         Text((f.path as NSString).lastPathComponent).lineLimit(1)
                         Spacer()

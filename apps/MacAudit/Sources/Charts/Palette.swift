@@ -32,6 +32,9 @@ enum Palette {
         "Docker": .purple,
         "Simulators": .pink,
         "Other": .gray,
+        "Other scanned": .gray,
+        "Unscanned": .gray.opacity(0.6),
+        "Other (unscanned)": .gray,
         "Purgeable": .gray.opacity(0.6),
         "Free": .clear,
         // iOS device storage bars.

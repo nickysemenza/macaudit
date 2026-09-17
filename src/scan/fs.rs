@@ -25,7 +25,7 @@ use serde_json::json;
 
 use crate::model::{Finding, FindingKind, Remedy, RemedyCommand, ScanEvent, ScannerId, Severity};
 use crate::scan::pipe::{RepoDiscovery, RepoSender};
-use crate::scan::sizing::{du_blocks, du_blocks_bounded, du_blocks_shared};
+use crate::scan::sizing::{du_blocks, du_blocks_shared};
 use crate::scan::walk::{
     self, DirAction, DirNode, DirTree, Entry, Flags, Kind, Visitor, WalkOptions, WalkStats,
 };
@@ -52,10 +52,6 @@ const PROJECT_MARKERS: &[&str] = &[
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 /// The "Largest files" group: this many, regardless of the threshold.
 const LARGEST_FILES: usize = 25;
-/// Budget for sizing an opaque subtree such as `~/Library/CloudStorage`.
-const OPAQUE_BUDGET: Duration = Duration::from_secs(3);
-const OPAQUE_MAX_ENTRIES: u64 = 200_000;
-
 /// An artifact directory awaiting its rolled-up size.
 struct Hit {
     label: String,
@@ -167,13 +163,28 @@ const IN_PACKAGE: Flags = Flags(1 << 9);
 const IN_GIT: Flags = Flags(1 << 10);
 const IN_ARTIFACT: Flags = Flags(1 << 11);
 const IN_TRASH: Flags = Flags(1 << 12);
+/// Outside the user's own trees — `/System`, `/Applications`, `/Library`,
+/// `/private`, other accounts — sized for the categories and the Folders
+/// browser, never mined: Homebrew's taps are git repositories and system
+/// frameworks contain `node_modules`, none of which are the user's to clean.
+const IN_SYSTEM: Flags = Flags(1 << 13);
+/// Inside a tree that is the user's: the home directory, or any configured
+/// root that is not an ancestor of it. Classification happens only here.
+const IN_USER: Flags = Flags(1 << 14);
 const CLASSIFIED: Flags =
-    Flags(IN_LIBRARY.0 | IN_PACKAGE.0 | IN_GIT.0 | IN_ARTIFACT.0 | IN_TRASH.0);
+    Flags(IN_LIBRARY.0 | IN_PACKAGE.0 | IN_GIT.0 | IN_ARTIFACT.0 | IN_TRASH.0 | IN_SYSTEM.0);
 
-/// Subtrees under `~/Library` that are listed opaquely: File Provider
-/// domains (Dropbox, Drive, OneDrive) enumerate on `opendir`, which can be
-/// slow and network-bound, so they get a bounded measurement instead.
-const OPAQUE_UNDER_LIBRARY: &[&str] = &["CloudStorage"];
+/// The flags a walk root's children start with: `NONE` while the walk is
+/// still above the home directory (`/`, `/Users`), so the visitor can sort
+/// its children into user and system trees; `IN_USER` for the home
+/// directory itself, anything beneath it, and unrelated roots the user chose.
+fn root_flags(root: &Path, home: &Path) -> Flags {
+    if home.starts_with(root) && root != home {
+        Flags::NONE
+    } else {
+        IN_USER
+    }
+}
 
 /// The walk's per-directory classifier. Shared by every rayon worker; the
 /// last clone to drop releases `repo_tx` and closes the fs→git pipe.
@@ -183,6 +194,7 @@ struct FsVisitor {
     token: tokio_util::sync::CancellationToken,
     config: Arc<crate::config::Config>,
     repo_tx: Option<RepoSender>,
+    home: PathBuf,
     /// `~/Library` — sized into the tree, never classified.
     library: PathBuf,
     large_file_threshold: u64,
@@ -216,27 +228,27 @@ impl Visitor for FsVisitor {
         let Some(name) = child.name.to_str() else {
             return DirAction::Descend(flags);
         };
-        if flags.contains(IN_LIBRARY)
-            && parent == self.library
-            && OPAQUE_UNDER_LIBRARY.contains(&name)
-        {
-            let r = du_blocks_bounded(
-                &parent.join(name),
-                OPAQUE_MAX_ENTRIES,
-                Instant::now() + OPAQUE_BUDGET,
-                &|| self.token.is_cancelled(),
-            );
-            return DirAction::Opaque {
-                alloc: r.bytes,
-                files: r.entries,
-                dirs: 0,
-            };
-        }
         // Inside a classified subtree nothing below is a project of ours.
         if flags.0 & CLASSIFIED.0 != 0 {
             return DirAction::Descend(flags);
         }
         let path = parent.join(name);
+        // Above the home directory (a whole-disk walk): the home directory
+        // is the user's tree, its ancestors (`/Users`) are transit, and every
+        // other branch is the system's.
+        if !flags.contains(IN_USER) {
+            if path == self.home {
+                return DirAction::Descend(flags | IN_USER);
+            }
+            if self.home.starts_with(&path) {
+                return DirAction::Descend(flags | Flags::NOT_LOOSE);
+            }
+            return if self.discovery_only {
+                DirAction::Skip
+            } else {
+                DirAction::Descend(flags | IN_SYSTEM | Flags::NOT_LOOSE)
+            };
+        }
         // ~/Library is measured (categories live there) but never mined for
         // artifacts or repositories.
         if path == self.library {
@@ -346,7 +358,7 @@ impl Scanner for FsScanner {
     async fn scan(&self, mut ctx: ScanCtx) -> anyhow::Result<()> {
         // Resolve roots (tilde-expanded) or fall back to the home dir.
         let roots: Vec<PathBuf> = if ctx.config.scan.roots.is_empty() {
-            ctx.paths.default_roots()
+            crate::config::Paths::default_disk_roots()
         } else {
             ctx.config
                 .scan
@@ -382,6 +394,7 @@ impl Scanner for FsScanner {
             token: token.clone(),
             config: config.clone(),
             repo_tx,
+            home: paths.home.clone(),
             library: paths.home.join("Library"),
             large_file_threshold: config.large_file_threshold_bytes(),
             stale_after_days: config.behavior.stale_after_days,
@@ -417,7 +430,7 @@ impl Scanner for FsScanner {
             // Discovery-only reproduces the cheap git-root sweep: no tree, no
             // largest-file bookkeeping, and the visitor skips everything else.
             keep_tree: !discovery_only,
-            per_dir_top: if discovery_only { 0 } else { 3 },
+            root_flags: Flags::NONE,
             top_n: if discovery_only { 0 } else { LARGEST_FILES * 4 },
             threshold: if discovery_only {
                 None
@@ -435,9 +448,13 @@ impl Scanner for FsScanner {
                     continue;
                 }
                 let started = Instant::now();
+                let opts = WalkOptions {
+                    root_flags: root_flags(&root, &walk_visitor.home),
+                    ..opts.clone()
+                };
                 let r = walk::walk(
                     &root,
-                    opts.clone(),
+                    opts,
                     walk_visitor.as_ref(),
                     Some(&walk_stats),
                     &|| walk_token.is_cancelled(),
@@ -629,47 +646,75 @@ fn find_node<'a>(trees: &'a [Arc<DirTree>], path: &Path) -> Option<&'a DirNode> 
         .and_then(|t| t.node.find(&t.root, path))
 }
 
-struct DiskCategory {
-    title: &'static str,
-    rel: &'static str,
+/// Why a category's folders can be unreadable — decides the coverage hint.
+#[derive(Clone, Copy)]
+enum Unreadable {
+    /// TCC-protected user data (Mail, Messages, Safari…): Full Disk Access.
+    FullDiskAccess,
+    /// Root-owned system folders: nothing the user can grant.
+    RootOnly,
 }
 
+struct DiskCategory {
+    title: &'static str,
+    /// Primary folder — the finding's key and path.
+    rel: &'static str,
+    /// Further folders summed into the same category.
+    extra: &'static [&'static str],
+    unreadable: Unreadable,
+}
+
+const fn home_category(title: &'static str, rel: &'static str) -> DiskCategory {
+    DiskCategory {
+        title,
+        rel,
+        extra: &[],
+        unreadable: Unreadable::FullDiskAccess,
+    }
+}
+
+/// Non-overlapping, so the Storage overview can stack them. Everything in
+/// the walked roots but outside these is "other scanned"; Homebrew has no
+/// category because the brew section already accounts for `/opt/homebrew`.
 const DISK_CATEGORIES: &[DiskCategory] = &[
+    home_category("Development", "~/dev"),
+    home_category("Agent worktrees", "~/.codex/worktrees"),
+    home_category("Developer caches", "~/.cache"),
     DiskCategory {
-        title: "Development",
-        rel: "~/dev",
+        title: "Package caches",
+        rel: "~/Library/pnpm",
+        extra: &["~/.npm", "~/.cargo", "~/.rustup", "~/go", "~/.bun", "~/.nx"],
+        unreadable: Unreadable::FullDiskAccess,
+    },
+    home_category("App caches", "~/Library/Caches"),
+    home_category("Application Support", "~/Library/Application Support"),
+    home_category("iCloud Drive", "~/Library/Mobile Documents"),
+    home_category("Documents", "~/Documents"),
+    home_category("Pictures", "~/Pictures"),
+    home_category("Apple developer data", "~/Library/Developer"),
+    DiskCategory {
+        title: "Applications",
+        rel: "/Applications",
+        extra: &[],
+        unreadable: Unreadable::RootOnly,
     },
     DiskCategory {
-        title: "Agent worktrees",
-        rel: "~/.codex/worktrees",
+        title: "macOS",
+        rel: "/System",
+        extra: &["/usr", "/bin", "/sbin"],
+        unreadable: Unreadable::RootOnly,
     },
     DiskCategory {
-        title: "Developer caches",
-        rel: "~/.cache",
+        title: "System Library",
+        rel: "/Library",
+        extra: &[],
+        unreadable: Unreadable::RootOnly,
     },
     DiskCategory {
-        title: "App caches",
-        rel: "~/Library/Caches",
-    },
-    DiskCategory {
-        title: "Application Support",
-        rel: "~/Library/Application Support",
-    },
-    DiskCategory {
-        title: "iCloud Drive",
-        rel: "~/Library/Mobile Documents",
-    },
-    DiskCategory {
-        title: "Documents",
-        rel: "~/Documents",
-    },
-    DiskCategory {
-        title: "Pictures",
-        rel: "~/Pictures",
-    },
-    DiskCategory {
-        title: "Apple developer data",
-        rel: "~/Library/Developer",
+        title: "System data",
+        rel: "/private",
+        extra: &[],
+        unreadable: Unreadable::RootOnly,
     },
 ];
 
@@ -680,8 +725,8 @@ const DISK_CATEGORIES: &[DiskCategory] = &[
 const PARTIAL_ATTENTION_DIRS: u64 = 25;
 
 /// Measure a deliberately narrow, non-overlapping set of roots, exactly,
-/// off the finished tree. A root outside every walked tree (custom
-/// `scan.roots`) falls back to a direct walk.
+/// off the finished trees. A category none of the walked roots covers
+/// (custom `scan.roots`) is simply absent — the roots mean "only these".
 fn size_disk_categories(
     paths: &crate::config::Paths,
     send: &dyn Fn(Finding),
@@ -693,20 +738,31 @@ fn size_disk_categories(
             return;
         }
         let root = paths.expand(category.rel);
-        if !root.is_dir() {
+        let (mut bytes, mut files, mut dirs, mut errors) = (0u64, 0u64, 0u64, 0u64);
+        let mut covered = false;
+        for rel in std::iter::once(&category.rel).chain(category.extra) {
+            if let Some(n) = find_node(trees, &paths.expand(rel)) {
+                covered = true;
+                bytes += n.alloc;
+                files += n.files;
+                dirs += n.dirs;
+                errors += n.errors;
+            }
+        }
+        if !covered {
             continue;
         }
-        let (bytes, files, dirs, errors) = match find_node(trees, &root) {
-            Some(n) => (n.alloc, n.files, n.dirs, n.errors),
-            None => (du_blocks(&root, cancelled), 0, 0, 0),
-        };
         let entries = files + dirs;
         let complete = errors == 0;
         let coverage = if complete {
             format!("Measured exactly: {files} files in {dirs} folders.")
         } else {
+            let hint = match category.unreadable {
+                Unreadable::FullDiskAccess => "grant Full Disk Access to include them",
+                Unreadable::RootOnly => "they are readable only by root",
+            };
             format!(
-                "{errors} folders could not be read — grant Full Disk Access to include them. Measured {files} files in {dirs} folders."
+                "{errors} folders could not be read — {hint}. Measured {files} files in {dirs} folders."
             )
         };
         let attention = errors > PARTIAL_ATTENTION_DIRS || errors.saturating_mul(100) > entries;
@@ -1206,7 +1262,7 @@ fn size_fixed_paths(
             match find_node(trees, &root) {
                 Some(node) => {
                     for child in &node.children {
-                        let p = root.join(&child.name);
+                        let p = root.join(&*child.name);
                         send(fixed_finding(&p, target.kind, &target.remedy, child.alloc));
                     }
                 }
@@ -1307,7 +1363,7 @@ mod tests {
     use crate::model::FindingId;
     use crate::runner::MockCommandRunner;
     use crate::scan::pipe::repo_channel;
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
@@ -2188,6 +2244,144 @@ mod tests {
             .node
             .find(&tree.root, &home.path().join("Documents"))
             .is_some());
+    }
+
+    /// A whole-disk layout: `root` stands in for `/`, `root/Users/dev` is the
+    /// home directory, and `root/opt` is a system tree. Both halves get the
+    /// same project + repository so the difference in treatment is the only
+    /// variable.
+    fn whole_disk_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("Users/dev");
+        let user_proj = home.join("proj");
+        let sys_proj = root.path().join("opt/proj");
+        for proj in [&user_proj, &sys_proj] {
+            fs::create_dir_all(proj.join("node_modules/pkg")).unwrap();
+            fs::write(proj.join("package.json"), "{}").unwrap();
+            fs::write(proj.join("node_modules/pkg/index.js"), vec![0u8; 4096]).unwrap();
+            fs::create_dir_all(proj.join(".git")).unwrap();
+            fs::write(proj.join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+        }
+        (root, home, user_proj, sys_proj)
+    }
+
+    /// `ctx_for` with the walk rooted at `root` rather than at `home`.
+    fn whole_disk_ctx(
+        root: &Path,
+        home: &Path,
+        discovery_only: bool,
+    ) -> (
+        ScanCtx,
+        mpsc::Receiver<ScanEvent>,
+        Option<crate::scan::pipe::RepoReceiver>,
+    ) {
+        let (mut ctx, rx, repo_rx) = ctx_for(home, true, discovery_only, vec![]);
+        let mut config = (*ctx.config).clone();
+        config.scan.roots = vec![root.to_string_lossy().into_owned()];
+        ctx.config = Arc::new(config);
+        (ctx, rx, repo_rx)
+    }
+
+    #[tokio::test]
+    async fn system_dirs_are_sized_but_never_classified() {
+        let (root, home, user_proj, sys_proj) = whole_disk_fixture();
+        let (ctx, mut rx, repo_rx) = whole_disk_ctx(root.path(), &home, false);
+        FsScanner.scan(ctx).await.unwrap();
+
+        let mut findings = Vec::new();
+        let mut trees = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                ScanEvent::Finding { finding, .. } => findings.push(*finding),
+                ScanEvent::DirTree { tree, .. } => trees.push(tree),
+                _ => {}
+            }
+        }
+        // Emitted twice (unsized, then sized) under the same id.
+        let artifacts: BTreeSet<&Path> = findings
+            .iter()
+            .filter(|f| f.kind == FindingKind::BuildArtifact)
+            .filter_map(|f| f.path.as_deref())
+            .collect();
+        assert_eq!(
+            artifacts,
+            BTreeSet::from([user_proj.join("node_modules").as_path()]),
+            "only the user's project is an artifact: {findings:?}"
+        );
+
+        let mut repos = Vec::new();
+        let mut repo_rx = repo_rx.unwrap();
+        while let Ok(d) = repo_rx.try_recv() {
+            repos.push(d.root);
+        }
+        assert_eq!(
+            repos,
+            vec![user_proj.clone()],
+            "system repos never reach git"
+        );
+
+        // Both halves are in the tree with their bytes.
+        let tree = &trees[0];
+        let sys = tree
+            .node
+            .find(&tree.root, &sys_proj)
+            .expect("system project in tree");
+        let user = tree
+            .node
+            .find(&tree.root, &user_proj)
+            .expect("user project in tree");
+        assert_eq!(sys.files, user.files);
+        assert_eq!(sys.alloc, user.alloc);
+    }
+
+    #[tokio::test]
+    async fn discovery_only_skips_system_dirs() {
+        let (root, home, user_proj, sys_proj) = whole_disk_fixture();
+        let (ctx, rx, repo_rx) = whole_disk_ctx(root.path(), &home, true);
+        FsScanner.scan(ctx).await.unwrap();
+
+        assert!(drain(rx).is_empty());
+        let mut repos = Vec::new();
+        let mut repo_rx = repo_rx.unwrap();
+        while let Ok(d) = repo_rx.try_recv() {
+            repos.push(d.root);
+        }
+        assert_eq!(repos, vec![user_proj]);
+        let _ = sys_proj;
+    }
+
+    #[tokio::test]
+    async fn categories_sum_extra_roots() {
+        let home = tempfile::tempdir().unwrap();
+        // "Package caches" = ~/Library/pnpm + ~/.npm + ~/.cargo + …
+        for (dir, size) in [("Library/pnpm", 4096), (".npm", 8192), (".cargo", 4096)] {
+            fs::create_dir_all(home.path().join(dir)).unwrap();
+            fs::write(home.path().join(dir).join("f"), vec![0u8; size]).unwrap();
+        }
+
+        let (ctx, rx, _) = ctx_for(home.path(), false, false, vec![]);
+        FsScanner.scan(ctx).await.unwrap();
+        let findings = drain(rx);
+
+        let cats: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.kind == FindingKind::DiskCategory)
+            .collect();
+        let pkg = cats
+            .iter()
+            .find(|f| f.title == "Package caches")
+            .unwrap_or_else(|| panic!("Package caches present: {cats:?}"));
+        assert_eq!(pkg.meta["files"], 3);
+        assert_eq!(pkg.size_bytes, Some(4096 + 8192 + 4096));
+        assert_eq!(
+            pkg.path.as_deref(),
+            Some(home.path().join("Library/pnpm").as_path())
+        );
+        assert!(
+            cats.iter()
+                .all(|f| f.title != "Applications" && f.title != "macOS"),
+            "categories outside the walked roots are absent: {cats:?}"
+        );
     }
 
     #[tokio::test]

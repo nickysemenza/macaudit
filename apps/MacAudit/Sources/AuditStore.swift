@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import MacAuditKit
 import Observation
@@ -80,11 +81,35 @@ final class AuditStore {
     private var scanBridge: ScanBridge?
     private var scanTask: Task<Void, Never>?
 
+    /// Whether the engine can currently read TCC-protected user data
+    /// (Safari, Mail, …). Refreshed after every fs scan and whenever the app
+    /// becomes active again (the user may have just granted it in System
+    /// Settings), so the banner clears without a rescan.
+    var hasFullDiskAccess = true
+
     init(engine: any MacAuditEngine, usingFakeData: Bool) {
         self.engine = engine
         self.usingFakeData = usingFakeData
         self.sections = engine.sections()
         self.browser = DirBrowser(engine: engine)
+        refreshFullDiskAccess()
+        // The store lives as long as the app; the observation ends with it.
+        Task { [weak self] in
+            for await _ in NotificationCenter.default.notifications(named: NSApplication.didBecomeActiveNotification) {
+                guard let self else { return }
+                self.refreshFullDiskAccess()
+            }
+        }
+    }
+
+    /// Re-probes Full Disk Access off-main and applies the result on the
+    /// main actor.
+    func refreshFullDiskAccess() {
+        let engine = self.engine
+        Task {
+            let ok = await Task.detached { engine.fullDiskAccess() }.value
+            hasFullDiskAccess = ok
+        }
     }
 
     // MARK: - Reads
@@ -249,6 +274,7 @@ final class AuditStore {
             if section == .fs {
                 browser.refreshRoot()
                 browser.invalidate()
+                refreshFullDiskAccess()
             }
         case .sectionFailed(let section, let gen, let error):
             guard expectedGen[section] == gen else { return }

@@ -305,6 +305,12 @@ impl Engine {
             .into_owned()
     }
 
+    /// Whether this process can read TCC-protected user data (Full Disk
+    /// Access). See `macaudit::scan::tcc`.
+    pub fn full_disk_access(&self) -> bool {
+        macaudit::scan::tcc::full_disk_access(&self.shared.manager.paths())
+    }
+
     /// The root of the first walked Disk tree, or `None` until a Disk scan
     /// has completed at least once.
     pub fn dir_root(&self) -> Option<DirEntry> {
@@ -349,6 +355,15 @@ impl Engine {
         let mut out = Vec::new();
         flatten_preorder(&summary, max_nodes as usize, &mut out);
         out
+    }
+
+    /// The `n` largest files directly inside `path`, listed live (one directory, no
+    /// recursion) so the tree does not have to carry a file list per directory.
+    pub fn dir_top_files(&self, path: String, n: u32) -> Vec<TopFile> {
+        macaudit::scan::walk::top_files_in(std::path::Path::new(&path), n as usize)
+            .iter()
+            .map(TopFile::from)
+            .collect()
     }
 
     /// The largest files across every walked root, allocated size descending.
@@ -589,6 +604,33 @@ mod tests {
         engine.start_scan(vec![SectionId::Fs], listener);
         collector.wait_for_terminal(1);
         collector
+    }
+
+    #[test]
+    fn dir_top_files_lists_live_and_handles_missing_path() {
+        let (engine, _home) = fake_engine();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("small"), vec![0u8; 4096]).unwrap();
+        std::fs::write(dir.path().join("medium"), vec![0u8; 8192]).unwrap();
+        std::fs::write(dir.path().join("large"), vec![0u8; 12288]).unwrap();
+
+        let top = engine.dir_top_files(dir.path().to_string_lossy().into_owned(), 5);
+        let names: Vec<_> = top
+            .iter()
+            .map(|f| {
+                std::path::Path::new(&f.path)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(names, ["large", "medium", "small"]);
+        assert!(top.windows(2).all(|w| w[0].alloc >= w[1].alloc));
+
+        assert!(engine
+            .dir_top_files(dir.path().join("missing").to_string_lossy().into_owned(), 5)
+            .is_empty());
     }
 
     #[test]

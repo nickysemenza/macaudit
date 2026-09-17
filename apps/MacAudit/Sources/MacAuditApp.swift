@@ -129,6 +129,7 @@ final class UnavailableEngine: MacAuditEngine {
     func sections() -> [SectionMeta] { [] }
     func deleteMode() -> DeleteMode { .trash }
     func configPath() -> String { "" }
+    func fullDiskAccess() -> Bool { true }
     func startScan(sections: [SectionId], listener: ScanListener) -> UInt64 { 0 }
     func cancelScan() {}
     func findings(section: SectionId) -> [Finding] { [] }
@@ -139,6 +140,7 @@ final class UnavailableEngine: MacAuditEngine {
     func dirEntry(path: String) -> DirEntry? { nil }
     func dirChildren(path: String) -> [DirEntry] { [] }
     func dirSubtree(path: String, depth: UInt32, maxNodes: UInt32) -> [DirEntry] { [] }
+    func dirTopFiles(path: String, n: UInt32) -> [TopFile] { [] }
     func largestFiles(n: UInt32) -> [TopFile] { [] }
     func dirTreeStats() -> DirTreeStats? { nil }
 }
