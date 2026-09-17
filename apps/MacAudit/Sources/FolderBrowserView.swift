@@ -28,7 +28,12 @@ struct FolderBrowserView: View {
                 "No subfolders", systemImage: "folder",
                 description: Text("Files directly here are listed in the inspector."))
         } else {
-            DirTable(browser: browser, store: store, parentAlloc: browser.current?.alloc ?? 0)
+            switch browser.viewMode {
+            case .list:
+                DirTable(browser: browser, store: store, parentAlloc: browser.current?.alloc ?? 0)
+            case .treemap:
+                TreemapView(browser: browser, store: store, engine: browser.engine)
+            }
         }
     }
 
@@ -69,6 +74,7 @@ private struct BreadcrumbBar: View {
     let browser: DirBrowser
 
     var body: some View {
+        @Bindable var browser = browser
         HStack(spacing: 4) {
             Button {
                 browser.goBack()
@@ -101,6 +107,15 @@ private struct BreadcrumbBar: View {
             }
 
             Spacer()
+
+            Picker("", selection: $browser.viewMode) {
+                Image(systemName: "list.bullet").tag(DirBrowser.ViewMode.list)
+                Image(systemName: "square.grid.2x2").tag(DirBrowser.ViewMode.treemap)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .controlSize(.small)
+            .fixedSize()
 
             if browser.isLoading {
                 ProgressView().controlSize(.small)

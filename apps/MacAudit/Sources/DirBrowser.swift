@@ -8,7 +8,23 @@ import MacAuditKit
 @MainActor
 @Observable
 final class DirBrowser {
-    private let engine: any MacAuditEngine
+    /// How the current directory's children are displayed. Not `private` —
+    /// `TreemapView` needs it for `dirSubtree` lookups off-main.
+    let engine: any MacAuditEngine
+
+    /// The Folders drill-down's presentation: a sortable table, or a
+    /// squarified treemap. Persisted across launches.
+    enum ViewMode: String, CaseIterable {
+        case list, treemap
+    }
+
+    private static let viewModeDefaultsKey = "foldersViewMode"
+
+    var viewMode: ViewMode {
+        didSet {
+            UserDefaults.standard.set(viewMode.rawValue, forKey: Self.viewModeDefaultsKey)
+        }
+    }
 
     private(set) var root: DirEntry?
     private(set) var current: DirEntry?
@@ -29,6 +45,13 @@ final class DirBrowser {
 
     init(engine: any MacAuditEngine) {
         self.engine = engine
+        if let raw = UserDefaults.standard.string(forKey: Self.viewModeDefaultsKey),
+            let mode = ViewMode(rawValue: raw)
+        {
+            self.viewMode = mode
+        } else {
+            self.viewMode = .list
+        }
     }
 
     /// Re-reads the scan root. Called after the fs section (re)finishes.
