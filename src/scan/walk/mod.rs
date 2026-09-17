@@ -235,6 +235,9 @@ pub struct WalkOptions {
     pub max_entries: Option<u64>,
     /// Keep `DirNode::children`; false rolls them up and drops them.
     pub keep_tree: bool,
+    /// Flags the root's own children are visited with — what the visitor
+    /// would have chosen for the root had it been a child of something.
+    pub root_flags: Flags,
     /// Size of the global largest-files heap; 0 disables.
     pub top_n: usize,
     /// Collect every loose file at least this large.
@@ -249,6 +252,7 @@ impl Default for WalkOptions {
             deadline: None,
             max_entries: None,
             keep_tree: true,
+            root_flags: Flags::NONE,
             top_n: 0,
             threshold: None,
         }
@@ -375,7 +379,7 @@ pub fn walk(
         errors: AtomicU64::new(0),
     };
 
-    let mut node = walk.scan_listed(&resolved, first, Flags::NONE);
+    let mut node = walk.scan_listed(&resolved, first, walk.opts.root_flags);
     node.name = root.to_string_lossy().into();
 
     let externally_linked = walk
@@ -933,6 +937,45 @@ mod tests {
         assert_eq!(result.root.alloc, 4096);
         assert_eq!(result.root.files, 1);
         assert_eq!(result.root.dirs, 0);
+    }
+
+    #[test]
+    fn root_flags_reach_root_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("child/grandchild")).unwrap();
+
+        struct Recorder(Mutex<Vec<(PathBuf, Flags)>>);
+        impl Visitor for Recorder {
+            fn on_child_dir(
+                &self,
+                parent: &Path,
+                child: &Entry,
+                _siblings: &[Entry],
+                flags: Flags,
+            ) -> DirAction {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((parent.join(&child.name), flags));
+                DirAction::Descend(flags)
+            }
+        }
+
+        let marker = Flags(1 << 20);
+        let recorder = Recorder(Mutex::new(Vec::new()));
+        let opts = WalkOptions {
+            root_flags: marker,
+            ..WalkOptions::default()
+        };
+        walk(root, opts, &recorder, None, &|| false);
+
+        let seen = recorder.0.into_inner().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(
+            seen.iter().all(|(_, f)| f.contains(marker)),
+            "root children and their descendants inherit root_flags: {seen:?}"
+        );
     }
 
     #[test]
