@@ -31,6 +31,9 @@ struct TreemapView: View {
     /// levels deep from the current directory. Refetched whenever the
     /// current directory changes.
     @State private var nested: [String: [DirEntry]] = [:]
+    /// The current directory's own largest loose files, fetched live
+    /// alongside `nested` (directories no longer carry a per-node file list).
+    @State private var topFiles: [TopFile] = []
     @State private var hover: CGPoint?
 
     var body: some View {
@@ -96,7 +99,7 @@ struct TreemapView: View {
                 isFile: false, hasChildren: entry.hasChildren)
             items.append(Squarify.Item(id: entry.path, value: Double(entry.alloc)))
         }
-        for file in current.topFiles {
+        for file in topFiles {
             let id = "file:\(file.path)"
             sources[id] = Source(
                 path: file.path, name: (file.path as NSString).lastPathComponent,
@@ -215,15 +218,23 @@ struct TreemapView: View {
 
     // MARK: - Data
 
-    /// Refetches the current directory's grandchildren, two levels deep,
-    /// off-main — same pattern as `DirBrowser.navigate`'s child load.
+    /// Refetches the current directory's grandchildren (two levels deep) and
+    /// its own largest loose files, off-main — same pattern as
+    /// `DirBrowser.navigate`'s child load. Fetched together so both land (or
+    /// are both dropped as stale) from the same snapshot of `path`.
     private func loadNested() async {
         guard let path = browser.current?.path else {
             nested = [:]
+            topFiles = []
             return
         }
         let engine = self.engine
-        let flat = await Task.detached { engine.dirSubtree(path: path, depth: 2, maxNodes: 400) }.value
+        let (flat, files) = await Task.detached {
+            (
+                engine.dirSubtree(path: path, depth: 2, maxNodes: 400),
+                engine.dirTopFiles(path: path, n: 5)
+            )
+        }.value
         // The current directory may have changed while this awaited; drop a
         // stale result rather than attributing it to the wrong parent.
         guard path == browser.current?.path else { return }
@@ -234,5 +245,6 @@ struct TreemapView: View {
             grouped[parentPath, default: []].append(entry)
         }
         nested = grouped
+        topFiles = files
     }
 }

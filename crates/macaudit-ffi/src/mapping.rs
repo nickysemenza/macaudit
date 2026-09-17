@@ -625,8 +625,6 @@ pub struct DirEntry {
     pub errors: u64,
     /// Whether this directory has any subdirectories (`child_count > 0`).
     pub has_children: bool,
-    /// Largest own files, largest first.
-    pub top_files: Vec<TopFile>,
 }
 
 impl From<&DirNodeSummary> for DirEntry {
@@ -640,7 +638,6 @@ impl From<&DirNodeSummary> for DirEntry {
             dirs: s.dirs,
             errors: s.errors,
             has_children: s.child_count > 0,
-            top_files: s.top_files.iter().map(TopFile::from).collect(),
         }
     }
 }
@@ -785,16 +782,6 @@ mod tests {
             files: 16_210,
             dirs: 2_222,
             errors: 3,
-            top_files: vec![
-                BigFile {
-                    path: std::path::PathBuf::from("/Users/dev/dev/.zsh_history"),
-                    alloc: 180 * 1024,
-                },
-                BigFile {
-                    path: std::path::PathBuf::from("/Users/dev/dev/Cargo.lock"),
-                    alloc: 90 * 1024,
-                },
-            ],
             child_count: 4,
             children: Vec::new(),
         };
@@ -807,11 +794,6 @@ mod tests {
         assert_eq!(entry.dirs, summary.dirs);
         assert_eq!(entry.errors, summary.errors);
         assert!(entry.has_children);
-        assert_eq!(entry.top_files.len(), 2);
-        assert_eq!(entry.top_files[0].path, "/Users/dev/dev/.zsh_history");
-        assert_eq!(entry.top_files[0].alloc, 180 * 1024);
-        assert_eq!(entry.top_files[1].path, "/Users/dev/dev/Cargo.lock");
-        assert_eq!(entry.top_files[1].alloc, 90 * 1024);
 
         let mut leaf = summary;
         leaf.child_count = 0;

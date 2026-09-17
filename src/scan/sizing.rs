@@ -97,11 +97,10 @@ pub fn du_blocks_shared(root: &Path, cancelled: &(dyn Fn() -> bool + Sync)) -> S
     }
 }
 
-/// Totals only: no tree, no per-directory or global largest-file lists.
+/// Totals only: no tree, no largest-file list.
 fn du_options(opts: WalkOptions) -> WalkOptions {
     WalkOptions {
         keep_tree: false,
-        per_dir_top: 0,
         top_n: 0,
         threshold: None,
         ..opts

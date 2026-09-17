@@ -154,7 +154,7 @@ impl AppState {
         if child.children.is_empty() {
             return;
         }
-        let child_path = self.browse.path.join(&child.name);
+        let child_path = self.browse.path.join(&*child.name);
         self.browse
             .stack
             .push((self.browse.path.clone(), self.browse.cursor));

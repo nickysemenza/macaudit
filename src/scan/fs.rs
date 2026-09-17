@@ -392,7 +392,6 @@ impl Scanner for FsScanner {
             // Discovery-only reproduces the cheap git-root sweep: no tree, no
             // largest-file bookkeeping, and the visitor skips everything else.
             keep_tree: !discovery_only,
-            per_dir_top: if discovery_only { 0 } else { 3 },
             top_n: if discovery_only { 0 } else { LARGEST_FILES * 4 },
             threshold: if discovery_only {
                 None
@@ -1181,7 +1180,7 @@ fn size_fixed_paths(
             match find_node(trees, &root) {
                 Some(node) => {
                     for child in &node.children {
-                        let p = root.join(&child.name);
+                        let p = root.join(&*child.name);
                         send(fixed_finding(&p, target.kind, &target.remedy, child.alloc));
                     }
                 }

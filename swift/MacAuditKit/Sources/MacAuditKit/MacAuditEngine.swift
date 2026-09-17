@@ -18,6 +18,7 @@ public protocol MacAuditEngine: AnyObject, Sendable {
     func dirEntry(path: String) -> DirEntry?
     func dirChildren(path: String) -> [DirEntry]
     func dirSubtree(path: String, depth: UInt32, maxNodes: UInt32) -> [DirEntry]
+    func dirTopFiles(path: String, n: UInt32) -> [TopFile]
     func largestFiles(n: UInt32) -> [TopFile]
     func dirTreeStats() -> DirTreeStats?
 }

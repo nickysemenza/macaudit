@@ -974,17 +974,14 @@ fn fs_fixtures() -> Vec<Finding> {
 pub fn dir_tree() -> DirTree {
     fn dir(name: &str, own: &[(&str, u64)], children: Vec<DirNode>) -> DirNode {
         let mut node = DirNode {
-            name: name.to_string(),
+            name: name.into(),
             ..DirNode::default()
         };
-        for (file, size) in own {
+        for (_, size) in own {
             node.alloc += size;
             node.apparent += size;
             node.files += 1;
-            node.top_files.push((file.to_string(), *size));
         }
-        node.top_files.sort_by_key(|f| std::cmp::Reverse(f.1));
-        node.top_files.truncate(3);
         for c in &children {
             node.alloc += c.alloc;
             node.apparent += c.apparent;
@@ -994,7 +991,7 @@ pub fn dir_tree() -> DirTree {
         }
         let mut children = children;
         children.sort_by(|a, b| b.alloc.cmp(&a.alloc).then_with(|| a.name.cmp(&b.name)));
-        node.children = children;
+        node.children = children.into_boxed_slice();
         node
     }
     let node = dir(
