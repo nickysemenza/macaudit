@@ -50,12 +50,7 @@ fn status(f: &Finding, _: &CellCtx) -> CellText {
 }
 
 fn deps(f: &Finding, _: &CellCtx) -> CellText {
-    let n = meta_len(f, "dependents");
-    if n == 0 {
-        plain("")
-    } else {
-        dim(format!("{n}"))
-    }
+    count_cell(meta_len(f, "dependents"))
 }
 
 fn key_status(f: &Finding) -> SortKey {
@@ -70,7 +65,7 @@ fn key_deps(f: &Finding) -> SortKey {
     SortKey::Int(meta_len(f, "dependents") as i64)
 }
 
-fn detail(f: &Finding, m: &mut MetaView<'_>) -> Vec<Field> {
+fn detail(f: &Finding, m: &mut MetaView<'_>, _ctx: &DetailCtx) -> Vec<Field> {
     let mut out = Vec::new();
     m.skip("name");
     m.skip("token");

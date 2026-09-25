@@ -6,16 +6,18 @@ import Testing
 
 /// Builds an owner Finding (`.project`/`.appOwner`) with the exact meta keys
 /// `footprint_finding` (`src/attribution/mod.rs`) writes — enough for
-/// `OwnerSummary`/`LensModel` to parse.
+/// `OwnerSummary`/`LensModel` to parse. `ownerKey` names the Finding itself
+/// (`title`/`path`) — `OwnerSummary` no longer carries its own copy, so
+/// tests identify a row via `.finding.title` instead of `.summary.ownerKey`.
 private func ownerFinding(
     id: UInt64, kind: FindingKind = .project, ownerKey: String, exclusive: UInt64, shared: UInt64,
     reach: UInt64, baselineShare: UInt64 = 0, byKind: [(String, UInt64)] = []
 ) -> Finding {
     let byKindJSON = byKind.map { "{\"kind\":\"\($0.0)\",\"bytes\":\($0.1)}" }.joined(separator: ",")
     let json = """
-        {"owner_key":"\(ownerKey)","owner_kind":"Project","exclusive":\(exclusive),"shared":\(shared),\
-        "reach":\(reach),"baseline_share":\(baselineShare),"by_kind":[\(byKindJSON)],"entry_count":1,\
-        "worktrees":[],"process_count":0,"ports":[],"top_tier":"exact","clone_note":false,"group":"Project"}
+        {"owner_kind":"Project","exclusive":\(exclusive),"shared":\(shared),\
+        "reach":\(reach),"baseline_share":\(baselineShare),"by_kind":[\(byKindJSON)],\
+        "worktrees":[],"process_count":0,"ports":[],"top_tier":"exact","clone_note":false}
         """
     return Finding(
         id: id, kind: kind, section: .projects, group: "Project", title: ownerKey, detail: "",
@@ -46,7 +48,7 @@ private func entry(bytes: UInt64) -> FootprintEntry {
         bucketFinding(id: 3, title: "Baseline", bytes: 999),
     ]
     let rows = LensModel.rows(findings)
-    #expect(rows.map(\.summary.ownerKey) == ["big", "small"])
+    #expect(rows.map(\.finding.title) == ["big", "small"])
 }
 
 @Test func rowsFractionsAreScaledByTheLargestReachAcrossRows() {
@@ -55,7 +57,7 @@ private func entry(bytes: UInt64) -> FootprintEntry {
         ownerFinding(id: 2, ownerKey: "b", exclusive: 10, shared: 0, reach: 200),
     ]
     let rows = LensModel.rows(findings)
-    let a = try! #require(rows.first { $0.summary.ownerKey == "a" })
+    let a = try! #require(rows.first { $0.finding.title == "a" })
     // Scale is 200 (the larger of the two reaches), not "a"'s own reach.
     #expect(a.exclusiveFraction == 50.0 / 200.0)
     #expect(a.sharedFraction == 25.0 / 200.0)

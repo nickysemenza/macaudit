@@ -6,9 +6,10 @@
 //! that crosses to Swift. The FFI mirror (`crates/macaudit-ffi`) swaps
 //! `PathBuf` for `String`; everything else copies field-for-field.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -79,6 +80,24 @@ impl Axis {
             Axis::AppStorage => ScannerId::AppStorage,
         }
     }
+
+    /// The `FindingKind` one of this axis's owner rows (`Footprint`) is
+    /// emitted as.
+    pub fn finding_kind(self) -> crate::model::FindingKind {
+        match self {
+            Axis::Projects => crate::model::FindingKind::Project,
+            Axis::AppStorage => crate::model::FindingKind::AppOwner,
+        }
+    }
+
+    /// The `FindingKind` this axis's three synthetic bucket rows
+    /// (Baseline/Unattributed/Coverage) are emitted as.
+    pub fn bucket_kind(self) -> crate::model::FindingKind {
+        match self {
+            Axis::Projects => crate::model::FindingKind::ProjectBucket,
+            Axis::AppStorage => crate::model::FindingKind::AppStorageBucket,
+        }
+    }
 }
 
 /// What sort of thing owns a `Footprint`.
@@ -90,10 +109,6 @@ pub enum OwnerKind {
     Formula,
     Homebrew,
     Tool,
-    /// The synthetic "shared by every project/app of an ecosystem" owner.
-    Baseline,
-    /// The synthetic "could not be linked to anything" owner.
-    Unattributed,
 }
 
 impl OwnerKind {
@@ -104,8 +119,6 @@ impl OwnerKind {
             OwnerKind::Formula => "Formula",
             OwnerKind::Homebrew => "Homebrew",
             OwnerKind::Tool => "Tool",
-            OwnerKind::Baseline => "Baseline",
-            OwnerKind::Unattributed => "Unattributed",
         }
     }
 }
@@ -432,7 +445,12 @@ pub struct ResolveEnv<'a> {
     pub trees: &'a [std::sync::Arc<DirTree>],
     pub snapshots: &'a HashMap<ScannerId, Snapshot>,
     pub runner: &'a dyn CommandRunner,
-    head_cache: RefCell<HashMap<PathBuf, Option<String>>>,
+    /// A `Mutex`, not a `RefCell` — makes `ResolveEnv` itself `Sync`, the
+    /// same as `paths::Sizer`, so batched lookups like
+    /// `entitlements::app_groups_for` can share a `&ResolveEnv` directly
+    /// across `std::thread::scope` worker threads instead of splitting its
+    /// fields apart first.
+    head_cache: Mutex<HashMap<PathBuf, Option<String>>>,
 }
 
 impl<'a> ResolveEnv<'a> {
@@ -449,7 +467,7 @@ impl<'a> ResolveEnv<'a> {
             trees,
             snapshots,
             runner,
-            head_cache: RefCell::new(HashMap::new()),
+            head_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -467,24 +485,49 @@ impl<'a> ResolveEnv<'a> {
     /// same manifest from multiple resolvers). `None` when the file can't be
     /// read.
     pub fn read_head(&self, path: &Path, max_bytes: usize) -> Option<String> {
-        if let Some(cached) = self.head_cache.borrow().get(path) {
+        if let Some(cached) = self.head_cache.lock().unwrap().get(path) {
             return cached.clone();
         }
-        let result = read_head_bytes(path, max_bytes);
+        let result = crate::scan::read_head(path, max_bytes);
         self.head_cache
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(path.to_path_buf(), result.clone());
         result
     }
-}
 
-fn read_head_bytes(path: &Path, max_bytes: usize) -> Option<String> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut buf = vec![0u8; max_bytes];
-    let n = file.read(&mut buf).ok()?;
-    buf.truncate(n);
-    Some(String::from_utf8_lossy(&buf).into_owned())
+    /// Run `program` to completion from this (synchronous) resolve pass,
+    /// off whatever Tokio runtime is currently active: enters the calling
+    /// task's `Handle` on a dedicated OS thread (so a nested `block_on`
+    /// never panics as a reentrant one would) and blocks that thread on the
+    /// command with a 10s timeout. `None` on anything short of a clean,
+    /// timely success — no runtime context (e.g. a plain unit test calling
+    /// in directly), the program isn't on `$PATH`, it exits non-zero, or it
+    /// times out — every caller treats that the same as "this data source
+    /// is unavailable".
+    pub fn run_blocking(&self, program: &str, args: &[&str]) -> Option<Vec<u8>> {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return None;
+        };
+        let runner = self.runner;
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    let _guard = handle.enter();
+                    let token = tokio_util::sync::CancellationToken::new();
+                    let result = handle.block_on(tokio::time::timeout(
+                        Duration::from_secs(10),
+                        runner.run(program, args, &token),
+                    ));
+                    match result {
+                        Ok(Ok(out)) if out.success() => Some(out.stdout),
+                        _ => None,
+                    }
+                })
+                .join()
+                .unwrap_or(None)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -497,6 +540,18 @@ mod tests {
             assert_eq!(Axis::parse(axis.slug()), Some(*axis));
         }
         assert_eq!(Axis::parse("nope"), None);
+    }
+
+    #[test]
+    fn axis_finding_kind_and_bucket_kind_are_axis_specific() {
+        use crate::model::FindingKind;
+        assert_eq!(Axis::Projects.finding_kind(), FindingKind::Project);
+        assert_eq!(Axis::Projects.bucket_kind(), FindingKind::ProjectBucket);
+        assert_eq!(Axis::AppStorage.finding_kind(), FindingKind::AppOwner);
+        assert_eq!(
+            Axis::AppStorage.bucket_kind(),
+            FindingKind::AppStorageBucket
+        );
     }
 
     #[test]
@@ -531,12 +586,8 @@ mod tests {
 
     #[test]
     fn read_head_is_memoised_and_missing_file_is_none() {
-        let paths = Paths::from_home("/tmp/macaudit-attribution-model-test-home");
-        let config = Config::default();
-        let trees: Vec<std::sync::Arc<DirTree>> = Vec::new();
-        let snapshots: HashMap<ScannerId, Snapshot> = HashMap::new();
-        let runner = crate::runner::MockCommandRunner::new();
-        let env = ResolveEnv::new(&paths, &config, &trees, &snapshots, &runner);
+        let fixture = crate::attribution::testutil::EnvFixture::new();
+        let env = fixture.env();
         assert_eq!(
             env.read_head(Path::new("/definitely/not/a/real/path"), 64),
             None

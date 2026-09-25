@@ -243,6 +243,24 @@ fn parse_labels(s: &str) -> HashMap<String, String> {
         .collect()
 }
 
+/// Compose's two project-identifying labels, pulled out of a parsed label
+/// map — the same `(meta key, value)` pairs `emit_containers`, `emit_images`,
+/// and `emit_volumes` each write into their finding's `meta` when present.
+/// Volumes never carry `working_dir`, so that half is simply always `None`
+/// there, same as it always was.
+fn compose_meta(labels: &HashMap<String, String>) -> [(&'static str, Option<&str>); 2] {
+    [
+        (
+            "compose_project",
+            labels.get(COMPOSE_PROJECT_LABEL).map(String::as_str),
+        ),
+        (
+            "compose_working_dir",
+            labels.get(COMPOSE_WORKING_DIR_LABEL).map(String::as_str),
+        ),
+    ]
+}
+
 /// Deserialize one NDJSON line per row (the shape every `docker ... --format
 /// '{{json .}}'` subcommand emits); a line that fails to parse is dropped
 /// rather than aborting the whole inventory.
@@ -352,8 +370,6 @@ async fn emit_containers(ctx: &ScanCtx, containers: &[PsRow]) {
 
     for row in containers {
         let labels = parse_labels(&row.labels);
-        let compose_project = labels.get(COMPOSE_PROJECT_LABEL).cloned();
-        let compose_working_dir = labels.get(COMPOSE_WORKING_DIR_LABEL).cloned();
         let (size_rw_bytes, size_virtual_bytes) = parse_container_size(&row.size);
         let running = row.state == "running";
         let stat = stats.get(&row.id);
@@ -401,11 +417,10 @@ async fn emit_containers(ctx: &ScanCtx, containers: &[PsRow]) {
         if let Some(v) = size_virtual_bytes {
             meta["size_virtual_bytes"] = serde_json::json!(v);
         }
-        if let Some(cp) = &compose_project {
-            meta["compose_project"] = serde_json::json!(cp);
-        }
-        if let Some(wd) = &compose_working_dir {
-            meta["compose_working_dir"] = serde_json::json!(wd);
+        for (key, value) in compose_meta(&labels) {
+            if let Some(value) = value {
+                meta[key] = serde_json::json!(value);
+            }
         }
 
         let mut finding = Finding::new(
@@ -464,8 +479,6 @@ async fn emit_images(ctx: &ScanCtx, containers: &[PsRow]) {
             })
             .map(|(_, labels)| labels.clone())
             .unwrap_or_default();
-        let compose_project = labels.get(COMPOSE_PROJECT_LABEL).cloned();
-        let compose_working_dir = labels.get(COMPOSE_WORKING_DIR_LABEL).cloned();
         let size_bytes = parse_human_size(&row.size);
         let repo_tag = format!("{}:{}", row.repository, row.tag);
         let used_by: Vec<&str> = containers
@@ -482,11 +495,10 @@ async fn emit_images(ctx: &ScanCtx, containers: &[PsRow]) {
             "labels": labels,
             "used_by": used_by,
         });
-        if let Some(cp) = &compose_project {
-            meta["compose_project"] = serde_json::json!(cp);
-        }
-        if let Some(wd) = &compose_working_dir {
-            meta["compose_working_dir"] = serde_json::json!(wd);
+        for (key, value) in compose_meta(&labels) {
+            if let Some(value) = value {
+                meta[key] = serde_json::json!(value);
+            }
         }
         if let Some(sz) = size_bytes {
             meta["size_bytes"] = serde_json::json!(sz);
@@ -556,7 +568,6 @@ async fn emit_volumes(ctx: &ScanCtx) {
     let rows: Vec<VolumeRow> = parse_ndjson(&out);
     for row in rows {
         let labels = parse_labels(&row.labels);
-        let compose_project = labels.get(COMPOSE_PROJECT_LABEL).cloned();
 
         let mut meta = serde_json::json!({
             "object": "volume",
@@ -565,8 +576,10 @@ async fn emit_volumes(ctx: &ScanCtx) {
             "mountpoint": row.mountpoint,
             "labels": labels,
         });
-        if let Some(cp) = &compose_project {
-            meta["compose_project"] = serde_json::json!(cp);
+        for (key, value) in compose_meta(&labels) {
+            if let Some(value) = value {
+                meta[key] = serde_json::json!(value);
+            }
         }
 
         ctx.emit(

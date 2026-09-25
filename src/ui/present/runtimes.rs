@@ -37,7 +37,7 @@ fn key_manager(f: &Finding) -> SortKey {
     key_meta_text(f, "manager")
 }
 
-fn detail(_: &Finding, m: &mut MetaView<'_>) -> Vec<Field> {
+fn detail(_: &Finding, m: &mut MetaView<'_>, _ctx: &DetailCtx) -> Vec<Field> {
     let mut out = Vec::new();
     out.extend(kv_str(m, "runtime", "Runtime"));
     out.extend(kv_str(m, "version", "Version"));

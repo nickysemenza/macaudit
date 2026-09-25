@@ -633,6 +633,32 @@ impl Finding {
         self.coverage = Some(value.into());
         self
     }
+
+    /// A `meta` field as a string, or `None` when absent or not a string.
+    pub fn meta_str(&self, key: &str) -> Option<&str> {
+        self.meta.get(key).and_then(|v| v.as_str())
+    }
+
+    /// A `meta` field as an unsigned integer, or `None` when absent or not
+    /// representable as one.
+    pub fn meta_u64(&self, key: &str) -> Option<u64> {
+        self.meta.get(key).and_then(|v| v.as_u64())
+    }
+
+    /// A `meta` array field's string elements, dropping any non-string
+    /// entries — empty (not `None`) when the key is absent, since callers
+    /// treat "no array" and "empty array" the same way.
+    pub fn meta_strs(&self, key: &str) -> Vec<String> {
+        self.meta
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// Events streamed from scanners to the UI / headless collector over an mpsc
@@ -863,5 +889,20 @@ mod tests {
     fn severity_ordering() {
         assert!(Severity::Info < Severity::Warning);
         assert!(Severity::Reclaimable < Severity::Warning);
+    }
+
+    #[test]
+    fn meta_accessors_read_typed_fields_and_default_on_absence() {
+        let f = Finding::new(FindingKind::App, "/x", "x").meta(serde_json::json!({
+            "name": "ripgrep",
+            "size_bytes": 42u64,
+            "tags": ["a", "b", 3],
+        }));
+        assert_eq!(f.meta_str("name"), Some("ripgrep"));
+        assert_eq!(f.meta_str("missing"), None);
+        assert_eq!(f.meta_u64("size_bytes"), Some(42));
+        assert_eq!(f.meta_u64("name"), None);
+        assert_eq!(f.meta_strs("tags"), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(f.meta_strs("missing"), Vec::<String>::new());
     }
 }

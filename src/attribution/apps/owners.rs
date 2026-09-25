@@ -138,11 +138,7 @@ fn discover_apps(env: &ResolveEnv<'_>) -> Vec<AppOwner> {
             continue;
         }
         let outer_path = root.join(&outer_rel);
-        let bundle_id = f
-            .meta
-            .get("bundle_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+        let bundle_id = f.meta_str("bundle_id").map(str::to_string);
 
         if *path == outer_path {
             // A top-level bundle: build its owner entry. `system_profiler`
@@ -169,21 +165,9 @@ fn discover_apps(env: &ResolveEnv<'_>) -> Vec<AppOwner> {
                     },
                     aliases: Vec::new(),
                     cask_names: Vec::new(),
-                    bundle_name: f
-                        .meta
-                        .get("bundle_name")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
-                    display_name: f
-                        .meta
-                        .get("display_name")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
-                    executable: f
-                        .meta
-                        .get("executable")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
+                    bundle_name: f.meta_str("bundle_name").map(str::to_string),
+                    display_name: f.meta_str("display_name").map(str::to_string),
+                    executable: f.meta_str("executable").map(str::to_string),
                 }
             });
         } else if let Some(bid) = bundle_id {
@@ -205,16 +189,12 @@ fn discover_apps(env: &ResolveEnv<'_>) -> Vec<AppOwner> {
         if f.kind != FindingKind::BrewCask {
             continue;
         }
-        let Some(app_paths) = f.meta.get("app_paths").and_then(|v| v.as_array()) else {
+        let app_paths = f.meta_strs("app_paths");
+        if app_paths.is_empty() {
             continue;
-        };
-        let token = f
-            .meta
-            .get("token")
-            .and_then(|v| v.as_str())
-            .unwrap_or(f.title.as_str());
-        for p in app_paths {
-            let Some(p) = p.as_str() else { continue };
+        }
+        let token = f.meta_str("token").unwrap_or(f.title.as_str());
+        for p in &app_paths {
             if let Some(owner) = top_level.get_mut(&PathBuf::from(p)) {
                 if !owner.cask_names.iter().any(|a| a == token) {
                     owner.cask_names.push(token.to_string());
@@ -232,22 +212,8 @@ fn discover_formulae(env: &ResolveEnv<'_>) -> Vec<FormulaOwner> {
         .iter()
         .filter(|f| f.kind == FindingKind::BrewFormula)
         .map(|f| {
-            let name = f
-                .meta
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or(f.title.as_str())
-                .to_string();
-            let dependents: Vec<String> = f
-                .meta
-                .get("dependents")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|x| x.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let name = f.meta_str("name").unwrap_or(f.title.as_str()).to_string();
+            let dependents: Vec<String> = f.meta_strs("dependents");
             let path = f
                 .path
                 .clone()
@@ -277,22 +243,9 @@ fn discover_tools(env: &ResolveEnv<'_>) -> Vec<ToolOwner> {
         if f.kind != FindingKind::GlobalTool {
             continue;
         }
-        let name = f
-            .meta
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or(f.title.as_str())
-            .to_string();
-        let root = f
-            .meta
-            .get("root")
-            .and_then(|v| v.as_str())
-            .map(PathBuf::from);
-        let install_dir = f
-            .meta
-            .get("install_dir")
-            .and_then(|v| v.as_str())
-            .map(PathBuf::from);
+        let name = f.meta_str("name").unwrap_or(f.title.as_str()).to_string();
+        let root = f.meta_str("root").map(PathBuf::from);
+        let install_dir = f.meta_str("install_dir").map(PathBuf::from);
         let store_dir = f
             .meta
             .get("manager_extra")

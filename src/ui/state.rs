@@ -176,13 +176,6 @@ impl AppState {
             }
             ScanEvent::Footprints { set, .. } => {
                 self.footprints.insert(set.axis, set);
-                // Mirror into `present`'s thread-local so the Projects/App
-                // Storage detail fns — which only ever receive a `Finding`,
-                // like every other section's `DetailFn` — can look up the
-                // full `Footprint`/`FootprintSet` `meta` deliberately
-                // doesn't carry (top entries, processes, baseline/
-                // unattributed lists). See `present::attribution_detail`.
-                crate::ui::present::cache_footprints(&self.footprints);
             }
         }
     }

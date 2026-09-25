@@ -370,25 +370,12 @@ impl AppState {
                 return;
             }
         }
-        if self.selected_section_id() == ScannerId::Fs {
-            if let Some(f) = self.selected_finding() {
-                if f.kind == FindingKind::DiskCategory {
-                    if let Some(path) = f.path.clone() {
-                        self.open_browse_at_path(path);
-                        return;
-                    }
-                }
-            }
-        }
-        // Projects/App Storage: an owner row has a path (its project root
-        // or app/formula/tool path) and opens Browse there, same as a Disk
-        // category. The three synthetic bucket rows never carry a path, so
-        // Enter on them just falls through to the detail pane below.
-        if matches!(
-            self.selected_section_id(),
-            ScannerId::Projects | ScannerId::AppStorage
-        ) {
-            if let Some(f) = self.selected_finding() {
+        // A Disk category or a Projects/App Storage owner row has a path and
+        // opens Browse there. The three synthetic Projects/App Storage
+        // bucket rows never carry a path, so Enter on them just falls
+        // through to the detail pane below.
+        if let Some(f) = self.selected_finding() {
+            if opens_browse(f.kind) {
                 if let Some(path) = f.path.clone() {
                     self.open_browse_at_path(path);
                     return;
@@ -413,6 +400,15 @@ impl AppState {
     fn scroll_detail(&mut self, delta: i16) {
         self.detail_scroll = self.detail_scroll.saturating_add_signed(delta);
     }
+}
+
+/// Whether Enter on a row of this kind opens Browse at its path rather than
+/// the detail pane: a Disk category, or a Projects/App Storage owner row.
+fn opens_browse(kind: FindingKind) -> bool {
+    matches!(
+        kind,
+        FindingKind::DiskCategory | FindingKind::Project | FindingKind::AppOwner
+    )
 }
 
 #[cfg(test)]
@@ -825,5 +821,18 @@ mod tests {
             "a bucket row has no path, so Enter should just force the detail pane on"
         );
         assert_eq!(app.detail_mode, DetailMode::ForceOn);
+    }
+
+    #[test]
+    fn opens_browse_matches_disk_category_project_and_app_owner_only() {
+        for kind in crate::model::FindingKind::ALL {
+            let expected = matches!(
+                kind,
+                crate::model::FindingKind::DiskCategory
+                    | crate::model::FindingKind::Project
+                    | crate::model::FindingKind::AppOwner
+            );
+            assert_eq!(super::opens_browse(*kind), expected, "{kind:?}");
+        }
     }
 }

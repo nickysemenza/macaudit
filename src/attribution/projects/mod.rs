@@ -7,9 +7,6 @@ pub mod names;
 pub mod resolvers;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
-use crate::scan::walk::{DirNode, DirTree};
 
 /// One discovered project: a non-vendored git repo root, or a manifest-only
 /// directory (`PROJECT_MARKERS`) not inside any repo. Worktrees and
@@ -83,23 +80,6 @@ pub(crate) const ARTIFACT_DIR_NAMES: &[&str] = &[
     "Pods",
     "__pycache__",
 ];
-
-/// Find the walked tree containing `path` (if any) and the `DirNode` at that
-/// path within it — the shared lookup both `discovery`'s manifest sweep and
-/// `names`'s manifest search use to walk *directory* structure for free
-/// (`DirNode` has no file entries; callers still need one `listing::list`
-/// per directory they want to inspect for filenames).
-pub(crate) fn find_node<'t>(
-    trees: &'t [Arc<DirTree>],
-    path: &Path,
-) -> Option<(&'t DirTree, &'t DirNode)> {
-    for tree in trees {
-        if let Some(node) = tree.node.find(&tree.root, path) {
-            return Some((tree, node));
-        }
-    }
-    None
-}
 
 #[cfg(test)]
 mod tests {

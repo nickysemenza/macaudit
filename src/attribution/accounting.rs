@@ -26,7 +26,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
-use crate::model::{FindingId, FindingKind};
+use crate::model::FindingId;
 
 use super::model::{
     self, Axis, Claim, EntryKind, Footprint, FootprintEntry, FootprintGroup, FootprintSet, Owner,
@@ -213,10 +213,7 @@ pub fn account(
     }
 
     // 4. Assemble one Footprint per owner.
-    let finding_kind = match axis {
-        Axis::Projects => FindingKind::Project,
-        Axis::AppStorage => FindingKind::AppOwner,
-    };
+    let finding_kind = axis.finding_kind();
     let mut footprints: Vec<Footprint> = all_owner_keys
         .into_iter()
         .map(|key| {
@@ -365,57 +362,37 @@ fn build_entry(
     (entry, ecosystems)
 }
 
-/// Best-effort owner identity from its key alone — see `account`'s doc
-/// comment for why a fuller registry isn't available here. Project keys are
-/// root paths; App Storage keys are bundle ids, or `formula:<name>` /
-/// `tool:<name>` / `homebrew`.
+/// Best-effort owner identity from its key alone, for a claim naming an
+/// owner the registry didn't list — see `account`'s doc comment for when
+/// that happens. Never the normal path: every owner the resolve pass itself
+/// produces (apps, formulae, tools, Homebrew, projects, and now the curated
+/// Apple/cloud-provider bundle ids too) is registered up front with a real
+/// name; this only covers whatever slips through that.
 fn owner_from_key(axis: Axis, key: &str) -> Owner {
-    match axis {
-        Axis::Projects => {
-            let path = PathBuf::from(key);
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| key.to_string());
-            Owner {
-                key: key.to_string(),
-                kind: OwnerKind::Project,
-                name,
-                path: Some(path),
-            }
-        }
-        Axis::AppStorage => {
-            if let Some(name) = key.strip_prefix("formula:") {
-                Owner {
-                    key: key.to_string(),
-                    kind: OwnerKind::Formula,
-                    name: name.to_string(),
-                    path: None,
-                }
-            } else if let Some(name) = key.strip_prefix("tool:") {
-                Owner {
-                    key: key.to_string(),
-                    kind: OwnerKind::Tool,
-                    name: name.to_string(),
-                    path: None,
-                }
-            } else if key == "homebrew" {
-                Owner {
-                    key: key.to_string(),
-                    kind: OwnerKind::Homebrew,
-                    name: "Homebrew".to_string(),
-                    path: None,
-                }
-            } else {
-                let name = key.rsplit('.').next().unwrap_or(key).to_string();
-                Owner {
-                    key: key.to_string(),
-                    kind: OwnerKind::App,
-                    name,
-                    path: None,
-                }
-            }
-        }
+    let kind = if key.starts_with("formula:") {
+        OwnerKind::Formula
+    } else if key.starts_with("tool:") {
+        OwnerKind::Tool
+    } else if key == "homebrew" {
+        OwnerKind::Homebrew
+    } else if axis == Axis::Projects {
+        OwnerKind::Project
+    } else {
+        OwnerKind::App
+    };
+    let name = if axis == Axis::Projects {
+        PathBuf::from(key)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| key.to_string())
+    } else {
+        key.to_string()
+    };
+    Owner {
+        key: key.to_string(),
+        kind,
+        name,
+        path: (axis == Axis::Projects).then(|| PathBuf::from(key)),
     }
 }
 
@@ -429,63 +406,7 @@ fn kind_rank(kind: EntryKind) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, Paths};
-    use crate::model::ScannerId;
-    use crate::runner::MockCommandRunner;
-    use crate::scan::walk::DirTree;
-    use std::collections::HashMap as StdHashMap;
-    use std::sync::Arc;
-
-    fn env<'a>(
-        paths: &'a Paths,
-        config: &'a Config,
-        trees: &'a [Arc<DirTree>],
-        snapshots: &'a StdHashMap<ScannerId, super::super::bus::Snapshot>,
-        runner: &'a MockCommandRunner,
-    ) -> ResolveEnv<'a> {
-        ResolveEnv::new(paths, config, trees, snapshots, runner)
-    }
-
-    struct Fixture {
-        paths: Paths,
-        config: Config,
-        trees: Vec<Arc<DirTree>>,
-        snapshots: StdHashMap<ScannerId, super::super::bus::Snapshot>,
-        runner: MockCommandRunner,
-    }
-
-    impl Fixture {
-        fn new() -> Self {
-            Fixture {
-                paths: Paths::from_home("/tmp/macaudit-accounting-test-home"),
-                config: Config::default(),
-                trees: Vec::new(),
-                snapshots: StdHashMap::new(),
-                runner: MockCommandRunner::new(),
-            }
-        }
-
-        fn env(&self) -> ResolveEnv<'_> {
-            env(
-                &self.paths,
-                &self.config,
-                &self.trees,
-                &self.snapshots,
-                &self.runner,
-            )
-        }
-    }
-
-    fn claim(path: &str, owner: &str, kind: EntryKind, raw_bytes: u64) -> Claim {
-        Claim::new(
-            path,
-            owner,
-            kind,
-            super::super::model::EvidenceTier::Exact,
-            "test",
-        )
-        .raw_bytes_override(raw_bytes)
-    }
+    use crate::attribution::testutil::{claim, EnvFixture};
 
     fn find_entry(set: &FootprintSet, path: impl AsRef<std::path::Path>) -> &FootprintEntry {
         let path = path.as_ref();
@@ -506,7 +427,7 @@ mod tests {
 
     #[test]
     fn nesting_three_distinct_owners_no_negative_no_double_subtraction() {
-        let fixture = Fixture::new();
+        let fixture = EnvFixture::new();
         let claims = vec![
             claim("/root/a", "proj-a", EntryKind::WorkingTree, 300),
             claim("/root/a/b", "proj-b", EntryKind::WorkingTree, 150),
@@ -526,7 +447,7 @@ mod tests {
     #[test]
     fn nesting_same_owner_at_top_and_bottom_of_a_different_middle_owner() {
         // A{p} ⊃ B{q} ⊃ C{p}: C's bytes go to p, B excludes C.
-        let fixture = Fixture::new();
+        let fixture = EnvFixture::new();
         let claims = vec![
             claim("/root/a", "p", EntryKind::WorkingTree, 300),
             claim("/root/a/b", "q", EntryKind::WorkingTree, 150),
@@ -548,7 +469,7 @@ mod tests {
 
     #[test]
     fn same_owner_breakdown_keeps_both_entries_and_the_artifact_finding() {
-        let fixture = Fixture::new();
+        let fixture = EnvFixture::new();
         let claims = vec![
             claim("/root/proj", "p", EntryKind::WorkingTree, 1000),
             Claim::new(
@@ -574,7 +495,7 @@ mod tests {
 
     #[test]
     fn shared_remainder_goes_to_the_first_owner_so_shares_sum_exactly() {
-        let fixture = Fixture::new();
+        let fixture = EnvFixture::new();
         let claims = vec![
             claim("/root/shared", "p1", EntryKind::PackageCache, 10),
             claim("/root/shared", "p2", EntryKind::PackageCache, 10),
@@ -594,7 +515,7 @@ mod tests {
     #[test]
     fn ecosystem_pass_baseline_claim_is_shared_by_tagged_owners_only() {
         use super::super::model::{EvidenceTier, BASELINE_OWNER};
-        let fixture = Fixture::new();
+        let fixture = EnvFixture::new();
         let rust_claim = |path: &str, owner: &str| {
             Claim::new(
                 path,
@@ -641,7 +562,7 @@ mod tests {
 
     #[test]
     fn baseline_share_divides_by_the_ecosystems_owner_count() {
-        let fixture = Fixture::new();
+        let fixture = EnvFixture::new();
         let claims = vec![
             Claim::new(
                 "/root/a",
@@ -692,7 +613,7 @@ mod tests {
 
     #[test]
     fn n_eco_zero_leaves_the_entry_whole_in_baseline() {
-        let fixture = Fixture::new();
+        let fixture = EnvFixture::new();
         // A baseline claim with no ecosystem tag at all (built via struct
         // literal, bypassing the `.baseline(eco)` builder, exactly the
         // "nobody is known to be in this ecosystem" case `N_eco == 0`
@@ -720,7 +641,7 @@ mod tests {
 
     #[test]
     fn clone_of_store_counts_in_reach_not_exclusive() {
-        let fixture = Fixture::new();
+        let fixture = EnvFixture::new();
         let claims = vec![Claim::new(
             "/root/proj/node_modules/.pnpm",
             "p",
@@ -741,7 +662,7 @@ mod tests {
 
     #[test]
     fn virtual_bytes_are_not_in_attributed_total() {
-        let fixture = Fixture::new();
+        let fixture = EnvFixture::new();
         let claims = vec![Claim::new(
             "/docker/image",
             "p",
@@ -761,7 +682,7 @@ mod tests {
 
     #[test]
     fn unattributed_claim_gets_a_reason_and_no_footprint() {
-        let fixture = Fixture::new();
+        let fixture = EnvFixture::new();
         let claims = vec![Claim::new(
             "/Library/Caches/orphan",
             model::UNATTRIBUTED_OWNER,
@@ -782,7 +703,7 @@ mod tests {
 
     #[test]
     fn file_claim_is_sized_via_lstat() {
-        let fixture = Fixture::new();
+        let fixture = EnvFixture::new();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), vec![0u8; 20_000]).unwrap();
         let claims = vec![Claim::new(
@@ -800,7 +721,7 @@ mod tests {
 
     #[test]
     fn unsized_dir_is_flagged() {
-        let fixture = Fixture::new();
+        let fixture = EnvFixture::new();
         let tmp = tempfile::tempdir().unwrap();
         let claims = vec![Claim::new(
             tmp.path(),
@@ -817,7 +738,7 @@ mod tests {
 
     #[test]
     fn empty_claims_yield_an_empty_set_for_the_requested_axis() {
-        let fixture = Fixture::new();
+        let fixture = EnvFixture::new();
         let set = account(Vec::new(), &[], &fixture.env(), Axis::AppStorage);
         assert_eq!(set.axis, Axis::AppStorage);
         assert!(set.footprints.is_empty());

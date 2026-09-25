@@ -21,10 +21,10 @@ struct ContentView: View {
                         if let owner = store.owners[axis]?.selectedOwner {
                             OwnerDetailView(axis: axis)
                                 .navigationTitle(owner.title)
-                                .navigationSubtitle(axis == .projects ? "Projects" : "Apps")
+                                .navigationSubtitle(axis.title)
                         } else {
                             LensView(axis: axis)
-                                .navigationTitle(axis == .projects ? "Projects" : "Apps")
+                                .navigationTitle(axis.title)
                                 .navigationSubtitle(subtitle(for: section))
                         }
                     }

@@ -48,7 +48,8 @@ xcodegen generate --spec apps/MacAudit/project.yml --quiet
 echo "== xcodebuild ($CONFIG)"
 xcodebuild -project apps/MacAudit/MacAudit.xcodeproj -scheme MacAudit \
   -configuration "$CONFIG" -destination "platform=macOS,arch=$ARCH" \
-  -derivedDataPath "$DERIVED" -quiet build
+  -derivedDataPath "$DERIVED" -quiet \
+  ONLY_ACTIVE_ARCH=YES build  # the FFI above is this Mac's arch only; Release would otherwise also link x86_64
 
 echo "== $APP"
 codesign -dvv "$APP" 2>&1 | grep -E '^(Authority|TeamIdentifier)=' | head -2 || true

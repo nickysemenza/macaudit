@@ -47,7 +47,7 @@ fn key_user(f: &Finding) -> SortKey {
     key_meta_text(f, "user")
 }
 
-fn detail(_: &Finding, m: &mut MetaView<'_>) -> Vec<Field> {
+fn detail(_: &Finding, m: &mut MetaView<'_>, _ctx: &DetailCtx) -> Vec<Field> {
     let mut out = Vec::new();
     out.extend(kv_u64(m, "port", "Port"));
     out.extend(kv_str(m, "host", "Bound to"));

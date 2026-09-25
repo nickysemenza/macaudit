@@ -6,7 +6,6 @@ import SwiftUI
 /// `cloneOfStore` is set. Same shape as `FullDiskAccessBanner` — constant
 /// intrinsic constraints, no data-driven frame (see `ColumnSizing.swift`).
 struct ApfsCloneNote: View {
-    let store: AuditStore
     var compact = false
 
     var body: some View {

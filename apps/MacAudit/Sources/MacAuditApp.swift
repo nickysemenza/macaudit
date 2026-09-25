@@ -92,7 +92,7 @@ private struct MenuBarContent: View {
             // Projects/App Storage are top-level lenses (Sidebar), not
             // reclaimable-cleanup sections — kept out of this menu the same
             // way they're kept out of the sidebar's Sections list.
-            ForEach(store.sections.filter { $0.id != .projects && $0.id != .appStorage }, id: \.id) { meta in
+            ForEach(store.scanSections, id: \.id) { meta in
                 let bytes = store.reclaimableBytes(in: meta.id)
                 if bytes > 0 || { if case .scanning = store.status(of: meta.id) { true } else { false } }() {
                     HStack {

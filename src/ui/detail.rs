@@ -7,30 +7,42 @@
 //! `build` is pure (a `Vec<Field>`), `render` turns fields into lines; both
 //! are testable without a terminal.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
+use crate::attribution::model::{Axis, FootprintSet};
 use crate::config::DeleteMode;
 use crate::model::{Finding, ScannerId};
 use crate::remedy::RemedyEngine;
-use crate::ui::present::{self, kv, Field, MetaView};
+use crate::ui::present::{self, kv, DetailCtx, Field, MetaView};
 use crate::ui::{fmt, theme};
 
-/// `scroll` is the pane's vertical scroll offset (lines), owned by
-/// `AppState::detail_scroll` and driven by `J`/`K` or the wheel — this pane is
-/// the only thing on screen that can outgrow its box (a finding's meta +
+/// Per-draw detail-pane state, bundled so `draw` stays under clippy's
+/// argument-count lint: the delete mode remedies are planned under, the
+/// pane's own scroll offset (`J`/`K`/wheel-driven, owned by `AppState::
+/// detail_scroll`), and which remedy the user chose with `e`.
+pub struct DetailState {
+    pub delete_mode: DeleteMode,
+    pub scroll: u16,
+    pub chosen_remedy: Option<usize>,
+}
+
+/// `state.scroll` is the pane's vertical scroll offset (lines) — this pane
+/// is the only thing on screen that can outgrow its box (a finding's meta +
 /// remedies can run to dozens of lines), so it's the one pane that scrolls.
 pub fn draw(
     frame: &mut Frame,
     area: Rect,
     selected: Option<&Finding>,
     section: ScannerId,
-    delete_mode: DeleteMode,
-    scroll: u16,
-    chosen_remedy: Option<usize>,
+    state: DetailState,
+    footprints: &BTreeMap<Axis, Arc<FootprintSet>>,
 ) {
     let block = Block::default().borders(Borders::LEFT).title(" Detail ");
     let text: Vec<Line> = match selected {
@@ -42,9 +54,10 @@ pub fn draw(
             &build_with_choice(
                 f,
                 section,
-                delete_mode,
+                state.delete_mode,
                 std::time::SystemTime::now(),
-                chosen_remedy,
+                state.chosen_remedy,
+                &DetailCtx { footprints },
             ),
             block.inner(area).width,
         ),
@@ -53,13 +66,15 @@ pub fn draw(
         Paragraph::new(text)
             .block(block)
             .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
+            .scroll((state.scroll, 0)),
         area,
     );
 }
 
 /// The detail fields for `f`: generic facts, the section's typed meta rows,
-/// any leftover meta keys, then the remedies.
+/// any leftover meta keys, then the remedies. No attribution axis has
+/// finished a scan in these tests, so `DetailCtx` is built from an empty
+/// footprints map — fine for every section this is used to test.
 #[cfg(test)]
 pub fn build(
     f: &Finding,
@@ -67,7 +82,17 @@ pub fn build(
     delete_mode: DeleteMode,
     now: std::time::SystemTime,
 ) -> Vec<Field> {
-    build_with_choice(f, section, delete_mode, now, None)
+    let footprints = BTreeMap::new();
+    build_with_choice(
+        f,
+        section,
+        delete_mode,
+        now,
+        None,
+        &DetailCtx {
+            footprints: &footprints,
+        },
+    )
 }
 
 /// `build`, marking the remedy the user chose with `e` (▶) and labelling
@@ -78,6 +103,7 @@ pub fn build_with_choice(
     delete_mode: DeleteMode,
     now: std::time::SystemTime,
     chosen: Option<usize>,
+    ctx: &DetailCtx,
 ) -> Vec<Field> {
     let mut fields = vec![Field::Header(""), Field::Text(f.title.clone())];
     if !f.detail.is_empty() && f.detail != f.title {
@@ -110,7 +136,7 @@ pub fn build_with_choice(
 
     if f.meta.is_object() {
         let mut view = MetaView::new(&f.meta);
-        let mut typed = (present::presenter(section).detail)(f, &mut view);
+        let mut typed = (present::presenter(section).detail)(f, &mut view, ctx);
         typed.extend(present::generic_fields(&view.remaining()));
         if !typed.is_empty() {
             fields.push(Field::Blank);

@@ -707,7 +707,7 @@ fn coverage_detail(f: &Finding, m: &mut MetaView<'_>) -> Vec<Field> {
     out
 }
 
-fn detail(f: &Finding, m: &mut MetaView<'_>) -> Vec<Field> {
+fn detail(f: &Finding, m: &mut MetaView<'_>, _ctx: &DetailCtx) -> Vec<Field> {
     match f.kind {
         FindingKind::GlobalTool => tool_detail(f, m),
         FindingKind::CommandResolution => command_detail(f, m),

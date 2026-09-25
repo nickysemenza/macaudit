@@ -21,11 +21,15 @@ pub struct RepoDiscovery {
     pub root: PathBuf,
 }
 
-pub type RepoSender = mpsc::Sender<RepoDiscovery>;
-pub type RepoReceiver = mpsc::Receiver<RepoDiscovery>;
+pub type RepoSender = mpsc::UnboundedSender<RepoDiscovery>;
+pub type RepoReceiver = mpsc::UnboundedReceiver<RepoDiscovery>;
 
-/// Create a bounded repo-discovery channel. Bounded so a slow GitScanner exerts
-/// backpressure on the walker rather than buffering unboundedly.
+/// Create the repo-discovery channel. Deliberately **unbounded**: the walker
+/// sends from rayon threads, and GitScanner sizes each repo's `.git` with the
+/// same walker on the same global rayon pool. With a bounded channel, a full
+/// pipe parks every rayon thread in `send` while GitScanner's `du` waits for
+/// a rayon thread to free up — a deadlock whenever the size cache is cold.
+/// Repo counts are in the hundreds, so buffering them all is free.
 pub fn repo_channel() -> (RepoSender, RepoReceiver) {
-    mpsc::channel(256)
+    mpsc::unbounded_channel()
 }

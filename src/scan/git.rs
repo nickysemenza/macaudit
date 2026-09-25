@@ -512,7 +512,6 @@ mod tests {
             .send(RepoDiscovery {
                 root: inner.clone(),
             })
-            .await
             .unwrap();
         drop(repo_tx);
         GitScanner.scan(ctx).await.unwrap();
@@ -542,7 +541,7 @@ mod tests {
             .on("git", &["-C", &inner_s, "stash", "list"], "");
         let (mut ctx, mut rx, repo_tx) = ctx_with(runner);
         ctx.paths = Arc::new(Paths::from_home(home.path()));
-        repo_tx.send(RepoDiscovery { root: inner }).await.unwrap();
+        repo_tx.send(RepoDiscovery { root: inner }).unwrap();
         drop(repo_tx);
         GitScanner.scan(ctx).await.unwrap();
         let mut names = Vec::new();
@@ -584,10 +583,7 @@ mod tests {
             .on("git", &["-C", &repo_s, "stash", "list"], "");
         let (mut ctx, mut rx, repo_tx) = ctx_with(runner);
         ctx.paths = Arc::new(Paths::from_home(home.path()));
-        repo_tx
-            .send(RepoDiscovery { root: repo.clone() })
-            .await
-            .unwrap();
+        repo_tx.send(RepoDiscovery { root: repo.clone() }).unwrap();
         drop(repo_tx);
         GitScanner.scan(ctx).await.unwrap();
 
@@ -640,7 +636,6 @@ mod tests {
             .send(RepoDiscovery {
                 root: PathBuf::from(repo),
             })
-            .await
             .unwrap();
         drop(repo_tx);
         GitScanner.scan(ctx).await.unwrap();
@@ -702,7 +697,6 @@ mod tests {
             .send(RepoDiscovery {
                 root: PathBuf::from(repo),
             })
-            .await
             .unwrap();
         drop(repo_tx);
 
@@ -747,7 +741,6 @@ mod tests {
             .send(RepoDiscovery {
                 root: PathBuf::from(repo),
             })
-            .await
             .unwrap();
         drop(repo_tx);
 

@@ -1,61 +1,39 @@
-//! One resolver per resource kind ; each turns a `Project`
-//! plus the shared `ResolveEnv` into zero or more `Claim`s. `all()` runs
-//! every resolver over one project, in the table's order; `all_baseline()`
-//! runs each resolver's once-per-scan ecosystem pass.
+//! Every project resolver, as a table (§Part A of the resolver-matrix plan):
+//! `rules.rs` is the data — three row shapes (`Lookup`, `ReverseLink`,
+//! `Baseline`) covering every ecosystem this crate resolves — `apply.rs` is
+//! the one evaluator for all three, `parsers.rs` holds the pure text
+//! parsers the rows reference, and `joins.rs` holds the handful of claim
+//! sources that need a findings snapshot rather than a walk of `~` (Fs
+//! artifacts, Docker, live processes).
+//!
+//! `all()` resolves one project; `all_baseline()` runs once per scan, not
+//! once per project (see `model.rs`'s `BASELINE_OWNER` doc).
 
-pub mod agents;
-pub mod artifacts;
-pub mod brew;
-pub mod caches;
-pub mod docker;
-pub mod editors;
-pub mod go;
-pub mod node;
-pub mod procs;
-pub mod python;
-pub mod rust;
-pub mod simulator;
-pub mod swiftpm;
-pub mod xcode;
+mod apply;
+mod joins;
+mod parsers;
+mod rules;
 
-use super::Project;
+pub use joins::processes_for;
+
 use crate::attribution::model::{Claim, ResolveEnv};
 
-/// Run every ecosystem's `baseline(env)` pass once per scan (never per
-/// project — see `model.rs`'s `BASELINE_OWNER` doc). Each resolver lane
-/// appends its own ecosystem's call here as it lands; not every resolver
-/// has a `baseline` (e.g. `procs`, `artifacts`), so this list is shorter
-/// than `all()`'s.
-pub fn all_baseline(env: &ResolveEnv<'_>) -> Vec<Claim> {
-    let mut claims = Vec::new();
-    claims.extend(node::baseline(env));
-    claims.extend(rust::baseline(env));
-    claims.extend(go::baseline(env));
-    claims.extend(python::baseline(env));
-    claims.extend(docker::baseline(env));
-    claims.extend(xcode::baseline(env));
-    claims.extend(simulator::baseline(env));
-    claims.extend(swiftpm::baseline(env));
-    claims.extend(agents::baseline(env));
+use super::{Project, ProjectIndex};
+
+/// Run every resolver over one project.
+pub fn all(project: &Project, env: &ResolveEnv<'_>) -> Vec<Claim> {
+    let mut claims = joins::artifacts(project, env);
+    claims.extend(apply::lookups(project, env));
+    claims.extend(joins::docker(project, env));
     claims
 }
 
-/// Run every resolver over one project, in table order (§5).
-pub fn all(project: &Project, env: &ResolveEnv<'_>) -> Vec<Claim> {
-    let mut claims = Vec::new();
-    claims.extend(artifacts::resolve(project, env));
-    claims.extend(node::resolve(project, env));
-    claims.extend(rust::resolve(project, env));
-    claims.extend(go::resolve(project, env));
-    claims.extend(python::resolve(project, env));
-    claims.extend(xcode::resolve(project, env));
-    claims.extend(simulator::resolve(project, env));
-    claims.extend(swiftpm::resolve(project, env));
-    claims.extend(docker::resolve(project, env));
-    claims.extend(agents::resolve(project, env));
-    claims.extend(editors::resolve(project, env));
-    claims.extend(brew::resolve(project, env));
-    claims.extend(caches::resolve(project, env));
-    claims.extend(procs::resolve(project, env));
+/// Run every once-per-scan ecosystem pass: reverse-links (DerivedData,
+/// editor workspace storage, agent sessions, pnpm store, simulator
+/// containers), fixed ecosystem baselines, and unlinked Docker objects.
+pub fn all_baseline(env: &ResolveEnv<'_>, index: &ProjectIndex) -> Vec<Claim> {
+    let mut claims = apply::reverse_links(env, index);
+    claims.extend(apply::baselines(env));
+    claims.extend(joins::docker_unlinked(env));
     claims
 }

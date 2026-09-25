@@ -308,7 +308,7 @@ private struct LargestOwnersCard: View {
     let title: String
     let icon: String
 
-    private var sectionId: SectionId { axis == .projects ? .projects : .appStorage }
+    private var sectionId: SectionId { axis.sectionId }
 
     private var top5: [LensModel.Row] {
         Array(LensModel.rows(store.findings(in: sectionId)).prefix(5))

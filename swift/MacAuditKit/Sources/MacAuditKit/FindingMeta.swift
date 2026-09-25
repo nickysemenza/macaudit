@@ -306,36 +306,6 @@ extension Finding {
     }
 }
 
-extension OwnerKind {
-    /// Mirrors `OwnerKind::label()` (`src/attribution/model.rs`) for display.
-    public var label: String {
-        switch self {
-        case .project: "Project"
-        case .app: "App"
-        case .formula: "Formula"
-        case .homebrew: "Homebrew"
-        case .tool: "Tool"
-        case .baseline: "Baseline"
-        case .unattributed: "Unattributed"
-        }
-    }
-
-    /// Reverses `label` — the string an owner Finding's `meta.owner_kind`
-    /// carries.
-    public init?(label: String) {
-        switch label {
-        case "Project": self = .project
-        case "App": self = .app
-        case "Formula": self = .formula
-        case "Homebrew": self = .homebrew
-        case "Tool": self = .tool
-        case "Baseline": self = .baseline
-        case "Unattributed": self = .unattributed
-        default: return nil
-        }
-    }
-}
-
 extension EvidenceTier {
     /// Mirrors `EvidenceTier::label()` for display: how confident the link
     /// from an entry to its owner is, strongest first.
@@ -346,18 +316,6 @@ extension EvidenceTier {
         case .observed: "observed"
         case .ecosystemDefault: "ecosystem default"
         case .curated: "curated"
-        }
-    }
-
-    /// Reverses `label` — the string `meta.top_tier` carries.
-    public init?(label: String) {
-        switch label {
-        case "exact": self = .exact
-        case "name match": self = .nameMatch
-        case "observed": self = .observed
-        case "ecosystem default": self = .ecosystemDefault
-        case "curated": self = .curated
-        default: return nil
         }
     }
 }
@@ -425,6 +383,28 @@ extension EntryKind {
     }
 }
 
+/// A small, closed set of tint names an entry's flag capsules use — a label
+/// rather than a `Color` since MacAuditKit doesn't import SwiftUI; the app
+/// maps each case to a real `Color`.
+public enum FlagTint: Sendable {
+    case orange, blue, purple, gray
+}
+
+extension FootprintEntry {
+    /// This entry's boolean flags as capsule (label, tint, help) triples, in
+    /// display order — shared by the owner entity page's grouped table and
+    /// `EntryInspector`'s badges.
+    public var flags: [(label: String, tint: FlagTint, help: String)] {
+        [
+            stale ? (label: "stale", tint: .orange, help: "stale — the project/app it pointed to is gone") : nil,
+            cloneOfStore ? (label: "clone", tint: .blue, help: "APFS clone of a shared store") : nil,
+            virtualBytes
+                ? (label: "virtual", tint: .purple, help: "Docker-reported size, not counted in any total") : nil,
+            unsized ? (label: "unsized", tint: .gray, help: "outside the walked tree — size unknown") : nil,
+        ].compactMap { $0 }
+    }
+}
+
 extension ProcKind {
     public var label: String {
         switch self {
@@ -436,10 +416,8 @@ extension ProcKind {
 }
 
 /// One resource-kind's byte total within an owner's `by_kind` breakdown
-/// (`OwnerSummary.byKind`). `kind` is `nil` when the label doesn't match any
-/// known `EntryKind` (forward-compatible with a scanner-only label).
+/// (`OwnerSummary.byKind`).
 public struct OwnerKindBytes: Sendable, Equatable {
-    public let kind: EntryKind?
     public let label: String
     public let bytes: UInt64
 }
@@ -447,39 +425,32 @@ public struct OwnerKindBytes: Sendable, Equatable {
 /// Typed view of a Projects/App-Storage owner Finding's summary
 /// (`FindingKind.project`/`.appOwner`) — the `meta` keys `footprint_finding`
 /// (`src/attribution/mod.rs`) writes. The entry-level breakdown is fetched
-/// separately, on demand, via `Engine.footprint(findingId:)`.
+/// separately, on demand, via `Engine.footprint(findingId:)`. `ownerKind` and
+/// `topTier` are left as the raw label strings the meta carries (matching
+/// `OwnerKindBytes.label`) rather than decoded back into `OwnerKind`/
+/// `EvidenceTier` — nothing here needs the enum, only the display string.
 public struct OwnerSummary: Sendable, Equatable {
-    public let ownerKey: String
-    public let ownerKind: OwnerKind?
+    public let ownerKind: String?
     public let exclusive: UInt64
     public let shared: UInt64
     public let reach: UInt64
     public let baselineShare: UInt64
     public let byKind: [OwnerKindBytes]
-    public let entryCount: Int
     public let worktrees: [String]
     public let processCount: Int
     public let ports: [Int]
-    public let topTier: EvidenceTier?
+    public let topTier: String?
     public let cloneNote: Bool
-    public let group: String?
-
-    /// `sizeBytes` on the finding is always `exclusive + shared`
-    /// (`footprint_finding`); exposed here so callers don't have to add it
-    /// back up themselves.
-    public var sizeBytes: UInt64 { exclusive + shared }
 
     public init?(_ f: Finding) {
         guard f.kind == .project || f.kind == .appOwner else { return nil }
         let m = f.meta
-        guard let ownerKey = m.string("owner_key"),
-            let exclusive = m.uint64("exclusive"),
+        guard let exclusive = m.uint64("exclusive"),
             let shared = m.uint64("shared"),
             let reach = m.uint64("reach"),
             let baselineShare = m.uint64("baseline_share")
         else { return nil }
-        self.ownerKey = ownerKey
-        self.ownerKind = m.string("owner_kind").flatMap(OwnerKind.init(label:))
+        self.ownerKind = m.string("owner_kind")
         self.exclusive = exclusive
         self.shared = shared
         self.reach = reach
@@ -488,15 +459,52 @@ public struct OwnerSummary: Sendable, Equatable {
             guard let dict = raw as? [String: Any], let label = dict["kind"] as? String,
                 let bytesNumber = dict["bytes"] as? NSNumber, bytesNumber.doubleValue >= 0
             else { return nil }
-            return OwnerKindBytes(
-                kind: EntryKind(label: label), label: label, bytes: UInt64(bytesNumber.doubleValue))
+            return OwnerKindBytes(label: label, bytes: UInt64(bytesNumber.doubleValue))
         }
-        self.entryCount = Int(m.uint64("entry_count") ?? 0)
         self.worktrees = m.strings("worktrees")
         self.processCount = Int(m.uint64("process_count") ?? 0)
         self.ports = m.array("ports").compactMap { ($0 as? NSNumber)?.intValue }
-        self.topTier = m.string("top_tier").flatMap(EvidenceTier.init(label:))
+        self.topTier = m.string("top_tier")
         self.cloneNote = m.bool("clone_note") ?? false
-        self.group = m.string("group")
+    }
+}
+
+/// Exclusive/Shared/Reach/Baseline-share: the four numbers every owner
+/// carries, with the one-line definition shown as each stat's `.help()` —
+/// shared by `StatTiles` (`OwnerDetailView`) and `OwnerInspector`'s facts
+/// grid, and matching the TUI's own wording.
+public enum FootprintStat: CaseIterable, Hashable, Sendable {
+    case exclusive, shared, reach, baselineShare
+
+    public var title: String {
+        switch self {
+        case .exclusive: "Exclusive"
+        case .shared: "Shared"
+        case .reach: "Reach"
+        case .baselineShare: "Baseline share"
+        }
+    }
+
+    public var help: String {
+        switch self {
+        case .exclusive: "Bytes only this owner touches — not shared, not baseline."
+        case .shared: "This owner's slice of bytes multiple owners touch together."
+        case .reach: "Everything this owner touches, exclusive + shared + baseline share."
+        case .baselineShare: "This owner's slice of ecosystem-wide resources shared by everyone."
+        }
+    }
+}
+
+extension Footprint {
+    /// `FootprintStat` paired with this footprint's own bytes, in display order.
+    public var stats: [(stat: FootprintStat, bytes: UInt64)] {
+        [(.exclusive, exclusive), (.shared, shared), (.reach, reach), (.baselineShare, baselineShare)]
+    }
+}
+
+extension OwnerSummary {
+    /// `FootprintStat` paired with this summary's own bytes, in display order.
+    public var stats: [(stat: FootprintStat, bytes: UInt64)] {
+        [(.exclusive, exclusive), (.shared, shared), (.reach, reach), (.baselineShare, baselineShare)]
     }
 }

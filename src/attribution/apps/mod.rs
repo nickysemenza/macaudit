@@ -31,6 +31,10 @@ pub fn resolve(env: &ResolveEnv<'_>) -> (Vec<Owner>, Vec<Claim>) {
 
     let mut claims = linkers::link(env, &discovered, &candidate_list, &groups);
 
+    // Bound once: it does a handful of live `read_dir` calls (Photos
+    // libraries, CloudStorage providers), and both loops below need it.
+    let apple_data = candidates::apple_data(env);
+
     // The Apple data-location table already knows its owning bundle id, so
     // these skip the tiered linker entirely. `accounting::account` derives
     // a Footprint row from the claim's owner key alone
@@ -40,24 +44,24 @@ pub fn resolve(env: &ResolveEnv<'_>) -> (Vec<Owner>, Vec<Claim>) {
     // under the excluded `/System/Library/CoreServices`, so it's never a
     // discovered owner; a Photos/CloudStorage-provider bundle id may not be
     // an owner either, if the app itself isn't currently installed).
-    for (path, bundle_id, kind, label) in candidates::apple_data(env) {
+    for (path, bundle_id, kind, label) in &apple_data {
         claims.push(
             Claim::new(
-                path,
-                bundle_id,
-                kind,
+                path.clone(),
+                *bundle_id,
+                *kind,
                 EvidenceTier::Exact,
                 "well-known data location",
             )
-            .label(label),
+            .label(label.clone()),
         );
     }
 
     let mut owners = discovered.into_owners();
     // Apple data locations name owners that may not be installed apps
     // (Finder never is): register them so their rows get a real name.
-    for (_, bundle_id, _, _) in candidates::apple_data(env) {
-        if owners.iter().any(|o| o.key == bundle_id) {
+    for (_, bundle_id, _, _) in &apple_data {
+        if owners.iter().any(|o| o.key == **bundle_id) {
             continue;
         }
         let Some(name) = curated::apple_owner_name(bundle_id) else {

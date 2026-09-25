@@ -29,6 +29,7 @@ pub mod tcc;
 pub mod time_machine;
 pub mod volume;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -39,6 +40,28 @@ use crate::config::{Config, Paths};
 use crate::model::{Finding, ScanEvent, ScannerId};
 use crate::runner::CommandRunner;
 use crate::scan::pipe::{RepoReceiver, RepoSender};
+
+/// The first `max_bytes` of a file, decoded lossily as UTF-8. Loops until
+/// EOF or the cap rather than trusting a single `read()` call, which on some
+/// filesystems/kernels can return fewer bytes than requested even when more
+/// remain (a short read used to silently truncate the attribution crate's
+/// manifest parsing). `None` when the file can't be opened at all; an empty
+/// file is `Some(String::new())`.
+pub fn read_head(path: &Path, max_bytes: usize) -> Option<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; max_bytes];
+    let mut total = 0;
+    while total < max_bytes {
+        match file.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(_) => break,
+        }
+    }
+    buf.truncate(total);
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
 
 /// Everything a scanner needs to do its work and report back. Cloneable so a
 /// scanner can hand copies to spawned sub-tasks (the sizing pool, etc.).
@@ -150,4 +173,22 @@ pub async fn run_classified(
 pub trait Scanner: Send + Sync {
     fn id(&self) -> ScannerId;
     async fn scan(&self, ctx: ScanCtx) -> anyhow::Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_head_reads_up_to_the_cap_and_none_for_a_missing_file() {
+        let tmp = std::env::temp_dir().join("macaudit-scan-read-head-test.txt");
+        std::fs::write(&tmp, "hello world").unwrap();
+        assert_eq!(read_head(&tmp, 5), Some("hello".to_string()));
+        assert_eq!(read_head(&tmp, 100), Some("hello world".to_string()));
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(
+            read_head(Path::new("/definitely/not/a/real/path"), 64),
+            None
+        );
+    }
 }

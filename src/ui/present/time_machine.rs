@@ -72,7 +72,7 @@ fn humanize_interval_secs(secs: u64) -> String {
     }
 }
 
-fn detail(f: &Finding, m: &mut MetaView<'_>) -> Vec<Field> {
+fn detail(f: &Finding, m: &mut MetaView<'_>, _ctx: &DetailCtx) -> Vec<Field> {
     let mut out = Vec::new();
     m.skip("group");
     m.skip("status");
@@ -232,7 +232,14 @@ mod tests {
             }),
         );
         let mut view = MetaView::new(&f.meta);
-        let fields = detail(&f, &mut view);
+        let footprints = BTreeMap::new();
+        let fields = detail(
+            &f,
+            &mut view,
+            &DetailCtx {
+                footprints: &footprints,
+            },
+        );
         assert!(fields.contains(&kv("Measurement", "bounded (partial)")));
     }
 

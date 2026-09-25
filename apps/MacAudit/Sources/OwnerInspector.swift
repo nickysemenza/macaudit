@@ -12,7 +12,7 @@ struct OwnerInspector: View {
     let finding: Finding
     let axis: AttributionAxis
 
-    private var sectionId: SectionId { axis == .projects ? .projects : .appStorage }
+    private var sectionId: SectionId { axis.sectionId }
 
     var body: some View {
         if let summary = OwnerSummary(finding) {
@@ -21,7 +21,7 @@ struct OwnerInspector: View {
                     header(summary)
                     facts(summary)
                     if summary.cloneNote {
-                        ApfsCloneNote(store: store, compact: true)
+                        ApfsCloneNote(compact: true)
                     }
                     shareOfAxis(summary)
                     byKind(summary)
@@ -44,7 +44,7 @@ struct OwnerInspector: View {
                 Text(finding.title).font(.title3.weight(.semibold)).textSelection(.enabled)
                 Spacer()
                 if let kind = s.ownerKind {
-                    Text(kind.label)
+                    Text(kind)
                         .font(.caption2.weight(.medium))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
@@ -74,26 +74,17 @@ struct OwnerInspector: View {
 
     private func facts(_ s: OwnerSummary) -> some View {
         Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 10, verticalSpacing: 4) {
-            GridRow {
-                Text("Exclusive").foregroundStyle(.secondary)
-                Text(Formatting.bytes(s.exclusive)).monospacedDigit()
-            }
-            GridRow {
-                Text("Shared").foregroundStyle(.secondary)
-                Text(Formatting.bytes(s.shared)).monospacedDigit()
-            }
-            GridRow {
-                Text("Reach").foregroundStyle(.secondary)
-                Text(Formatting.bytes(s.reach)).monospacedDigit()
-            }
-            GridRow {
-                Text("Baseline share").foregroundStyle(.secondary)
-                Text(Formatting.bytes(s.baselineShare)).monospacedDigit()
+            ForEach(s.stats, id: \.stat) { item in
+                GridRow {
+                    Text(item.stat.title).foregroundStyle(.secondary)
+                    Text(Formatting.bytes(item.bytes)).monospacedDigit()
+                }
+                .help(item.stat.help)
             }
             if let tier = s.topTier {
                 GridRow {
                     Text("Best evidence").foregroundStyle(.secondary)
-                    Text(tier.label)
+                    Text(tier)
                 }
             }
         }
@@ -108,7 +99,7 @@ struct OwnerInspector: View {
         let rows = LensModel.rows(store.findings(in: sectionId))
         if let row = rows.first(where: { $0.finding.id == finding.id }) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Share of \(axis == .projects ? "Projects" : "Apps")").font(.headline)
+                Text("Share of \(axis.title)").font(.headline)
                 OwnerBarCell(row: row)
             }
         }
@@ -122,7 +113,7 @@ struct OwnerInspector: View {
                 ForEach(Array(s.byKind.enumerated()), id: \.offset) { _, k in
                     HStack(spacing: 6) {
                         Circle()
-                            .fill(k.kind.map(Palette.color(for:)) ?? Color.gray)
+                            .fill(Palette.color(forKindLabel: k.label))
                             .frame(width: 8, height: 8)
                         Text(k.label).lineLimit(1)
                         Spacer()

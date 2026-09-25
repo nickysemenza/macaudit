@@ -70,6 +70,17 @@ enum SidebarItem: Hashable {
     }
 }
 
+extension AttributionAxis {
+    /// The sidebar item this axis opens — `AuditStore.openOwner`,
+    /// `SectionSidebar`, and `ContentView`'s detail switch all key off this.
+    var sidebarItem: SidebarItem {
+        switch self {
+        case .projects: .projects
+        case .appStorage: .apps
+        }
+    }
+}
+
 /// The app's single source of truth: the TUI's `AppState` in Swift. Owns the
 /// engine, ingests scan/cleanup events on the main actor, and holds the
 /// UI-only state (selection, marks, remedy choices).
@@ -143,6 +154,14 @@ final class AuditStore {
 
     func meta(for id: SectionId) -> SectionMeta? {
         sections.first { $0.id == id }
+    }
+
+    /// `sections` minus the Projects/App Storage lenses — they're top-level
+    /// items (Sidebar) and axis-driven rescans, not generic scanner sections;
+    /// kept out of the Sections list (`SectionSidebar`), the Rescan-All menu
+    /// (`MacAuditApp`), and the menu bar extra the same way.
+    var scanSections: [SectionMeta] {
+        sections.filter { $0.id != .projects && $0.id != .appStorage }
     }
 
     func status(of id: SectionId) -> SectionStatus {
@@ -344,7 +363,7 @@ final class AuditStore {
     /// table's double-click.
     func openOwner(_ owner: Finding, axis: AttributionAxis) {
         owners[axis]?.open(owner)
-        selectedItem = axis == .projects ? .projects : .apps
+        selectedItem = axis.sidebarItem
         selectedFinding = nil
     }
 
