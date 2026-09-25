@@ -6,11 +6,10 @@
 //! blobs, `.plist`s, ...) via `lstat`, since the tree has no file nodes.
 
 use std::collections::HashMap;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::scan::walk::DirTree;
+use crate::scan::walk::{DirNode, DirTree};
 
 /// Canonicalise `p` onto the literal-component form `DirNode::find` expects
 /// (`walk/mod.rs`'s tree is rooted at the walk's own root, e.g. `/`, with
@@ -129,20 +128,33 @@ impl<'a> Sizer<'a> {
     }
 
     fn compute(&self, path: &Path) -> Sized {
-        for tree in self.trees {
-            if let Some(node) = tree.node.find(&tree.root, path) {
-                return if node.errors > 0 && node.alloc == 0 {
-                    Sized::Unsized
-                } else {
-                    Sized::Dir(node.alloc)
-                };
-            }
+        if let Some(node) = node_at(self.trees, path) {
+            return if node.errors > 0 && node.alloc == 0 {
+                Sized::Unsized
+            } else {
+                Sized::Dir(node.alloc)
+            };
         }
         match std::fs::symlink_metadata(path) {
-            Ok(meta) if meta.is_file() => Sized::File(meta.blocks() * 512),
+            Ok(meta) if meta.is_file() => Sized::File(crate::scan::sizing::on_disk_bytes(&meta)),
             _ => Sized::Unsized,
         }
     }
+}
+
+/// The `DirNode` at `path` in whichever walked tree reached it (a resolver
+/// doesn't know which root's tree a path fell under, so every tree is tried
+/// in turn) — the shared lookup every subtree walk in this crate uses to
+/// traverse *directory* structure for free (`DirNode` has no file entries;
+/// callers still need one `listing::list` per directory they want filenames
+/// for).
+pub fn node_at<'t>(trees: &'t [Arc<DirTree>], path: &Path) -> Option<&'t DirNode> {
+    for tree in trees {
+        if let Some(node) = tree.node.find(&tree.root, path) {
+            return Some(node);
+        }
+    }
+    None
 }
 
 /// Total allocated bytes across every walked root — the denominator for
@@ -258,6 +270,22 @@ mod tests {
             scanned_at: SystemTime::now(),
             elapsed: Duration::from_millis(1),
         })
+    }
+
+    #[test]
+    fn node_at_finds_a_path_in_any_tree_and_none_outside_every_tree() {
+        let a = tiny_tree("/a", vec![leaf("x", 100, 0)]);
+        let b = tiny_tree("/b", vec![leaf("y", 250, 0)]);
+        let trees = [a, b];
+        assert_eq!(
+            node_at(&trees, Path::new("/a/x")).map(|n| n.alloc),
+            Some(100)
+        );
+        assert_eq!(
+            node_at(&trees, Path::new("/b/y")).map(|n| n.alloc),
+            Some(250)
+        );
+        assert!(node_at(&trees, Path::new("/nowhere")).is_none());
     }
 
     #[test]

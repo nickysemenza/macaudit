@@ -30,8 +30,8 @@ fn key_ports(f: &Finding) -> SortKey {
     key_meta_array_len(f, "ports")
 }
 
-fn detail(f: &Finding, m: &mut MetaView<'_>) -> Vec<Field> {
-    attribution_detail(f, m, Axis::Projects)
+fn detail(f: &Finding, m: &mut MetaView<'_>, ctx: &DetailCtx) -> Vec<Field> {
+    attribution_detail(f, m, Axis::Projects, ctx)
 }
 
 static COLUMNS: &[Column] = &[

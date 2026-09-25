@@ -11,7 +11,9 @@
 //! published as `ScanEvent::DirTree` for drill-down views.
 //!
 //! Concurrency contract (spec §1): the sync walk runs inside
-//! `spawn_blocking`; rayon threads bridge back with `blocking_send`. The
+//! `spawn_blocking`; rayon threads bridge back with `blocking_send` for
+//! events and a non-blocking `send` on the unbounded repo pipe (see
+//! `scan::pipe` for why it must never block). The
 //! visitor (and with it `repo_tx`) is dropped the instant the walk finishes
 //! so GitScanner's channel closes before the post-walk derivations.
 
@@ -271,7 +273,7 @@ impl Visitor for FsVisitor {
         // sizes (packfiles are real bytes) but are never loose large files.
         if name == ".git" {
             if let Some(tx) = self.repo_tx.as_ref() {
-                let _ = tx.blocking_send(RepoDiscovery {
+                let _ = tx.send(RepoDiscovery {
                     root: parent.to_path_buf(),
                 });
             }

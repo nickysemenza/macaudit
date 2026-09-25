@@ -64,11 +64,14 @@ impl SizeCache {
                 computed_at INTEGER NOT NULL,
                 root_mtime  INTEGER NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS entitlements (
+            -- v2: dropped the unused `sandboxed` column (tier 2 always runs
+            -- when tier 1 misses — it never gated on sandbox status). A new
+            -- table name, not a migration, since a stale `entitlements` row
+            -- is harmless to leave behind and simpler than an ALTER TABLE.
+            CREATE TABLE IF NOT EXISTS entitlements_v2 (
                 app_path    TEXT PRIMARY KEY,
                 mtime       INTEGER NOT NULL,
-                app_groups  TEXT NOT NULL,
-                sandboxed   INTEGER NOT NULL
+                app_groups  TEXT NOT NULL
             );
             "#,
         )?;
@@ -136,27 +139,20 @@ impl SizeCache {
     ) -> anyhow::Result<Option<CachedEntitlements>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT mtime, app_groups, sandboxed FROM entitlements WHERE app_path = ?1")?;
+            .prepare("SELECT mtime, app_groups FROM entitlements_v2 WHERE app_path = ?1")?;
         let row = stmt
             .query_row(rusqlite::params![app_path.to_string_lossy()], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
             })
             .ok();
-        let Some((cached_mtime, app_groups_json, sandboxed)) = row else {
+        let Some((cached_mtime, app_groups_json)) = row else {
             return Ok(None);
         };
         if cached_mtime != mtime {
             return Ok(None);
         }
         let app_groups: Vec<String> = serde_json::from_str(&app_groups_json).unwrap_or_default();
-        Ok(Some(CachedEntitlements {
-            app_groups,
-            sandboxed: sandboxed != 0,
-        }))
+        Ok(Some(CachedEntitlements { app_groups }))
     }
 
     /// Upsert one app bundle's entitlements read.
@@ -165,32 +161,24 @@ impl SizeCache {
         app_path: &Path,
         mtime: i64,
         app_groups: &[String],
-        sandboxed: bool,
     ) -> anyhow::Result<()> {
         let app_groups_json = serde_json::to_string(app_groups)?;
         self.conn.execute(
-            "INSERT INTO entitlements (app_path, mtime, app_groups, sandboxed)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO entitlements_v2 (app_path, mtime, app_groups)
+             VALUES (?1, ?2, ?3)
              ON CONFLICT(app_path) DO UPDATE SET
                  mtime = excluded.mtime,
-                 app_groups = excluded.app_groups,
-                 sandboxed = excluded.sandboxed",
-            rusqlite::params![
-                app_path.to_string_lossy(),
-                mtime,
-                app_groups_json,
-                sandboxed as i64
-            ],
+                 app_groups = excluded.app_groups",
+            rusqlite::params![app_path.to_string_lossy(), mtime, app_groups_json],
         )?;
         Ok(())
     }
 }
 
-/// A previously fetched app bundle's entitlements (`entitlements` table).
+/// A previously fetched app bundle's entitlements (`entitlements_v2` table).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CachedEntitlements {
     pub app_groups: Vec<String>,
-    pub sandboxed: bool,
 }
 
 /// Path to the size cache database, derived from `Paths::state_dir` (which is
@@ -301,30 +289,19 @@ mod tests {
         let cache = SizeCache::open_in_memory().unwrap();
         let groups = vec!["group.io.robbie.homeassistant".to_string()];
         cache
-            .put_entitlements(
-                Path::new("/Applications/Home Assistant.app"),
-                100,
-                &groups,
-                true,
-            )
+            .put_entitlements(Path::new("/Applications/Home Assistant.app"), 100, &groups)
             .unwrap();
         let got = cache
             .get_entitlements(Path::new("/Applications/Home Assistant.app"), 100)
             .unwrap();
-        assert_eq!(
-            got,
-            Some(CachedEntitlements {
-                app_groups: groups,
-                sandboxed: true,
-            })
-        );
+        assert_eq!(got, Some(CachedEntitlements { app_groups: groups }));
     }
 
     #[test]
     fn entitlements_stale_mtime_misses() {
         let cache = SizeCache::open_in_memory().unwrap();
         cache
-            .put_entitlements(Path::new("/Applications/X.app"), 100, &[], false)
+            .put_entitlements(Path::new("/Applications/X.app"), 100, &[])
             .unwrap();
         assert_eq!(
             cache

@@ -5,6 +5,25 @@ import Foundation
 /// This alias reads better at call sites that don't need the disambiguation.
 public typealias AttributionAxis = Axis
 
+extension AttributionAxis {
+    /// Display name for this lens — the header, the navigation title/
+    /// subtitle, and every "Rescan Projects/Apps" string.
+    public var title: String {
+        switch self {
+        case .projects: "Projects"
+        case .appStorage: "Apps"
+        }
+    }
+
+    /// The scanner section backing this lens.
+    public var sectionId: SectionId {
+        switch self {
+        case .projects: .projects
+        case .appStorage: .appStorage
+        }
+    }
+}
+
 /// Pure ranking / coverage / treemap logic for one attribution lens
 /// (Projects or App Storage). Takes plain `[Finding]` + an optional
 /// `FootprintBuckets` — no engine calls — so `LensView` can drive it
@@ -80,12 +99,13 @@ public enum LensModel {
     }
 
     /// Top-level treemap items: one per owner (area = `exclusive + shared`,
-    /// i.e. `OwnerSummary.sizeBytes`) plus one synthetic "Baseline" item
-    /// summing every baseline entry's bytes. `Squarify.layout` itself drops
-    /// zero-area items, so an axis with no baseline simply omits the cell.
+    /// i.e. the owner Finding's own `sizeBytes` — `footprint_finding` always
+    /// sets it to that sum) plus one synthetic "Baseline" item summing every
+    /// baseline entry's bytes. `Squarify.layout` itself drops zero-area
+    /// items, so an axis with no baseline simply omits the cell.
     public static func treemapItems(_ rows: [Row], buckets: FootprintBuckets?) -> [Squarify.Item] {
         var items = rows.map {
-            Squarify.Item(id: treemapOwnerId($0), value: Double($0.summary.sizeBytes))
+            Squarify.Item(id: treemapOwnerId($0), value: Double($0.finding.sizeBytes ?? 0))
         }
         let baselineTotal = buckets?.baseline.reduce(UInt64(0)) { $0 + $1.bytes } ?? 0
         items.append(Squarify.Item(id: treemapBaselineId, value: Double(baselineTotal)))

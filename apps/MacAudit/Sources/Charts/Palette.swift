@@ -65,35 +65,53 @@ enum Palette {
         categorical[SectionId.allCases.firstIndex(of: id)! % categorical.count]
     }
 
-    /// Stable colour per `EntryKind` — an owner's resource-kind breakdown
-    /// (`OwnerDetailView`'s `BarBreakdown`/table/treemap, `OwnerInspector`).
-    /// Grouped so kinds from the same ecosystem read as a family (Xcode ↔
-    /// Simulator, the various `~/Library` locations, …).
-    static func color(for kind: EntryKind) -> Color {
-        switch kind {
-        case .workingTree: .red
-        case .artifacts: .orange
-        case .worktree: .indigo
-        case .packageCache: .mint
-        case .toolchain: .cyan
-        case .xcode: .purple
-        case .simulator: .pink
-        case .docker: .purple.opacity(0.6)
-        case .agentState: .teal
-        case .editorState: .yellow
-        case .projectCache: .mint.opacity(0.6)
-        case .appBundle: .blue
-        case .container: .indigo.opacity(0.6)
-        case .groupContainer: .indigo.opacity(0.4)
-        case .appSupport: .green
-        case .cache: .teal.opacity(0.6)
-        case .preferences: .brown
-        case .logs: .brown.opacity(0.6)
-        case .webData: .cyan.opacity(0.6)
-        case .savedState: .yellow.opacity(0.6)
-        case .dotDir: .gray.opacity(0.7)
-        case .data: .blue.opacity(0.6)
-        case .other: .gray
+    /// Stable colour per `EntryKind` label — an owner's resource-kind
+    /// breakdown (`OwnerDetailView`'s `BarBreakdown`/table/treemap,
+    /// `OwnerInspector`). Grouped so kinds from the same ecosystem read as a
+    /// family (Xcode ↔ Simulator, the various `~/Library` locations, …).
+    /// Takes `EntryKind.label` rather than the enum itself so a breakdown
+    /// entry whose label doesn't match any known case (forward-compatible
+    /// with a scanner-only label) still gets a colour instead of requiring a
+    /// reverse `EntryKind(label:)` decode.
+    static func color(forKindLabel label: String) -> Color {
+        switch label {
+        case "Working tree": .red
+        case "Artifacts": .orange
+        case "Worktree": .indigo
+        case "Package cache": .mint
+        case "Toolchain": .cyan
+        case "Xcode": .purple
+        case "Simulator": .pink
+        case "Docker": .purple.opacity(0.6)
+        case "Agent state": .teal
+        case "Editor state": .yellow
+        case "Project cache": .mint.opacity(0.6)
+        case "App bundle": .blue
+        case "Container": .indigo.opacity(0.6)
+        case "Group container": .indigo.opacity(0.4)
+        case "App support": .green
+        case "Cache": .teal.opacity(0.6)
+        case "Preferences": .brown
+        case "Logs": .brown.opacity(0.6)
+        case "Web data": .cyan.opacity(0.6)
+        case "Saved state": .yellow.opacity(0.6)
+        case "Dot dir": .gray.opacity(0.7)
+        case "Data": .blue.opacity(0.6)
+        default: .gray
+        }
+    }
+}
+
+extension Color {
+    /// Maps a `FlagTint` (Kit) to a real `Color` — MacAuditKit doesn't
+    /// import SwiftUI, so `FootprintEntry.flags` hands back a tint name and
+    /// the app does this mapping.
+    init(_ tint: FlagTint) {
+        switch tint {
+        case .orange: self = .orange
+        case .blue: self = .blue
+        case .purple: self = .purple
+        case .gray: self = .gray
         }
     }
 }

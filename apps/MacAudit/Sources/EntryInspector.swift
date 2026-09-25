@@ -33,7 +33,7 @@ struct EntryInspector: View {
                 facts
                 badges
                 if entry.cloneOfStore {
-                    ApfsCloneNote(store: store, compact: true)
+                    ApfsCloneNote(compact: true)
                 }
                 evidence
                 if !entry.owners.isEmpty { owners }
@@ -86,22 +86,10 @@ struct EntryInspector: View {
 
     @ViewBuilder
     private var badges: some View {
-        let items: [(String, String, Color)] = [
-            entry.stale ? ("stale", "stale — the project/app it pointed to is gone", .orange) : nil,
-            entry.cloneOfStore ? ("clone", "APFS clone of a shared store", .blue) : nil,
-            entry.virtualBytes ? ("virtual", "Docker-reported size, not counted in any total", .purple) : nil,
-            entry.unsized ? ("unsized", "outside the walked tree — size unknown", .gray) : nil,
-        ].compactMap { $0 }
-        if !items.isEmpty {
+        if !entry.flags.isEmpty {
             HStack(spacing: 6) {
-                ForEach(items, id: \.0) { label, help, color in
-                    Text(label)
-                        .font(.caption2.weight(.medium))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(color.opacity(0.15), in: Capsule())
-                        .foregroundStyle(color)
-                        .help(help)
+                ForEach(entry.flags, id: \.label) { flag in
+                    FlagCapsule(label: flag.label, color: Color(flag.tint), help: flag.help)
                 }
             }
         }
@@ -159,5 +147,24 @@ struct EntryInspector: View {
             }
         }
         .controlSize(.small)
+    }
+}
+
+/// One inline flag capsule, rendering a `FootprintEntry.flags` (MacAuditKit)
+/// triple — shared by this inspector's badges and the owner entity page's
+/// grouped table (`OwnerDetailView.EntryGroupedTable`).
+struct FlagCapsule: View {
+    let label: String
+    let color: Color
+    let help: String
+
+    var body: some View {
+        Text(label)
+            .font(.caption2.weight(.medium))
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(color.opacity(0.15), in: Capsule())
+            .foregroundStyle(color)
+            .help(help)
     }
 }

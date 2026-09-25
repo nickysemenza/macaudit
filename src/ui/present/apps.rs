@@ -63,7 +63,7 @@ fn key_arch(f: &Finding) -> SortKey {
     key_meta_text(f, "arch")
 }
 
-fn detail(_: &Finding, m: &mut MetaView<'_>) -> Vec<Field> {
+fn detail(_: &Finding, m: &mut MetaView<'_>, _ctx: &DetailCtx) -> Vec<Field> {
     let mut out = Vec::new();
     out.extend(kv_str(m, "bundle_id", "Bundle id"));
     out.extend(kv_str(m, "version", "Version"));

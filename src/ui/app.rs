@@ -341,9 +341,12 @@ impl AppState {
                     split[1],
                     self.selected_finding(),
                     self.selected_section_id(),
-                    self.delete_mode,
-                    self.detail_scroll,
-                    chosen,
+                    detail::DetailState {
+                        delete_mode: self.delete_mode,
+                        scroll: self.detail_scroll,
+                        chosen_remedy: chosen,
+                    },
+                    &self.footprints,
                 );
             }
         } else {

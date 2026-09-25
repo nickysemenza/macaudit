@@ -5,7 +5,7 @@ use ratatui::layout::Constraint;
 
 use super::*;
 
-fn detail(_: &Finding, m: &mut MetaView<'_>) -> Vec<Field> {
+fn detail(_: &Finding, m: &mut MetaView<'_>, _ctx: &DetailCtx) -> Vec<Field> {
     let mut out = Vec::new();
     m.skip("group");
     out.extend(kv_str(m, "artifact", "Artifact"));

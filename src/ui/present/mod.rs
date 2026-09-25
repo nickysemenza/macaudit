@@ -25,7 +25,6 @@ mod time_machine;
 mod tools;
 
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -420,12 +419,29 @@ fn prettify_key(key: &str) -> String {
     out
 }
 
+/// Per-draw context a section's detail fn may need beyond the finding and
+/// its meta. Today that's only the attribution axes' full `FootprintSet`s
+/// (`meta` deliberately stays summary-only — see the struct's field doc) —
+/// every other section's detail fn ignores it. Threaded from `AppState` at
+/// the single call site (`ui/detail.rs::build_with_choice`, called from
+/// `app.rs` where `self.footprints` is in hand) rather than looked up via a
+/// thread-local, so the data a detail fn renders is exactly what was in
+/// scope when it was called.
+pub struct DetailCtx<'a> {
+    /// The latest `FootprintSet` per attribution axis — the source for the
+    /// Projects/App Storage detail pane's "Top entries", "Processes", and
+    /// the bucket rows' "Baseline"/"Unattributed" entry lists, none of which
+    /// fit in `meta` without blowing up the FFI's `meta_json` (see the
+    /// attribution plan §4).
+    pub footprints: &'a BTreeMap<Axis, Arc<FootprintSet>>,
+}
+
 /// Section-specific detail rows for a finding's meta. Whatever the fn does
 /// not consume is appended generically, so these only need to handle keys
 /// that deserve a better label or format than the fallback gives.
-pub type DetailFn = fn(&Finding, &mut MetaView<'_>) -> Vec<Field>;
+pub type DetailFn = fn(&Finding, &mut MetaView<'_>, &DetailCtx) -> Vec<Field>;
 
-fn no_detail(_: &Finding, _: &mut MetaView<'_>) -> Vec<Field> {
+fn no_detail(_: &Finding, _: &mut MetaView<'_>, _: &DetailCtx) -> Vec<Field> {
     Vec::new()
 }
 
@@ -543,7 +559,7 @@ pub(super) fn colored(text: impl Into<String>, color: Color) -> CellText {
 }
 
 pub(super) fn meta_str<'a>(f: &'a Finding, key: &str) -> Option<&'a str> {
-    f.meta.get(key).and_then(|v| v.as_str())
+    f.meta_str(key)
 }
 
 pub(super) fn meta_bool(f: &Finding, key: &str) -> Option<bool> {
@@ -551,7 +567,7 @@ pub(super) fn meta_bool(f: &Finding, key: &str) -> Option<bool> {
 }
 
 pub(super) fn meta_u64(f: &Finding, key: &str) -> Option<u64> {
-    f.meta.get(key).and_then(|v| v.as_u64())
+    f.meta_u64(key)
 }
 
 pub(super) fn meta_f64(f: &Finding, key: &str) -> Option<f64> {
@@ -678,30 +694,9 @@ pub(super) fn count_cell(n: usize) -> CellText {
 //
 // The detail pane's "Top entries", "Processes", and the bucket rows'
 // "Baseline"/"Unattributed" entry lists need the full `Footprint`/
-// `FootprintSet` — `meta` deliberately stays summary-only (by_kind bytes,
-// counts) so it doesn't blow up the FFI's `meta_json` (see the attribution
-// plan §4). `DetailFn` only receives a `Finding`, like every other section's
-// detail fn, so rather than change that signature for all 16 sections, the
-// two attribution scanners' data is mirrored here from `AppState.footprints`
-// (`ui/state.rs`, on every `ScanEvent::Footprints`) and looked up by finding
-// id. Single-threaded rendering, hence a plain `RefCell`.
-thread_local! {
-    static FOOTPRINTS: RefCell<BTreeMap<Axis, Arc<FootprintSet>>> =
-        const { RefCell::new(BTreeMap::new()) };
-}
-
-/// Mirror `AppState.footprints` into the thread-local the two attribution
-/// detail fns read from. Called from `ui/state.rs`'s `ScanEvent::Footprints`
-/// handler, right after it updates `AppState.footprints` itself.
-pub(crate) fn cache_footprints(map: &BTreeMap<Axis, Arc<FootprintSet>>) {
-    FOOTPRINTS.with(|c| *c.borrow_mut() = map.clone());
-}
-
-/// The latest `FootprintSet` for `axis`, if that axis has finished at least
-/// one scan since the process started.
-fn cached_footprint_set(axis: Axis) -> Option<Arc<FootprintSet>> {
-    FOOTPRINTS.with(|c| c.borrow().get(&axis).cloned())
-}
+// `FootprintSet` (`meta` deliberately stays summary-only, see `DetailCtx`'s
+// doc) — supplied via `DetailCtx`, threaded through from `AppState.
+// footprints` at the single `DetailFn` call site.
 
 /// A one-line footprint bar: `▮` cells for exclusive, `▯` for shared, `·`
 /// for baseline share. The bar's length is this owner's `reach` scaled
@@ -727,40 +722,27 @@ pub(super) fn bar(
     }
     let filled = ((reach as f64 / max_reach as f64) * width as f64).round() as usize;
     let filled = filled.clamp(1, width);
-    let total = reach.max(1) as u128;
-    let raw = [exclusive, shared, baseline_share];
-    let mut cells = [0usize; 3];
-    let mut assigned = 0usize;
-    for i in 0..3 {
-        cells[i] = (raw[i] as u128 * filled as u128 / total) as usize;
-        assigned += cells[i];
-    }
-    // Rounding can leave `filled - assigned` cells unaccounted for; hand
-    // them to the largest components first so the bar's visible length
-    // always matches `filled` exactly.
-    let mut remaining = filled.saturating_sub(assigned);
-    let mut order = [0usize, 1, 2];
-    order.sort_by_key(|&i| std::cmp::Reverse(raw[i]));
-    for &i in &order {
-        if remaining == 0 {
-            break;
-        }
-        if raw[i] > 0 {
-            cells[i] += 1;
-            remaining -= 1;
-        }
-    }
-    if remaining > 0 {
-        // Only reachable if every component is zero, which `reach == 0`
-        // above already ruled out — kept as a non-panicking fallback.
-        cells[0] += remaining;
-    }
-    let glyphs = ['▮', '▯', '·'];
+
+    // Cumulative rounding: each boundary is the running total's share of
+    // `filled`, rounded independently, so the bar's visible length always
+    // matches `filled` exactly (the last boundary is `filled` itself) —
+    // no separate remainder-distribution pass needed.
+    let total = reach as f64;
+    let b1 = (((exclusive as f64) / total) * filled as f64).round() as usize;
+    let b1 = b1.min(filled);
+    let b2 = ((((exclusive + shared) as f64) / total) * filled as f64).round() as usize;
+    let b2 = b2.clamp(b1, filled);
+    let b3 = filled;
+
     let mut s = String::with_capacity(filled);
-    for (glyph, &n) in glyphs.iter().zip(cells.iter()) {
-        for _ in 0..n {
-            s.push(*glyph);
-        }
+    for _ in 0..b1 {
+        s.push('▮');
+    }
+    for _ in b1..b2 {
+        s.push('▯');
+    }
+    for _ in b2..b3 {
+        s.push('·');
     }
     s
 }
@@ -860,18 +842,26 @@ fn entry_fields(e: &FootprintEntry) -> Vec<Field> {
 /// four numbers, the bar, the by-kind breakdown, top entries, worktrees/
 /// processes/ports and the APFS-clone note for an owner row; coverage/
 /// baseline/unattributed for the three bucket rows.
-pub(super) fn attribution_detail(f: &Finding, m: &mut MetaView<'_>, axis: Axis) -> Vec<Field> {
+pub(super) fn attribution_detail(
+    f: &Finding,
+    m: &mut MetaView<'_>,
+    axis: Axis,
+    ctx: &DetailCtx,
+) -> Vec<Field> {
     if is_attribution_bucket(f) {
-        attribution_bucket_detail(f, m, axis)
+        attribution_bucket_detail(f, m, axis, ctx)
     } else {
-        attribution_owner_detail(f, m, axis)
+        attribution_owner_detail(f, m, axis, ctx)
     }
 }
 
-fn attribution_owner_detail(f: &Finding, m: &mut MetaView<'_>, axis: Axis) -> Vec<Field> {
+fn attribution_owner_detail(
+    f: &Finding,
+    m: &mut MetaView<'_>,
+    axis: Axis,
+    ctx: &DetailCtx,
+) -> Vec<Field> {
     let mut out = Vec::new();
-    m.skip("owner_key");
-    m.skip("group");
     let exclusive = m.u64("exclusive").unwrap_or(0);
     let shared = m.u64("shared").unwrap_or(0);
     let reach = m.u64("reach").unwrap_or(0);
@@ -903,8 +893,8 @@ fn attribution_owner_detail(f: &Finding, m: &mut MetaView<'_>, axis: Axis) -> Ve
     ));
     out.extend(kv_str(m, "top_tier", "Best evidence"));
 
-    let set = cached_footprint_set(axis);
-    if let Some(set) = &set {
+    let set = ctx.footprints.get(&axis);
+    if let Some(set) = set {
         let max_reach = set
             .footprints
             .iter()
@@ -930,73 +920,58 @@ fn attribution_owner_detail(f: &Finding, m: &mut MetaView<'_>, axis: Axis) -> Ve
         }
     }
     m.skip("by_kind");
-    m.skip("entry_count");
 
-    let fp = set
-        .as_ref()
-        .and_then(|s| s.footprints.iter().find(|fp| fp.finding == f.id));
-    match fp {
-        Some(fp) => {
-            m.skip("worktrees");
-            m.skip("process_count");
-            m.skip("ports");
-            m.skip("clone_note");
-            let mut entries: Vec<&FootprintEntry> =
-                fp.groups.iter().flat_map(|g| &g.entries).collect();
-            entries.sort_by_key(|e| std::cmp::Reverse(e.bytes));
-            if !entries.is_empty() {
-                out.push(Field::Blank);
-                out.push(Field::Header("Top entries"));
-                for e in entries.into_iter().take(15) {
-                    out.extend(entry_fields(e));
-                }
-            }
-            if !fp.worktrees.is_empty() {
-                out.push(Field::Blank);
-                out.push(Field::Header("Worktrees"));
-                for w in &fp.worktrees {
-                    out.push(Field::Text(format!("  {}", fmt::abbrev_home(w))));
-                }
-            }
-            if !fp.processes.is_empty() {
-                out.push(Field::Blank);
-                out.push(Field::Header("Processes"));
-                for p in &fp.processes {
-                    out.push(kv(
-                        format!("  {}", p.pid),
-                        format!("{} — {}", p.name, proc_kind_label(p.kind)),
-                    ));
-                }
-            }
-            if !fp.ports.is_empty() {
-                let ports = fp
-                    .ports
-                    .iter()
-                    .map(u16::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                out.push(kv("Ports", ports));
-            }
-            if fp.clone_note {
-                out.push(Field::Blank);
-                out.push(Field::Text(CLONE_NOTE.to_string()));
+    // The `Footprints` event for this axis arrives in the same generation as
+    // its findings, so by the time an owner row exists to select, `ctx.
+    // footprints` already holds its `FootprintSet` — `fp` is always `Some`
+    // in practice. The worktrees/process_count/ports/clone_note meta keys
+    // stay on the Finding only so the table's own cells (which never see
+    // `DetailCtx`) can render without it; the detail pane always prefers the
+    // full `Footprint` below.
+    m.skip("worktrees");
+    m.skip("process_count");
+    m.skip("ports");
+    m.skip("clone_note");
+    let fp = set.and_then(|s| s.footprints.iter().find(|fp| fp.finding == f.id));
+    if let Some(fp) = fp {
+        let mut entries: Vec<&FootprintEntry> = fp.groups.iter().flat_map(|g| &g.entries).collect();
+        entries.sort_by_key(|e| std::cmp::Reverse(e.bytes));
+        if !entries.is_empty() {
+            out.push(Field::Blank);
+            out.push(Field::Header("Top entries"));
+            for e in entries.into_iter().take(15) {
+                out.extend(entry_fields(e));
             }
         }
-        None => {
-            out.extend(kv_list(m, "worktrees", "Worktrees"));
-            if let Some(n) = m.u64("process_count") {
-                if n > 0 {
-                    out.push(kv(
-                        "Processes",
-                        format!("{n} (reopen this row once the scan finishes for detail)"),
-                    ));
-                }
+        if !fp.worktrees.is_empty() {
+            out.push(Field::Blank);
+            out.push(Field::Header("Worktrees"));
+            for w in &fp.worktrees {
+                out.push(Field::Text(format!("  {}", fmt::abbrev_home(w))));
             }
-            out.extend(kv_list(m, "ports", "Ports"));
-            if m.bool("clone_note").unwrap_or(false) {
-                out.push(Field::Blank);
-                out.push(Field::Text(CLONE_NOTE.to_string()));
+        }
+        if !fp.processes.is_empty() {
+            out.push(Field::Blank);
+            out.push(Field::Header("Processes"));
+            for p in &fp.processes {
+                out.push(kv(
+                    format!("  {}", p.pid),
+                    format!("{} — {}", p.name, proc_kind_label(p.kind)),
+                ));
             }
+        }
+        if !fp.ports.is_empty() {
+            let ports = fp
+                .ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push(kv("Ports", ports));
+        }
+        if fp.clone_note {
+            out.push(Field::Blank);
+            out.push(Field::Text(CLONE_NOTE.to_string()));
         }
     }
     out
@@ -1007,7 +982,12 @@ fn attribution_owner_detail(f: &Finding, m: &mut MetaView<'_>, axis: Axis) -> Ve
 /// missing; Baseline/Unattributed list their entries (with `reason` for
 /// Unattributed) from the cached `FootprintSet` — `meta` only carries their
 /// count.
-fn attribution_bucket_detail(f: &Finding, m: &mut MetaView<'_>, axis: Axis) -> Vec<Field> {
+fn attribution_bucket_detail(
+    f: &Finding,
+    m: &mut MetaView<'_>,
+    axis: Axis,
+    ctx: &DetailCtx,
+) -> Vec<Field> {
     let mut out = Vec::new();
     m.skip("group");
     if f.title == "Coverage" {
@@ -1043,7 +1023,7 @@ fn attribution_bucket_detail(f: &Finding, m: &mut MetaView<'_>, axis: Axis) -> V
     }
 
     m.skip("entry_count");
-    let entries = cached_footprint_set(axis).map(|set| {
+    let entries = ctx.footprints.get(&axis).map(|set| {
         if f.title == "Baseline" {
             set.baseline.clone()
         } else {

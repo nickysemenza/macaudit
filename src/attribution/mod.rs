@@ -7,24 +7,31 @@
 //! - `bus.rs` — `ScanBus`, letting the two scanners below wait on other
 //!   sections' latest results without the engine's `plan()` knowing about it.
 //! - `paths.rs` / `accounting.rs` — pure path/byte-accounting logic.
+//! - `lsof.rs` — one cached `lsof` snapshot shared by both axes' live-process
+//!   joins.
 //! - `projects/` — project discovery, naming, and one resolver per resource
 //!   kind.
 //! - `apps/` — app-axis owner discovery, entitlements, candidates, linker
 //!   tiers, and the curated tables.
+//! - `testutil.rs` (test-only) — a shared `ResolveEnv` fixture for resolver/
+//!   accounting/model unit tests.
 
 pub mod accounting;
 pub mod apps;
 pub mod bus;
+pub mod lsof;
 pub mod model;
 pub mod paths;
 pub mod projects;
+#[cfg(test)]
+pub(crate) mod testutil;
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::model::{Finding, FindingKind, ScanEvent, ScannerId};
+use crate::model::{Finding, ScanEvent, ScannerId};
 use crate::scan::{ScanCtx, Scanner};
 
 use bus::ScanBus;
@@ -127,7 +134,7 @@ async fn run(
     // async runtime. The snapshots are moved in; the ctx handles are Arcs.
     let (paths, config, runner) = (ctx.paths.clone(), ctx.config.clone(), ctx.runner.clone());
     let gen = ctx.gen;
-    let mut set = tokio::task::spawn_blocking(move || {
+    let set = tokio::task::spawn_blocking(move || {
         let trees: Vec<Arc<crate::scan::walk::DirTree>> = snapshots
             .values()
             .flat_map(|s| s.dir_trees.iter().cloned())
@@ -136,8 +143,16 @@ async fn run(
         resolve_axis(axis, &env)
     })
     .await?;
-    set.gen = gen;
-    set.missing_deps = missing_deps;
+    // `resolve_axis`'s resolve pass has no way to know this scan's
+    // generation or which dependency sections came back missing — both are
+    // only known here, before the pass even starts. Reconstructed rather
+    // than assigned in place, so there is exactly one place that ever sets
+    // them, not a mutation bolted on after the fact.
+    let set = FootprintSet {
+        gen,
+        missing_deps,
+        ..set
+    };
 
     emit_set(ctx, &set).await;
     let _ = ctx
@@ -165,7 +180,7 @@ fn resolve_axis(axis: Axis, env: &ResolveEnv<'_>) -> FootprintSet {
                 .iter()
                 .flat_map(|p| projects::resolvers::all(p, env))
                 .collect();
-            claims.extend(projects::resolvers::all_baseline(env));
+            claims.extend(projects::resolvers::all_baseline(env, &index));
             let mut set = accounting::account(claims, &owners, env, axis);
             for project in index.projects() {
                 let Some(fp) = set
@@ -176,7 +191,7 @@ fn resolve_axis(axis: Axis, env: &ResolveEnv<'_>) -> FootprintSet {
                     continue;
                 };
                 fp.worktrees = project.worktrees.clone();
-                let (processes, ports) = projects::resolvers::procs::processes_for(project, env);
+                let (processes, ports) = projects::resolvers::processes_for(project, env);
                 fp.processes = processes;
                 fp.ports = ports;
             }
@@ -217,10 +232,7 @@ async fn emit_set(ctx: &ScanCtx, set: &FootprintSet) {
 /// the fake `Footprints` event and the fake `Project`/`AppOwner` findings
 /// must carry identical ids.
 pub(crate) fn footprint_finding(axis: Axis, fp: &Footprint) -> Finding {
-    let kind = match axis {
-        Axis::Projects => FindingKind::Project,
-        Axis::AppStorage => FindingKind::AppOwner,
-    };
+    let kind = axis.finding_kind();
     let by_kind: Vec<serde_json::Value> = fp
         .groups
         .iter()
@@ -233,23 +245,24 @@ pub(crate) fn footprint_finding(axis: Axis, fp: &Footprint) -> Finding {
         .map(|e| e.tier)
         .min()
         .map(|t| t.label());
+    // No `owner_key` (Swift sorts Name by title, not this) and no `group`
+    // (this axis is a `ViewKind::Table`, never grouped — see
+    // `present::attribution_owner_detail`'s doc for the detail-pane side of
+    // this; Swift stops reading `Finding.group` for these two kinds too).
     let mut finding = Finding::new(kind, &fp.owner.key, fp.owner.name.clone())
         .size(fp.exclusive + fp.shared)
         .meta(json!({
-            "owner_key": fp.owner.key,
             "owner_kind": fp.owner.kind.label(),
             "exclusive": fp.exclusive,
             "shared": fp.shared,
             "reach": fp.reach,
             "baseline_share": fp.baseline_share,
             "by_kind": by_kind,
-            "entry_count": fp.groups.iter().map(|g| g.entries.len()).sum::<usize>(),
             "worktrees": fp.worktrees.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
             "process_count": fp.processes.len(),
             "ports": fp.ports,
             "top_tier": top_tier,
             "clone_note": fp.clone_note,
-            "group": fp.owner.kind.label(),
         }));
     if let Some(path) = &fp.owner.path {
         finding = finding.path(path.clone());
@@ -261,10 +274,7 @@ pub(crate) fn footprint_finding(axis: Axis, fp: &Footprint) -> Finding {
 /// one `FootprintSet`. `pub(crate)` for the same reason as
 /// `footprint_finding` — `fake.rs` reuses it verbatim.
 pub(crate) fn bucket_findings(set: &FootprintSet) -> [Finding; 3] {
-    let kind = match set.axis {
-        Axis::Projects => FindingKind::ProjectBucket,
-        Axis::AppStorage => FindingKind::AppStorageBucket,
-    };
+    let kind = set.axis.bucket_kind();
     let prefix = set.axis.scanner().slug();
 
     let baseline = Finding::new(kind, &format!("{prefix}:baseline"), "Baseline")

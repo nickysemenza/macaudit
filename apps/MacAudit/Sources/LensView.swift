@@ -11,7 +11,7 @@ struct LensView: View {
     @Environment(AuditStore.self) private var store
     let axis: AttributionAxis
 
-    private var sectionId: SectionId { axis == .projects ? .projects : .appStorage }
+    private var sectionId: SectionId { axis.sectionId }
 
     var body: some View {
         let browser = store.owners[axis]
@@ -73,19 +73,10 @@ private struct LensHeaderCard: View {
     var body: some View {
         Card {
             HStack(alignment: .firstTextBaseline) {
-                Text(axis == .projects ? "Projects" : "Apps").font(.headline)
+                Text(axis.title).font(.headline)
                 Spacer()
                 if let browser {
-                    Picker(
-                        "", selection: Binding(get: { browser.viewMode }, set: { browser.viewMode = $0 })
-                    ) {
-                        Image(systemName: "list.bullet").tag(OwnerBrowser.ViewMode.list)
-                        Image(systemName: "square.grid.2x2").tag(OwnerBrowser.ViewMode.treemap)
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .controlSize(.small)
-                    .fixedSize()
+                    ViewModePicker(selection: Binding(get: { browser.viewMode }, set: { browser.viewMode = $0 }))
                 }
             }
             if let coverage = LensModel.coverage(browser?.buckets) {
@@ -151,24 +142,7 @@ private struct ProjectsLensTable: View {
     var body: some View {
         @Bindable var store = store
         Table(rows.sorted(using: sortOrder), selection: $store.selectedFinding, sortOrder: $sortOrder) {
-            TableColumn("Name", value: \.summary.ownerKey) { row in
-                Text(row.finding.title).lineLimit(1)
-            }
-            .width(min: 160, ideal: 240)
-            TableColumn("Share") { row in OwnerBarCell(row: row) }
-                .width(min: 130, ideal: 190)
-            TableColumn("Exclusive", value: \.summary.exclusive) { row in
-                Text(Formatting.bytes(row.summary.exclusive)).monospacedDigit()
-            }
-            .width(min: 70, ideal: 90)
-            TableColumn("Shared", value: \.summary.shared) { row in
-                Text(Formatting.bytes(row.summary.shared)).monospacedDigit().foregroundStyle(.secondary)
-            }
-            .width(min: 70, ideal: 90)
-            TableColumn("Reach", value: \.summary.reach) { row in
-                Text(Formatting.bytes(row.summary.reach)).monospacedDigit().foregroundStyle(.secondary)
-            }
-            .width(min: 70, ideal: 90)
+            lensSharedColumns()
             TableColumn("Worktrees", value: \.worktreeCount) { row in
                 Text("\(row.summary.worktrees.count)").foregroundStyle(.secondary)
             }
@@ -184,15 +158,7 @@ private struct ProjectsLensTable: View {
             }
             .width(min: 60, ideal: 110)
         }
-        .contextMenu(forSelectionType: UInt64.self) { ids in
-            if let id = ids.first, let row = rows.first(where: { $0.id == id }) {
-                LensRowContextMenu(store: store, axis: .projects, row: row)
-            }
-        } primaryAction: { ids in
-            if let id = ids.first, let row = rows.first(where: { $0.id == id }) {
-                store.owners[.projects]?.open(row.finding)
-            }
-        }
+        .lensRowActions(store: store, axis: .projects, rows: rows)
     }
 }
 
@@ -206,36 +172,58 @@ private struct AppsLensTable: View {
     var body: some View {
         @Bindable var store = store
         Table(rows.sorted(using: sortOrder), selection: $store.selectedFinding, sortOrder: $sortOrder) {
-            TableColumn("Name", value: \.summary.ownerKey) { row in
-                Text(row.finding.title).lineLimit(1)
-            }
-            .width(min: 160, ideal: 240)
-            TableColumn("Share") { row in OwnerBarCell(row: row) }
-                .width(min: 130, ideal: 190)
-            TableColumn("Exclusive", value: \.summary.exclusive) { row in
-                Text(Formatting.bytes(row.summary.exclusive)).monospacedDigit()
-            }
-            .width(min: 70, ideal: 90)
-            TableColumn("Shared", value: \.summary.shared) { row in
-                Text(Formatting.bytes(row.summary.shared)).monospacedDigit().foregroundStyle(.secondary)
-            }
-            .width(min: 70, ideal: 90)
-            TableColumn("Reach", value: \.summary.reach) { row in
-                Text(Formatting.bytes(row.summary.reach)).monospacedDigit().foregroundStyle(.secondary)
-            }
-            .width(min: 70, ideal: 90)
+            lensSharedColumns()
             TableColumn("Kind", value: \.ownerKindLabel) { row in
-                Text(row.summary.ownerKind?.label ?? "–").foregroundStyle(.secondary)
+                Text(row.summary.ownerKind ?? "–").foregroundStyle(.secondary)
             }
             .width(90)
         }
-        .contextMenu(forSelectionType: UInt64.self) { ids in
+        .lensRowActions(store: store, axis: .appStorage, rows: rows)
+    }
+}
+
+/// The five columns every lens table shows (Name/Share/Exclusive/Shared/
+/// Reach), shared by `ProjectsLensTable` and `AppsLensTable` — each of which
+/// appends its own axis-specific columns after this. A `@TableColumnBuilder`
+/// free function rather than one `Table` with an `if axis == …` inside the
+/// column builder: this target's floor is macOS 14.0 (`project.yml`), and a
+/// *conditional* `TableColumn` needs 14.4 (`_ConditionalContent`'s
+/// `TableColumnContent` conformance) — a plain, unconditional group of
+/// columns like this one has no such requirement.
+@TableColumnBuilder<LensModel.Row, KeyPathComparator<LensModel.Row>>
+private func lensSharedColumns() -> some TableColumnContent<LensModel.Row, KeyPathComparator<LensModel.Row>> {
+    TableColumn("Name", value: \.finding.title) { row in
+        Text(row.finding.title).lineLimit(1)
+    }
+    .width(min: 160, ideal: 240)
+    TableColumn("Share") { row in OwnerBarCell(row: row) }
+        .width(min: 130, ideal: 190)
+    TableColumn("Exclusive", value: \.summary.exclusive) { row in
+        Text(Formatting.bytes(row.summary.exclusive)).monospacedDigit()
+    }
+    .width(min: 70, ideal: 90)
+    TableColumn("Shared", value: \.summary.shared) { row in
+        Text(Formatting.bytes(row.summary.shared)).monospacedDigit().foregroundStyle(.secondary)
+    }
+    .width(min: 70, ideal: 90)
+    TableColumn("Reach", value: \.summary.reach) { row in
+        Text(Formatting.bytes(row.summary.reach)).monospacedDigit().foregroundStyle(.secondary)
+    }
+    .width(min: 70, ideal: 90)
+}
+
+extension View {
+    /// The lens table's shared row context menu + primary (double-click/
+    /// Return) open action — identical between the two tables apart from
+    /// `axis`.
+    fileprivate func lensRowActions(store: AuditStore, axis: AttributionAxis, rows: [LensModel.Row]) -> some View {
+        contextMenu(forSelectionType: UInt64.self) { ids in
             if let id = ids.first, let row = rows.first(where: { $0.id == id }) {
-                LensRowContextMenu(store: store, axis: .appStorage, row: row)
+                LensRowContextMenu(store: store, axis: axis, row: row)
             }
         } primaryAction: { ids in
             if let id = ids.first, let row = rows.first(where: { $0.id == id }) {
-                store.owners[.appStorage]?.open(row.finding)
+                store.owners[axis]?.open(row.finding)
             }
         }
     }
@@ -245,7 +233,7 @@ extension LensModel.Row {
     fileprivate var worktreeCount: Int { summary.worktrees.count }
     fileprivate var processCount: Int { summary.processCount }
     fileprivate var portCount: Int { summary.ports.count }
-    fileprivate var ownerKindLabel: String { summary.ownerKind?.label ?? "" }
+    fileprivate var ownerKindLabel: String { summary.ownerKind ?? "" }
 }
 
 /// A small stacked capsule bar: exclusive (solid accent), shared (faded
@@ -276,74 +264,56 @@ struct OwnerBarCell: View {
 
 /// Squarified treemap of owners (area = exclusive + shared), with a
 /// synthetic Baseline cell, and each owner's `by_kind` breakdown nested one
-/// level inside its cell. Drawing approach mirrors `TreemapView`.
+/// level inside its cell. Layout-only: `TreemapCanvas` owns drawing,
+/// hit-testing, and the hover tooltip.
 private struct LensTreemap: View {
     let store: AuditStore
     let axis: AttributionAxis
     let rows: [LensModel.Row]
     let buckets: FootprintBuckets?
 
-    struct Placed {
-        let id: String
-        let title: String
-        let bytes: UInt64
-        let rect: CGRect
-        let depth: Int
-        let isBaseline: Bool
-        let row: LensModel.Row?
-    }
-
-    @State private var hover: CGPoint?
-
     var body: some View {
         GeometryReader { geo in
-            let placed = layout(size: geo.size)
-            Canvas { ctx, _ in
-                draw(placed, into: &ctx)
-            }
-            .contentShape(Rectangle())
-            .onContinuousHover { phase in
-                switch phase {
-                case .active(let location): hover = location
-                case .ended: hover = nil
-                }
-            }
-            .onTapGesture(count: 2) { point in
-                guard let hit = placed.last(where: { $0.rect.contains(point) }), hit.depth == 0,
-                    let row = hit.row
-                else { return }
-                store.owners[axis]?.open(row.finding)
-            }
-            .onTapGesture(count: 1) { point in
-                guard let hit = placed.last(where: { $0.rect.contains(point) }), hit.depth == 0
-                else { return }
-                store.selectedFinding = hit.row?.finding.id
-            }
-            .overlay(alignment: .topLeading) {
-                if let point = hover, let hit = placed.last(where: { $0.rect.contains(point) }) {
-                    tooltip(for: hit).position(tooltipCenter(for: point, in: geo.size))
-                }
-            }
+            let (cells, rowById) = layout(size: geo.size)
+            TreemapCanvas(
+                cells: cells,
+                // No treemap-level selection highlight here (never drawn
+                // before this consolidation either) — only depth-0 owner
+                // cells select/open, and they do so via `store.selectedFinding`.
+                selected: nil,
+                onSelect: { cell in
+                    guard cell.depth == 0 else { return }
+                    store.selectedFinding = rowById[cell.id]?.finding.id
+                },
+                onOpen: { cell in
+                    guard cell.depth == 0, let row = rowById[cell.id] else { return }
+                    store.owners[axis]?.open(row.finding)
+                })
         }
     }
 
     // MARK: - Layout
 
-    private func layout(size: CGSize) -> [Placed] {
-        guard size.width > 0, size.height > 0 else { return [] }
+    private func layout(size: CGSize) -> ([TreemapCell], [String: LensModel.Row]) {
+        guard size.width > 0, size.height > 0 else { return ([], [:]) }
         let items = LensModel.treemapItems(rows, buckets: buckets)
         let rowById = Dictionary(uniqueKeysWithValues: rows.map { (LensModel.treemapOwnerId($0), $0) })
         let itemValueById = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0.value) })
 
         let bounds = CGRect(origin: .zero, size: size).insetBy(dx: 2, dy: 2)
-        var placed: [Placed] = []
+        var cells: [TreemapCell] = []
         for cell in Squarify.layout(items, in: bounds) {
             let isBaseline = cell.id == LensModel.treemapBaselineId
             let row = rowById[cell.id]
             let title = isBaseline ? "Baseline" : (row?.finding.title ?? cell.id)
             let bytes = UInt64(itemValueById[cell.id] ?? 0)
-            placed.append(
-                Placed(id: cell.id, title: title, bytes: bytes, rect: cell.rect, depth: 0, isBaseline: isBaseline, row: row))
+            let fill: Color =
+                if isBaseline {
+                    .gray.opacity(0.35)
+                } else {
+                    Palette.color(for: title).opacity(0.35)
+                }
+            cells.append(TreemapCell(id: cell.id, title: title, bytes: bytes, rect: cell.rect, depth: 0, fill: fill))
 
             guard let row, cell.rect.width >= 60, cell.rect.height >= 40 else { continue }
             let kindItems = LensModel.kindItems(row)
@@ -355,74 +325,13 @@ private struct LensTreemap: View {
                 uniqueKeysWithValues: kindItems.enumerated().map { i, item in (item.id, row.summary.byKind[i]) })
             for kindCell in Squarify.layout(kindItems, in: content) {
                 guard let k = kindByCellId[kindCell.id] else { continue }
-                placed.append(
-                    Placed(id: kindCell.id, title: k.label, bytes: k.bytes, rect: kindCell.rect, depth: 1, isBaseline: false, row: row))
+                cells.append(
+                    TreemapCell(
+                        id: kindCell.id, title: k.label, bytes: k.bytes, rect: kindCell.rect, depth: 1,
+                        fill: Palette.color(for: k.label).opacity(0.55)))
             }
         }
-        return placed
-    }
-
-    // MARK: - Drawing
-
-    private func draw(_ placed: [Placed], into ctx: inout GraphicsContext) {
-        let separator = Color(nsColor: .windowBackgroundColor)
-        for p in placed {
-            let path = Path(p.rect)
-            let fill: Color =
-                if p.isBaseline {
-                    .gray.opacity(0.35)
-                } else if p.depth == 0 {
-                    Palette.color(for: p.title).opacity(0.35)
-                } else {
-                    Palette.color(for: p.title).opacity(0.55)
-                }
-            ctx.fill(path, with: .color(fill))
-            ctx.stroke(path, with: .color(separator), lineWidth: 1)
-
-            guard p.rect.width > 48, p.rect.height > 16 else { continue }
-            let font: Font = p.depth == 0 ? .caption : .caption2
-            let nameText = ctx.resolve(Text(p.title).font(font))
-            ctx.drawLayer { layer in
-                layer.clip(to: Path(p.rect))
-                layer.draw(nameText, at: CGPoint(x: p.rect.minX + 4, y: p.rect.minY + 2), anchor: .topLeading)
-            }
-            if p.rect.height > 32 {
-                let bytesText = ctx.resolve(
-                    Text(Formatting.bytes(p.bytes)).font(.caption2).foregroundStyle(.secondary))
-                ctx.drawLayer { layer in
-                    layer.clip(to: Path(p.rect))
-                    layer.draw(bytesText, at: CGPoint(x: p.rect.minX + 4, y: p.rect.minY + 18), anchor: .topLeading)
-                }
-            }
-        }
-    }
-
-    // MARK: - Tooltip
-
-    @ViewBuilder
-    private func tooltip(for p: Placed) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(p.title).font(.caption).fontWeight(.semibold).lineLimit(1)
-            Text(Formatting.bytes(p.bytes)).font(.caption2).foregroundStyle(.secondary)
-        }
-        .padding(6)
-        .background(Color(nsColor: .windowBackgroundColor).opacity(0.9), in: RoundedRectangle(cornerRadius: 6))
-        .shadow(radius: 2)
-        .fixedSize()
-    }
-
-    private func tooltipCenter(for point: CGPoint, in bounds: CGSize) -> CGPoint {
-        let estimated = CGSize(width: 160, height: 56)
-        var origin = CGPoint(x: point.x + 12, y: point.y + 12)
-        if origin.x + estimated.width > bounds.width {
-            origin.x = point.x - estimated.width - 12
-        }
-        if origin.y + estimated.height > bounds.height {
-            origin.y = point.y - estimated.height - 12
-        }
-        origin.x = max(estimated.width / 2, origin.x)
-        origin.y = max(estimated.height / 2, origin.y)
-        return CGPoint(x: origin.x + estimated.width / 2, y: origin.y + estimated.height / 2)
+        return (cells, rowById)
     }
 }
 
@@ -441,8 +350,8 @@ private struct LensRowContextMenu: View {
             }
         }
         Divider()
-        Button("Rescan \(axis == .projects ? "Projects" : "Apps")") {
-            store.rescan(axis == .projects ? .projects : .appStorage)
+        Button("Rescan \(axis.title)") {
+            store.rescan(axis.sectionId)
         }
     }
 }

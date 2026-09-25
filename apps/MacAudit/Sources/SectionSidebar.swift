@@ -19,7 +19,7 @@ struct SectionSidebar: View {
                 // Projects/App Storage are top-level lenses above, not
                 // generic scanner sections — kept out of this list and the
                 // Rescan-All menu (`MacAuditApp.swift`) the same way.
-                ForEach(store.sections.filter { $0.id != .projects && $0.id != .appStorage }, id: \.id) { meta in
+                ForEach(store.scanSections, id: \.id) { meta in
                     SectionRow(meta: meta).tag(SidebarItem.section(meta.id))
                 }
             }

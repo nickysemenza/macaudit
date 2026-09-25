@@ -77,7 +77,7 @@ struct FindingInspector: View {
             }
             GridRow {
                 Text("Kind").foregroundStyle(.secondary)
-                Text("\(f.kind)")
+                Text(String(describing: f.kind))
             }
         }
         .font(.callout)

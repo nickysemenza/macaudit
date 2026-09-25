@@ -11,12 +11,13 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::attribution::model::ResolveEnv;
+use crate::attribution::paths::node_at;
 use crate::scan::global_tools::projects::SKIP_DIRS;
 use crate::scan::walk::listing::{self, Kind};
 use crate::scan::walk::DirNode;
 
 use super::discovery::is_package_dir;
-use super::{find_node, Project, ARTIFACT_DIR_NAMES};
+use super::{Project, ARTIFACT_DIR_NAMES};
 
 /// How deep below a project's root the Cargo.toml/`.xcodeproj` search goes.
 const NAME_SEARCH_DEPTH: usize = 4;
@@ -153,7 +154,7 @@ fn resolve_simple_glob(env: &ResolveEnv<'_>, root: &Path, glob: &str) -> Vec<Pat
         return Vec::new();
     }
     let dir = root.join(prefix);
-    let Some((_, node)) = find_node(env.trees, &dir) else {
+    let Some(node) = node_at(env.trees, &dir) else {
         return Vec::new();
     };
     node.children.iter().map(|c| dir.join(&*c.name)).collect()
@@ -166,7 +167,7 @@ fn collect_cargo_and_xcode(
     env: &ResolveEnv<'_>,
     seen: &mut HashSet<String>,
 ) {
-    let Some((_, root_node)) = find_node(env.trees, &project.root) else {
+    let Some(root_node) = node_at(env.trees, &project.root) else {
         return;
     };
     let mut stack: Vec<(PathBuf, &DirNode, usize)> = vec![(project.root.clone(), root_node, 0)];

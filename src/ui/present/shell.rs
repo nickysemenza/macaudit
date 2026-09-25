@@ -65,7 +65,7 @@ fn key_index(f: &Finding) -> SortKey {
     key_meta_int(f, "index")
 }
 
-fn detail(f: &Finding, m: &mut MetaView<'_>) -> Vec<Field> {
+fn detail(f: &Finding, m: &mut MetaView<'_>, _ctx: &DetailCtx) -> Vec<Field> {
     let mut out = Vec::new();
     if f.meta.get("only_in_shell").is_some() {
         out.extend(kv_str(m, "login_shell", "Login shell"));

@@ -52,7 +52,7 @@ fn key_age_days(f: &Finding) -> SortKey {
     key_meta_int(f, "age_days")
 }
 
-fn detail(_: &Finding, m: &mut MetaView<'_>) -> Vec<Field> {
+fn detail(_: &Finding, m: &mut MetaView<'_>, _ctx: &DetailCtx) -> Vec<Field> {
     let mut out = Vec::new();
     out.extend(kv_str(m, "type", "Type"));
     out.extend(kv_u64(m, "bits", "Bits"));

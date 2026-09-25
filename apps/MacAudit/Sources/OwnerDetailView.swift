@@ -35,7 +35,7 @@ struct OwnerDetailView: View {
                         }
                     }
                     Button {
-                        store.rescan(axis == .projects ? .projects : .appStorage)
+                        store.rescan(axis.sectionId)
                     } label: {
                         Label("Rescan", systemImage: "arrow.clockwise")
                     }
@@ -52,7 +52,7 @@ struct OwnerDetailView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     if footprint.cloneNote {
-                        ApfsCloneNote(store: store, compact: false)
+                        ApfsCloneNote(compact: false)
                     }
                     StatTiles(footprint: footprint)
                     if axis == .projects {
@@ -85,9 +85,9 @@ struct OwnerDetailView: View {
             ContentUnavailableView {
                 Label("Not resolved yet", systemImage: "hourglass")
             } description: {
-                Text("This owner hasn't been resolved by a scan yet. Rescan \(axis == .projects ? "Projects" : "Apps") to try again.")
+                Text("This owner hasn't been resolved by a scan yet. Rescan \(axis.title) to try again.")
             } actions: {
-                Button("Rescan") { store.rescan(axis == .projects ? .projects : .appStorage) }
+                Button("Rescan") { store.rescan(axis.sectionId) }
             }
         }
     }
@@ -111,7 +111,7 @@ private struct OwnerBreadcrumbBar: View {
             .disabled(!browser.canGoBack)
             .help("Back")
 
-            Button(axis == .projects ? "Projects" : "Apps") {
+            Button(axis.title) {
                 browser.closeToLanding()
             }
             .buttonStyle(.borderless)
@@ -128,14 +128,7 @@ private struct OwnerBreadcrumbBar: View {
 
             Spacer()
 
-            Picker("", selection: Binding(get: { browser.viewMode }, set: { browser.viewMode = $0 })) {
-                Image(systemName: "list.bullet").tag(OwnerBrowser.ViewMode.list)
-                Image(systemName: "square.grid.2x2").tag(OwnerBrowser.ViewMode.treemap)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .controlSize(.small)
-            .fixedSize()
+            ViewModePicker(selection: Binding(get: { browser.viewMode }, set: { browser.viewMode = $0 }))
 
             if browser.isLoading {
                 ProgressView().controlSize(.small)
@@ -147,30 +140,23 @@ private struct OwnerBreadcrumbBar: View {
 }
 
 /// Exclusive / Shared / Reach / Baseline share, each with a one-line
-/// definition in `.help` (the four numbers §1 of the plan defines).
+/// definition in `.help` — `FootprintStat` (MacAuditKit) is the single place
+/// those four titles/definitions live, shared with `OwnerInspector`'s facts
+/// grid.
 private struct StatTiles: View {
     let footprint: Footprint
 
-    private var tiles: [(String, UInt64, String)] {
-        [
-            ("Exclusive", footprint.exclusive, "Bytes only this owner touches — not shared, not baseline."),
-            ("Shared", footprint.shared, "This owner's slice of bytes multiple owners touch together."),
-            ("Reach", footprint.reach, "Everything this owner touches, exclusive + shared + baseline share."),
-            ("Baseline share", footprint.baselineShare, "This owner's slice of ecosystem-wide resources shared by everyone."),
-        ]
-    }
-
     var body: some View {
         HStack(spacing: 12) {
-            ForEach(tiles, id: \.0) { title, bytes, definition in
+            ForEach(footprint.stats, id: \.stat) { item in
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(title.uppercased()).font(.caption2).foregroundStyle(.secondary)
-                    Text(Formatting.bytes(bytes)).font(.title3.weight(.semibold)).monospacedDigit()
+                    Text(item.stat.title.uppercased()).font(.caption2).foregroundStyle(.secondary)
+                    Text(Formatting.bytes(item.bytes)).font(.title3.weight(.semibold)).monospacedDigit()
                 }
                 .padding(12)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 10))
-                .help(definition)
+                .help(item.stat.help)
             }
         }
     }
@@ -186,7 +172,9 @@ private struct ByKindBreakdown: View {
     var body: some View {
         BarBreakdown(
             rows: groups.map {
-                BarRow(name: $0.kind.label, parts: [(label: $0.kind.label, value: Double($0.bytes))], color: Palette.color(for: $0.kind))
+                BarRow(
+                    name: $0.kind.label, parts: [(label: $0.kind.label, value: Double($0.bytes))],
+                    color: Palette.color(forKindLabel: $0.kind.label))
             },
             title: "By kind",
             format: { Formatting.bytes(UInt64(max(0, $0))) },
@@ -268,7 +256,11 @@ private struct EntryGroupedTable: View {
             }
             .width(min: 90, ideal: 110)
             TableColumn("Flags") { e in
-                EntryBadges(entry: e)
+                HStack(spacing: 4) {
+                    ForEach(e.flags, id: \.label) { flag in
+                        FlagCapsule(label: flag.label, color: Color(flag.tint), help: flag.help)
+                    }
+                }
             }
             .width(min: 90, ideal: 140)
             TableColumn("Path") { e in
@@ -294,33 +286,9 @@ private struct EntryGroupedTable: View {
     }
 }
 
-/// Small inline flag capsules — same idea as `SeverityBadge` but for an
-/// entry's boolean flags, several of which can be true at once.
-private struct EntryBadges: View {
-    let entry: FootprintEntry
-
-    var body: some View {
-        let flags: [(String, Color)] = [
-            entry.stale ? ("stale", .orange) : nil,
-            entry.cloneOfStore ? ("clone", .blue) : nil,
-            entry.virtualBytes ? ("virtual", .purple) : nil,
-            entry.unsized ? ("unsized", .gray) : nil,
-        ].compactMap { $0 }
-        HStack(spacing: 4) {
-            ForEach(flags, id: \.0) { label, color in
-                Text(label)
-                    .font(.caption2.weight(.medium))
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(color.opacity(0.15), in: Capsule())
-                    .foregroundStyle(color)
-            }
-        }
-    }
-}
-
 /// Squarified treemap of one owner's entries, coloured by `EntryKind`. Leaf
-/// cells only — entries don't nest further.
+/// cells only — entries don't nest further. Layout-only: `TreemapCanvas`
+/// owns drawing, hit-testing, and the hover tooltip.
 private struct EntryTreemap: View {
     let store: AuditStore
     let axis: AttributionAxis
@@ -329,59 +297,24 @@ private struct EntryTreemap: View {
     private var browser: OwnerBrowser? { store.owners[axis] }
     private var entries: [FootprintEntry] { groups.flatMap(\.entries) }
 
-    @State private var hover: CGPoint?
-
     var body: some View {
         GeometryReader { geo in
             let bounds = CGRect(origin: .zero, size: geo.size).insetBy(dx: 2, dy: 2)
             let items = entries.map { Squarify.Item(id: $0.path, value: Double($0.bytes)) }
-            let cells = Squarify.layout(items, in: bounds)
             let byPath = Dictionary(uniqueKeysWithValues: entries.map { ($0.path, $0) })
+            let cells = Squarify.layout(items, in: bounds).compactMap { cell -> TreemapCell? in
+                guard let entry = byPath[cell.id] else { return nil }
+                return TreemapCell(
+                    id: cell.id, title: entry.label, bytes: entry.bytes, rect: cell.rect, depth: 0,
+                    fill: Palette.color(forKindLabel: entry.kind.label).opacity(0.4))
+            }
 
-            Canvas { ctx, _ in
-                for cell in cells {
-                    guard let entry = byPath[cell.id] else { continue }
-                    let path = Path(cell.rect)
-                    ctx.fill(path, with: .color(Palette.color(for: entry.kind).opacity(0.4)))
-                    ctx.stroke(path, with: .color(Color(nsColor: .windowBackgroundColor)), lineWidth: 1)
-                    if browser?.selectedEntry?.path == entry.path {
-                        ctx.stroke(path, with: .color(.accentColor), lineWidth: 2)
-                    }
-                    guard cell.rect.width > 48, cell.rect.height > 16 else { continue }
-                    let text = ctx.resolve(Text(entry.label).font(.caption2))
-                    ctx.drawLayer { layer in
-                        layer.clip(to: Path(cell.rect))
-                        layer.draw(text, at: CGPoint(x: cell.rect.minX + 4, y: cell.rect.minY + 2), anchor: .topLeading)
-                    }
-                }
-            }
-            .contentShape(Rectangle())
-            .onContinuousHover { phase in
-                switch phase {
-                case .active(let location): hover = location
-                case .ended: hover = nil
-                }
-            }
-            .onTapGesture { point in
-                guard let cell = cells.last(where: { $0.rect.contains(point) }), let entry = byPath[cell.id]
-                else { return }
-                browser?.selectedEntry = entry
-            }
-            .overlay(alignment: .topLeading) {
-                if let point = hover, let cell = cells.last(where: { $0.rect.contains(point) }),
-                    let entry = byPath[cell.id]
-                {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(entry.label).font(.caption).fontWeight(.semibold).lineLimit(1)
-                        Text(Formatting.bytes(entry.bytes)).font(.caption2).foregroundStyle(.secondary)
-                    }
-                    .padding(6)
-                    .background(Color(nsColor: .windowBackgroundColor).opacity(0.9), in: RoundedRectangle(cornerRadius: 6))
-                    .shadow(radius: 2)
-                    .fixedSize()
-                    .position(x: min(point.x + 80, geo.size.width - 80), y: min(point.y + 30, geo.size.height - 20))
-                }
-            }
+            TreemapCanvas(
+                cells: cells,
+                selected: browser?.selectedEntry?.path,
+                onSelect: { cell in
+                    browser?.selectedEntry = byPath[cell.id]
+                })
         }
     }
 }

@@ -48,7 +48,7 @@ fn key_state(f: &Finding) -> SortKey {
     SortKey::Int(score)
 }
 
-fn detail(_: &Finding, m: &mut MetaView<'_>) -> Vec<Field> {
+fn detail(_: &Finding, m: &mut MetaView<'_>, _ctx: &DetailCtx) -> Vec<Field> {
     let mut out = Vec::new();
     out.extend(kv_str(m, "branch", "Branch"));
     if let Some(dirty) = m.bool("dirty") {

@@ -108,14 +108,7 @@ private struct BreadcrumbBar: View {
 
             Spacer()
 
-            Picker("", selection: $browser.viewMode) {
-                Image(systemName: "list.bullet").tag(DirBrowser.ViewMode.list)
-                Image(systemName: "square.grid.2x2").tag(DirBrowser.ViewMode.treemap)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .controlSize(.small)
-            .fixedSize()
+            ViewModePicker(selection: $browser.viewMode)
 
             if browser.isLoading {
                 ProgressView().controlSize(.small)

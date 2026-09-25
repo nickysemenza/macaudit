@@ -11,10 +11,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use crate::attribution::model::{self, Claim, EntryKind, EvidenceTier, ResolveEnv};
-use crate::runner::CommandRunner;
 
 use super::candidates::Candidate;
 use super::curated::{self, CuratedTarget};
@@ -35,7 +33,7 @@ pub(crate) fn link(
     env: &ResolveEnv<'_>,
     owners: &Owners,
     candidates: &[Candidate],
-    groups: &HashMap<PathBuf, (Vec<String>, bool)>,
+    groups: &HashMap<PathBuf, Vec<String>>,
 ) -> Vec<Claim> {
     let observed = observed_opens(env, owners, candidates);
 
@@ -85,7 +83,7 @@ pub(crate) fn link(
 /// the unit tests below exercise directly.
 fn resolve_candidate(
     owners: &Owners,
-    groups: &HashMap<PathBuf, (Vec<String>, bool)>,
+    groups: &HashMap<PathBuf, Vec<String>>,
     observed: &HashSet<(String, PathBuf)>,
     candidate: &Candidate,
 ) -> (Vec<OwnerHit>, EvidenceTier) {
@@ -122,7 +120,7 @@ fn resolve_candidate(
 /// app groups.
 fn tier1_exact(
     owners: &Owners,
-    groups: &HashMap<PathBuf, (Vec<String>, bool)>,
+    groups: &HashMap<PathBuf, Vec<String>>,
     candidate: &Candidate,
 ) -> Vec<OwnerHit> {
     let cand_lower = candidate.name.to_lowercase();
@@ -139,7 +137,7 @@ fn tier1_exact(
         }
         if candidate.parent_kind == EntryKind::GroupContainer {
             if let Some(app_path) = &app.owner.path {
-                if let Some((entitled_groups, _)) = groups.get(app_path) {
+                if let Some(entitled_groups) = groups.get(app_path) {
                     if entitled_groups
                         .iter()
                         .any(|g| g.to_lowercase() == cand_lower)
@@ -412,6 +410,26 @@ fn last_component(bundle_id: &str) -> &str {
     bundle_id.rsplit('.').next().unwrap_or(bundle_id)
 }
 
+/// One `AppBundle`/`Exact` claim for an owner's own storage — the shape
+/// every "this is the owner's own thing" claim in `owner_own_claims` and
+/// `formula_sharing_claims` shares, differing only in path/owner/evidence/
+/// label.
+fn own(
+    path: impl Into<PathBuf>,
+    owner_key: impl Into<String>,
+    evidence: impl Into<String>,
+    label: impl Into<String>,
+) -> Claim {
+    Claim::new(
+        path,
+        owner_key,
+        EntryKind::AppBundle,
+        EvidenceTier::Exact,
+        evidence,
+    )
+    .label(label)
+}
+
 /// Every owner's own bundle/Cellar/install dir, plus Homebrew's own cache,
 /// logs, and prefix top-level dirs (the Cellar/Caskroom dirs nested under
 /// the prefix are separate owners, claimed above by their own formula, so
@@ -422,58 +440,42 @@ fn owner_own_claims(env: &ResolveEnv<'_>, owners: &Owners) -> Vec<Claim> {
 
     for app in &owners.apps {
         if let Some(path) = &app.owner.path {
-            claims.push(
-                Claim::new(
-                    path.clone(),
-                    app.owner.key.clone(),
-                    EntryKind::AppBundle,
-                    EvidenceTier::Exact,
-                    "the app bundle",
-                )
-                .label(app.owner.name.clone()),
-            );
+            claims.push(own(
+                path.clone(),
+                app.owner.key.as_str(),
+                "the app bundle",
+                app.owner.name.as_str(),
+            ));
         }
     }
 
     for formula in &owners.formulae {
         if let Some(path) = &formula.owner.path {
-            claims.push(
-                Claim::new(
-                    path.clone(),
-                    formula.owner.key.clone(),
-                    EntryKind::AppBundle,
-                    EvidenceTier::Exact,
-                    "Cellar",
-                )
-                .label(formula.owner.name.clone()),
-            );
+            claims.push(own(
+                path.clone(),
+                formula.owner.key.as_str(),
+                "Cellar",
+                formula.owner.name.as_str(),
+            ));
         }
     }
 
     for tool in &owners.tools {
         if let Some(path) = &tool.owner.path {
-            claims.push(
-                Claim::new(
-                    path.clone(),
-                    tool.owner.key.clone(),
-                    EntryKind::AppBundle,
-                    EvidenceTier::Exact,
-                    "install directory",
-                )
-                .label(tool.owner.name.clone()),
-            );
+            claims.push(own(
+                path.clone(),
+                tool.owner.key.as_str(),
+                "install directory",
+                tool.owner.name.as_str(),
+            ));
         }
         for extra in &tool.extra_paths {
-            claims.push(
-                Claim::new(
-                    extra.clone(),
-                    tool.owner.key.clone(),
-                    EntryKind::AppBundle,
-                    EvidenceTier::Exact,
-                    "shared store directory",
-                )
-                .label(tool.owner.name.clone()),
-            );
+            claims.push(own(
+                extra.clone(),
+                tool.owner.key.as_str(),
+                "shared store directory",
+                tool.owner.name.as_str(),
+            ));
         }
     }
 
@@ -481,22 +483,22 @@ fn owner_own_claims(env: &ResolveEnv<'_>, owners: &Owners) -> Vec<Claim> {
         claims.push(
             Claim::new(
                 env.paths.home.join("Library/Caches/Homebrew"),
-                homebrew.key.clone(),
+                homebrew.key.as_str(),
                 EntryKind::Cache,
                 EvidenceTier::Exact,
                 "Homebrew's own cache",
             )
-            .label("Homebrew".to_string()),
+            .label("Homebrew"),
         );
         claims.push(
             Claim::new(
                 env.paths.home.join("Library/Logs/Homebrew"),
-                homebrew.key.clone(),
+                homebrew.key.as_str(),
                 EntryKind::Logs,
                 EvidenceTier::Exact,
                 "Homebrew's own logs",
             )
-            .label("Homebrew".to_string()),
+            .label("Homebrew"),
         );
         if let Some(prefix) = &homebrew.path {
             const PREFIX_DIRS: &[&str] = &[
@@ -513,16 +515,12 @@ fn owner_own_claims(env: &ResolveEnv<'_>, owners: &Owners) -> Vec<Claim> {
                 "Homebrew",
             ];
             for dir in PREFIX_DIRS {
-                claims.push(
-                    Claim::new(
-                        prefix.join(dir),
-                        homebrew.key.clone(),
-                        EntryKind::AppBundle,
-                        EvidenceTier::Exact,
-                        "Homebrew prefix",
-                    )
-                    .label("Homebrew".to_string()),
-                );
+                claims.push(own(
+                    prefix.join(dir),
+                    homebrew.key.as_str(),
+                    "Homebrew prefix",
+                    "Homebrew",
+                ));
             }
         }
     }
@@ -549,25 +547,24 @@ fn formula_sharing_claims(owners: &Owners) -> Vec<Claim> {
             else {
                 continue;
             };
-            claims.push(
-                Claim::new(
-                    path.clone(),
-                    dependent.owner.key.clone(),
-                    EntryKind::AppBundle,
-                    EvidenceTier::Exact,
-                    format!("dependency of {dependent_name}"),
-                )
-                .label(formula.owner.name.clone()),
-            );
+            claims.push(own(
+                path.clone(),
+                dependent.owner.key.as_str(),
+                format!("dependency of {dependent_name}"),
+                formula.owner.name.as_str(),
+            ));
         }
     }
     claims
 }
 
-/// One `lsof`/`ps` pass: which (owner key, candidate path) pairs a running
-/// process of that owner's app has a file open under. Best-effort — `None`
-/// from either command (no Tokio runtime, command missing, timeout) simply
-/// yields no observed hits, same as any other degraded scanner input.
+/// Which (owner key, candidate path) pairs a running process of that
+/// owner's app has a file open under, from a `ps` pass (pid → full
+/// executable path, to attribute the pid to an owner) joined against the
+/// shared `lsof` snapshot (`attribution::lsof`, already memoised for the
+/// whole resolve pass). Best-effort — `None` from `ps` (no Tokio runtime,
+/// command missing, timeout) simply yields no observed hits, same as any
+/// other degraded scanner input.
 fn observed_opens(
     env: &ResolveEnv<'_>,
     owners: &Owners,
@@ -577,33 +574,10 @@ fn observed_opens(
     if owners.apps.is_empty() || candidates.is_empty() {
         return result;
     }
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+    let Some(ps_out) = env.run_blocking("ps", &["-axo", "pid,comm"]) else {
         return result;
     };
-    let runner = env.runner;
-
-    let (ps_out, lsof_out) = std::thread::scope(|scope| {
-        scope
-            .spawn(move || {
-                let _guard = handle.enter();
-                let ps = run_blocking(runner, "ps", &["-axo", "pid,comm"]);
-                let user = std::env::var("USER").unwrap_or_default();
-                let lsof = run_blocking(
-                    runner,
-                    "lsof",
-                    &["-a", "-u", &user, "-d", "^txt,^mem", "-F", "pn"],
-                );
-                (ps, lsof)
-            })
-            .join()
-            .unwrap_or((None, None))
-    });
-    let (Some(ps_out), Some(lsof_out)) = (ps_out, lsof_out) else {
-        return result;
-    };
-
-    let procs = parse_ps_pid_comm(&ps_out);
-    let opens = parse_lsof_pn(&lsof_out);
+    let procs = parse_ps_pid_comm(&String::from_utf8_lossy(&ps_out));
 
     let mut pid_owner: HashMap<u32, String> = HashMap::new();
     for (pid, comm) in &procs {
@@ -620,30 +594,16 @@ fn observed_opens(
         return result;
     }
 
-    for (pid, opened_path) in &opens {
-        let Some(owner_key) = pid_owner.get(pid) else {
-            continue;
-        };
-        for candidate in candidates {
-            if opened_path.starts_with(&candidate.path) {
+    let files = crate::attribution::lsof::snapshot(env);
+    for candidate in candidates {
+        for file in crate::attribution::lsof::open_under(&files, &candidate.path) {
+            if let Some(owner_key) = pid_owner.get(&file.pid) {
                 result.insert((owner_key.clone(), candidate.path.clone()));
             }
         }
     }
 
     result
-}
-
-fn run_blocking(runner: &dyn CommandRunner, program: &str, args: &[&str]) -> Option<String> {
-    let token = tokio_util::sync::CancellationToken::new();
-    let result = tokio::runtime::Handle::current().block_on(tokio::time::timeout(
-        Duration::from_secs(10),
-        runner.run(program, args, &token),
-    ));
-    match result {
-        Ok(Ok(out)) if out.success() => Some(out.stdout_str().into_owned()),
-        _ => None,
-    }
 }
 
 /// `ps -axo pid,comm`'s rows, skipping the header line. `comm` is the full
@@ -661,23 +621,6 @@ fn parse_ps_pid_comm(output: &str) -> Vec<(u32, String)> {
             Some((pid, rest.trim().to_string()))
         })
         .collect()
-}
-
-/// `lsof -F pn`'s output: a `p<pid>` line starts a block, each following
-/// `n<path>` line is one file that pid has open.
-fn parse_lsof_pn(output: &str) -> Vec<(u32, PathBuf)> {
-    let mut out = Vec::new();
-    let mut current_pid: Option<u32> = None;
-    for line in output.lines() {
-        if let Some(rest) = line.strip_prefix('p') {
-            current_pid = rest.trim().parse().ok();
-        } else if let Some(rest) = line.strip_prefix('n') {
-            if let Some(pid) = current_pid {
-                out.push((pid, PathBuf::from(rest)));
-            }
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -708,7 +651,6 @@ mod tests {
             name: name.to_string(),
             parent_kind: kind,
             vendor: vendor.map(str::to_string),
-            is_file: false,
         }
     }
 
@@ -721,7 +663,7 @@ mod tests {
         }
     }
 
-    fn empty_groups() -> HashMap<PathBuf, (Vec<String>, bool)> {
+    fn empty_groups() -> HashMap<PathBuf, Vec<String>> {
         HashMap::new()
     }
 
@@ -847,7 +789,7 @@ mod tests {
         let mut groups = empty_groups();
         groups.insert(
             PathBuf::from("/Applications/Home Assistant.app"),
-            (vec!["group.io.robbie.homeassistant".to_string()], true),
+            vec!["group.io.robbie.homeassistant".to_string()],
         );
         let cand = candidate(
             "group.io.robbie.homeassistant",
@@ -970,21 +912,6 @@ mod tests {
             PathBuf::from("/opt/homebrew/Cellar/libidn2")
         );
         assert_eq!(claims[0].owner, "formula:wget");
-    }
-
-    #[test]
-    fn parse_lsof_pn_associates_paths_with_the_preceding_pid() {
-        let out =
-            "p123\nn/Users/dev/Library/Caches/Foo\nn/tmp/x\np456\nn/Users/dev/Library/Logs/Bar";
-        let parsed = parse_lsof_pn(out);
-        assert_eq!(
-            parsed,
-            vec![
-                (123, PathBuf::from("/Users/dev/Library/Caches/Foo")),
-                (123, PathBuf::from("/tmp/x")),
-                (456, PathBuf::from("/Users/dev/Library/Logs/Bar")),
-            ]
-        );
     }
 
     #[test]

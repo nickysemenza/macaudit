@@ -152,9 +152,8 @@ pub fn inspect(path: &Path) -> Option<Launcher> {
         return None;
     }
     // Read only the head: shims are small; a real binary is not text.
-    let head = read_head(path, 16 * 1024);
-    if head.starts_with(b"#!") {
-        let text = String::from_utf8_lossy(&head);
+    let text = crate::scan::read_head(path, 16 * 1024).unwrap_or_default();
+    if text.starts_with("#!") {
         if text.contains("basedir") || text.contains("cmd-shim") {
             let target = parse_shim_target(&text, path.parent().unwrap_or(Path::new("/")));
             let exists = target.as_ref().map(|t| t.exists());
@@ -185,24 +184,6 @@ pub fn inspect(path: &Path) -> Option<Launcher> {
         target_exists: None,
         owner: Ownership::Unknown,
     })
-}
-
-fn read_head(path: &Path, max: usize) -> Vec<u8> {
-    use std::io::Read;
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return Vec::new();
-    };
-    let mut buf = vec![0u8; max];
-    let mut total = 0;
-    while total < max {
-        match f.read(&mut buf[total..]) {
-            Ok(0) => break,
-            Ok(n) => total += n,
-            Err(_) => break,
-        }
-    }
-    buf.truncate(total);
-    buf
 }
 
 /// Is `path` (or the file it links to) inside `dir`? Lexical after

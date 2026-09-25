@@ -20,8 +20,8 @@ fn key_kind(f: &Finding) -> SortKey {
     key_meta_text(f, "owner_kind")
 }
 
-fn detail(f: &Finding, m: &mut MetaView<'_>) -> Vec<Field> {
-    attribution_detail(f, m, Axis::AppStorage)
+fn detail(f: &Finding, m: &mut MetaView<'_>, ctx: &DetailCtx) -> Vec<Field> {
+    attribution_detail(f, m, Axis::AppStorage, ctx)
 }
 
 static COLUMNS: &[Column] = &[

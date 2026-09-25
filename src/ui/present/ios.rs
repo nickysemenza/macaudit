@@ -60,7 +60,7 @@ fn key_data_bytes(f: &Finding) -> SortKey {
     key_meta_bytes(f, "dynamic_bytes")
 }
 
-fn detail(f: &Finding, m: &mut MetaView<'_>) -> Vec<Field> {
+fn detail(f: &Finding, m: &mut MetaView<'_>, _ctx: &DetailCtx) -> Vec<Field> {
     let mut out = Vec::new();
     match f.kind {
         FindingKind::IosApp => {

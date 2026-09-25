@@ -709,8 +709,6 @@ pub enum OwnerKind {
     Formula,
     Homebrew,
     Tool,
-    Baseline,
-    Unattributed,
 }
 
 impl From<attrib::OwnerKind> for OwnerKind {
@@ -721,8 +719,6 @@ impl From<attrib::OwnerKind> for OwnerKind {
             attrib::OwnerKind::Formula => OwnerKind::Formula,
             attrib::OwnerKind::Homebrew => OwnerKind::Homebrew,
             attrib::OwnerKind::Tool => OwnerKind::Tool,
-            attrib::OwnerKind::Baseline => OwnerKind::Baseline,
-            attrib::OwnerKind::Unattributed => OwnerKind::Unattributed,
         }
     }
 }

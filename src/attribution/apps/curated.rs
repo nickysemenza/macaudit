@@ -77,12 +77,37 @@ pub(crate) const APPLE_DATA: &[AppleDataLocation] = &[
 /// not a single fixed path.
 pub(crate) const PHOTOS_BUNDLE_ID: &str = "com.apple.Photos";
 
-/// `~/Library/CloudStorage/<Provider>-*` name prefix → the app that owns it.
-pub(crate) const CLOUD_STORAGE_PROVIDERS: &[(&str, &str)] = &[
-    ("GoogleDrive", "com.google.GoogleDrive"),
-    ("Dropbox", "com.getdropbox.dropbox"),
-    ("OneDrive", "com.microsoft.OneDrive"),
-    ("Box", "com.box.desktop"),
+/// `~/Library/CloudStorage/<Provider>-*` name prefix → the app that owns it,
+/// plus the display name for its owner row (Apple's iCloud Drive is handled
+/// separately via `APPLE_DATA`'s Finder entry — it doesn't live under
+/// `CloudStorage`).
+pub(crate) struct CloudStorageProvider {
+    pub prefix: &'static str,
+    pub bundle_id: &'static str,
+    pub name: &'static str,
+}
+
+pub(crate) const CLOUD_STORAGE_PROVIDERS: &[CloudStorageProvider] = &[
+    CloudStorageProvider {
+        prefix: "GoogleDrive",
+        bundle_id: "com.google.GoogleDrive",
+        name: "Google Drive",
+    },
+    CloudStorageProvider {
+        prefix: "Dropbox",
+        bundle_id: "com.getdropbox.dropbox",
+        name: "Dropbox",
+    },
+    CloudStorageProvider {
+        prefix: "OneDrive",
+        bundle_id: "com.microsoft.OneDrive",
+        name: "OneDrive",
+    },
+    CloudStorageProvider {
+        prefix: "Box",
+        bundle_id: "com.box.desktop",
+        name: "Box",
+    },
 ];
 
 /// What a curated row resolves a matching candidate to.
@@ -226,23 +251,26 @@ pub(crate) const CURATED: &[CuratedRow] = &[
     },
 ];
 
-/// Display names for the Apple bundle ids the data table attributes to —
-/// several (Finder, Photos when not on the Dock, ...) are never discovered
-/// as owners, so the row would otherwise be named after the id's last
-/// component (`finder`).
+/// Display names for the bundle ids the data tables attribute to — several
+/// (Finder, Photos when not on the Dock, a CloudStorage provider that isn't
+/// separately a discovered `.app` owner, ...) are never discovered as owners
+/// any other way, so the row would otherwise be named after the id's last
+/// component (`finder`). Derived from `APPLE_DATA`'s own labels plus Photos
+/// and the cloud providers, rather than a hand-maintained second table —
+/// Finder is the one deliberate mismatch: `APPLE_DATA`'s label for it is
+/// "iCloud Drive" (what the *entry* is), but the *owner* is named "Finder".
 pub(crate) fn apple_owner_name(bundle_id: &str) -> Option<&'static str> {
-    Some(match bundle_id {
-        "com.apple.mail" => "Mail",
-        "com.apple.MobileSMS" => "Messages",
-        "com.apple.Music" => "Music",
-        "com.apple.TV" => "TV",
-        "com.apple.finder" => "Finder (iCloud Drive)",
-        "com.apple.Safari" => "Safari",
-        "com.apple.dt.Xcode" => "Xcode",
-        "com.apple.Podcasts" => "Podcasts",
-        "com.apple.iBooksX" => "Books",
-        "com.apple.Notes" => "Notes",
-        "com.apple.Photos" => "Photos",
-        _ => return None,
-    })
+    if bundle_id == "com.apple.finder" {
+        return Some("Finder");
+    }
+    if bundle_id == PHOTOS_BUNDLE_ID {
+        return Some("Photos");
+    }
+    if let Some(loc) = APPLE_DATA.iter().find(|loc| loc.bundle_id == bundle_id) {
+        return Some(loc.label);
+    }
+    CLOUD_STORAGE_PROVIDERS
+        .iter()
+        .find(|p| p.bundle_id == bundle_id)
+        .map(|p| p.name)
 }

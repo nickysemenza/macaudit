@@ -60,7 +60,7 @@ fn key_total(f: &Finding) -> SortKey {
     }
 }
 
-fn detail(_: &Finding, m: &mut MetaView<'_>) -> Vec<Field> {
+fn detail(_: &Finding, m: &mut MetaView<'_>, _ctx: &DetailCtx) -> Vec<Field> {
     let mut out = Vec::new();
     if m.str("type") == Some("active_container") {
         out.extend(kv_str(m, "name", "Container"));

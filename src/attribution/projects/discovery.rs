@@ -6,12 +6,13 @@
 use std::path::{Path, PathBuf};
 
 use crate::attribution::model::ResolveEnv;
+use crate::attribution::paths::node_at;
 use crate::model::{FindingKind, ScannerId};
 use crate::scan::global_tools::projects::{PROJECT_MARKERS, SKIP_DIRS};
 use crate::scan::walk::listing::{self, Kind};
 use crate::scan::walk::DirNode;
 
-use super::{find_node, Project, ProjectIndex, ARTIFACT_DIR_NAMES};
+use super::{Project, ProjectIndex, ARTIFACT_DIR_NAMES};
 
 /// Manifest-only projects are swept no deeper than this many path
 /// components below `$HOME`.
@@ -131,7 +132,7 @@ fn checkout_from_gitdir(content: &str, admin_dir: &Path) -> Option<PathBuf> {
 /// tracks subdirectories but never individual files.
 fn manifest_projects(env: &ResolveEnv<'_>, exclude: &[PathBuf]) -> Vec<Project> {
     let home = env.paths.home.clone();
-    let Some((_, home_node)) = find_node(env.trees, &home) else {
+    let Some(home_node) = node_at(env.trees, &home) else {
         return Vec::new();
     };
 
