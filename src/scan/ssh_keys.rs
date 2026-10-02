@@ -31,7 +31,8 @@ impl Scanner for SshKeysScanner {
             return Ok(());
         };
 
-        let config_text = std::fs::read_to_string(ssh_dir.join("config")).unwrap_or_default();
+        let config_text =
+            crate::scan::read_head(&ssh_dir.join("config"), 256 * 1024).unwrap_or_default();
 
         let mut pub_files: Vec<PathBuf> = entries
             .flatten()
@@ -75,7 +76,7 @@ async fn emit_no_keys(ctx: &ScanCtx, ssh_dir: &Path) {
 }
 
 async fn emit_for_pubkey(ctx: &ScanCtx, pub_path: &Path, config_text: &str) {
-    let Ok(content) = std::fs::read_to_string(pub_path) else {
+    let Some(content) = crate::scan::read_head(pub_path, 8 * 1024) else {
         return;
     };
     let Some(line) = content

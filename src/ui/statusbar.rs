@@ -27,12 +27,14 @@ fn hints(app: &AppState) -> Vec<(&'static str, String, Action)> {
         ("z", "fold".into(), Action::Char('z')),
         ("x", "exec".into(), Action::Char('x')),
         ("r", "rescan".into(), Action::Char('r')),
+        ("o", "root".into(), Action::Char('o')),
+        ("S", "stop".into(), Action::Char('S')),
+        ("?", "help".into(), Action::Char('?')),
+        ("q", "quit".into(), Action::Char('q')),
         ("/", "filter".into(), Action::Char('/')),
         ("s", format!("sort:{}", app.sort_label()), Action::Char('s')),
         ("p", "detail".into(), Action::Char('p')),
         ("H", "sys-apps".into(), Action::Char('H')),
-        ("?", "help".into(), Action::Char('?')),
-        ("q", "quit".into(), Action::Char('q')),
     ]
 }
 
@@ -58,12 +60,28 @@ pub fn draw(app: &AppState, frame: &mut Frame, area: Rect, rail: RailMode, vp: &
         draw_filter_input(app, frame, area);
         return;
     }
+    if app.mode == Mode::Root {
+        frame.render_widget(
+            Paragraph::new(format!(
+                " Root: {}_  (enter: restart all · esc: keep current)",
+                app.root_input
+            ))
+            .style(Style::default().bg(Color::Blue).fg(Color::White)),
+            area,
+        );
+        return;
+    }
 
     let base = Style::default().bg(Color::DarkGray).fg(Color::White);
     let key_style = base.add_modifier(Modifier::BOLD).fg(Color::Yellow);
 
     let (n, bytes) = app.marked_total();
-    let right = format!(" Selected: {n} · {} ", fmt::bytes(bytes));
+    let retiring = if app.retiring_count > 0 {
+        format!(" · retiring: {}", app.retiring_count)
+    } else {
+        String::new()
+    };
+    let right = format!(" Selected: {n} · {}{retiring} ", fmt::bytes(bytes));
     let bar = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([

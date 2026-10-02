@@ -15,8 +15,8 @@
 //! asked for it". Missing flags are reported as unknown.
 //!
 //! Degradation: if `brew info` fails but `brew list` works, formulae/casks
-//! are still reported (version only, `completeness: partial`, no graph). If
-//! nothing works, one Info finding says Homebrew was not found.
+//! are still reported (version only, `completeness: partial`, no graph).
+//! Unavailable sources produce incomplete coverage, not an empty successful audit.
 //!
 //! Remedies: `brew upgrade` for outdated packages (non-destructive), and
 //! `brew uninstall` only for packages nothing else installed depends on
@@ -24,10 +24,10 @@
 //! `__autoremove__` finding carries `brew autoremove` when the dry-run lists
 //! candidates.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -37,10 +37,10 @@ use tokio::task::JoinSet;
 
 use crate::brewgraph::{parse_autoremove_dry_run, BrewGraph, InfoRoot, InstallReason, NodeKind};
 use crate::model::{Finding, FindingKind, Guard, Remedy, RemedyCommand, ScannerId, Severity};
-use crate::runner::CmdOutput;
-use crate::scan::sizing::du_blocks;
-use crate::scan::{run_with_timeout, ScanCtx, Scanner};
-use crate::size_cache::{self, is_fresh, root_mtime_secs, CachedSize, SizeCache};
+use crate::runner::{CmdOutput, CommandError};
+use crate::scan::sizing::{du_blocks_shared, SharedSize};
+use crate::scan::{report_command_error, run_command, ScanCtx, Scanner};
+use crate::size_cache::{CachedSize, SizeSnapshot};
 
 const BREW_TIMEOUT: Duration = Duration::from_secs(90);
 const SIZE_CONCURRENCY: usize = 4;
@@ -48,16 +48,42 @@ const SIZE_CONCURRENCY: usize = 4;
 #[derive(Default)]
 pub struct BrewScanner;
 
-/// Run a `brew` subcommand; `None` on spawn failure, nonzero exit, or timeout.
-async fn brew(ctx: &ScanCtx, args: &[&str]) -> Option<CmdOutput> {
-    run_with_timeout(ctx, "brew", args, BREW_TIMEOUT).await
+async fn brew(ctx: &ScanCtx, args: &[&str]) -> Result<Option<CmdOutput>, CommandError> {
+    match run_command(ctx, "brew", args, BREW_TIMEOUT).await {
+        Ok(output) if output.success() => Ok(Some(output)),
+        Ok(output) => {
+            report_command_error(
+                ctx,
+                "brew",
+                &CommandError::Unavailable(anyhow::anyhow!(
+                    "brew exited with status {}",
+                    output.status
+                )),
+            )
+            .await;
+            Ok(None)
+        }
+        Err(error) => {
+            report_command_error(ctx, "brew", &error).await;
+            if matches!(error, CommandError::NotFound(_)) {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        }
+    }
 }
 
 async fn emit_brew_not_found(ctx: &ScanCtx) {
     ctx.emit(
-        Finding::new(FindingKind::BrewFormula, "brew-not-found", "Homebrew not found")
-            .detail("`brew` is not installed, not on PATH, or a required command failed; skipping the Homebrew scan.")
-            .severity(Severity::Info),
+        Finding::new(
+            FindingKind::BrewFormula,
+            "brew-unavailable",
+            "Homebrew inventory unavailable",
+        )
+        .detail("`brew` could not provide an inventory; consult the command coverage diagnostic.")
+        .severity(Severity::Attention)
+        .meta(json!({"context":"audit_host", "complete":false, "group":"Coverage"})),
     )
     .await;
 }
@@ -353,8 +379,11 @@ fn cask_finding(graph: &BrewGraph, info: &InfoRoot, id: &str) -> Finding {
 
 /// Formula/cask findings from `brew list` only — used when `brew info` is
 /// unavailable. No graph, no origin, no dependents: everything unknown.
-async fn emit_partial_from_list(ctx: &ScanCtx, formula_out: &CmdOutput) {
-    let cask_out = brew(ctx, &["list", "--cask", "--versions"]).await;
+async fn emit_partial_from_list(
+    ctx: &ScanCtx,
+    formula_out: &CmdOutput,
+) -> Result<(), CommandError> {
+    let cask_out = brew(ctx, &["list", "--cask", "--versions"]).await?;
     let note = "brew info --json=v2 --installed failed; inventory from brew list only (no dependency data, origin unknown)";
     for (name, version) in parse_name_versions(&formula_out.stdout_str()) {
         ctx.emit(
@@ -391,6 +420,7 @@ async fn emit_partial_from_list(ctx: &ScanCtx, formula_out: &CmdOutput) {
             .await;
         }
     }
+    Ok(())
 }
 
 #[async_trait]
@@ -401,14 +431,22 @@ impl Scanner for BrewScanner {
 
     async fn scan(&self, ctx: ScanCtx) -> anyhow::Result<()> {
         ctx.progress("brew info", 0, None).await;
-        let info_out = brew(&ctx, &["info", "--json=v2", "--installed"]).await;
+        let info_out = brew(&ctx, &["info", "--json=v2", "--installed"]).await?;
         let info: Option<InfoRoot> = info_out
             .as_ref()
             .and_then(|o| serde_json::from_str(&o.stdout_str()).ok());
         let Some(info) = info else {
+            if info_out.is_some() {
+                report_command_error(
+                    &ctx,
+                    "brew",
+                    &CommandError::Unavailable(anyhow::anyhow!("invalid brew info JSON")),
+                )
+                .await;
+            }
             // Degrade: `brew list` still gives an inventory; nothing ⇒ not found.
-            match brew(&ctx, &["list", "--formula", "--versions"]).await {
-                Some(out) => emit_partial_from_list(&ctx, &out).await,
+            match brew(&ctx, &["list", "--formula", "--versions"]).await? {
+                Some(out) => emit_partial_from_list(&ctx, &out).await?,
                 None => emit_brew_not_found(&ctx).await,
             }
             return Ok(());
@@ -416,12 +454,19 @@ impl Scanner for BrewScanner {
 
         ctx.progress("brew outdated / autoremove --dry-run", 1, None)
             .await;
-        let outdated: OutdatedRoot = brew(&ctx, &["outdated", "--json=v2"])
-            .await
-            .and_then(|o| serde_json::from_str(&o.stdout_str()).ok())
-            .unwrap_or_default();
+        let outdated: OutdatedRoot = match brew(&ctx, &["outdated", "--json=v2"]).await? {
+            Some(output) => match serde_json::from_str(&output.stdout_str()) {
+                Ok(outdated) => outdated,
+                Err(error) => {
+                    report_command_error(&ctx, "brew", &CommandError::Unavailable(error.into()))
+                        .await;
+                    OutdatedRoot::default()
+                }
+            },
+            None => OutdatedRoot::default(),
+        };
         let autoremove: Option<BTreeSet<String>> = brew(&ctx, &["autoremove", "--dry-run"])
-            .await
+            .await?
             .map(|o| parse_autoremove_dry_run(&o.stdout_str()));
         let autoremove_known = autoremove.is_some();
 
@@ -439,22 +484,11 @@ impl Scanner for BrewScanner {
         // Cellar sizes: cached when fresh, else measured concurrently and
         // re-emitted (same upsert rule as Disk/Git).
         let prefix = brew_prefix();
-        let paths_load = ctx.paths.clone();
-        let cache: Arc<HashMap<PathBuf, CachedSize>> = Arc::new(
-            tokio::task::spawn_blocking(move || {
-                SizeCache::open(&size_cache::db_path(&paths_load))
-                    .and_then(|c| c.load_all())
-                    .unwrap_or_default()
-            })
-            .await
-            .unwrap_or_default(),
-        );
-        let fresh: Arc<Mutex<Vec<(PathBuf, CachedSize)>>> = Arc::new(Mutex::new(Vec::new()));
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let ttl_hours = ctx.config.scan.size_cache_ttl_hours;
+        let cache_load = ctx.paths.size_cache.clone();
+        let cache: SizeSnapshot =
+            tokio::task::spawn_blocking(move || cache_load.load_all().unwrap_or_default())
+                .await
+                .unwrap_or_default();
 
         let formula_ids: Vec<String> = graph
             .nodes()
@@ -471,7 +505,7 @@ impl Scanner for BrewScanner {
 
         // Pre-fill cached sizes so shared-dependency totals are right on the
         // first emit; measured sizes arrive as re-emits.
-        let mut to_measure: Vec<(String, PathBuf, i64)> = Vec::new();
+        let mut to_measure: Vec<(String, PathBuf)> = Vec::new();
         if let Some(prefix) = &prefix {
             for id in &formula_ids {
                 let node = graph.get(id).unwrap();
@@ -482,14 +516,9 @@ impl Scanner for BrewScanner {
                 if !keg.is_dir() {
                     continue;
                 }
-                let mtime = root_mtime_secs(&keg);
-                match cache
-                    .get(&keg)
-                    .copied()
-                    .filter(|c| is_fresh(c, mtime, now_secs, ttl_hours))
-                {
+                match cache.get(&keg).copied() {
                     Some(c) => graph.set_size(id, Some(c.size)),
-                    None => to_measure.push((id.clone(), keg, mtime)),
+                    None => to_measure.push((id.clone(), keg)),
                 }
             }
         }
@@ -570,55 +599,57 @@ impl Scanner for BrewScanner {
         // Measure uncached kegs and re-emit with sizes.
         if !to_measure.is_empty() && !ctx.cancelled() {
             let sem = Arc::new(Semaphore::new(SIZE_CONCURRENCY));
-            let mut set: JoinSet<(String, PathBuf, i64, u64)> = JoinSet::new();
-            for (id, keg, mtime) in to_measure {
+            let mut set: JoinSet<(String, PathBuf, Option<SharedSize>)> = JoinSet::new();
+            for (id, keg) in to_measure {
                 let permit = sem.clone().acquire_owned().await?;
                 let token = ctx.token.clone();
                 set.spawn(async move {
                     let _permit = permit;
                     let du_root = keg.clone();
                     let t = token.clone();
-                    let size = tokio::task::spawn_blocking(move || {
-                        du_blocks(&du_root, &|| t.is_cancelled())
+                    let measured = tokio::task::spawn_blocking(move || {
+                        du_blocks_shared(&du_root, &|| t.is_cancelled())
                     })
                     .await
-                    .unwrap_or(0);
-                    (id, keg, mtime, size)
+                    .ok();
+                    (id, keg, measured)
                 });
             }
-            let mut sizes: BTreeMap<String, u64> = BTreeMap::new();
-            while let Some(Ok((id, keg, mtime, size))) = set.join_next().await {
+            let mut sizes: BTreeMap<String, SharedSize> = BTreeMap::new();
+            while let Some(Ok((id, keg, measured))) = set.join_next().await {
                 if ctx.cancelled() {
                     break;
                 }
-                sizes.insert(id, size);
-                fresh.lock().unwrap().push((
-                    keg,
-                    CachedSize {
-                        size,
-                        computed_at: now_secs,
-                        root_mtime: mtime,
-                    },
-                ));
+                let Some(measured) = measured else {
+                    continue;
+                };
+                if measured.complete {
+                    let _ = ctx.paths.size_cache.clone().upsert_batch(&[(
+                        keg,
+                        CachedSize {
+                            size: measured.bytes,
+                        },
+                    )]);
+                }
+                sizes.insert(id, measured);
             }
             if !ctx.cancelled() {
                 let mut sized = (*graph).clone();
-                for (id, size) in &sizes {
-                    sized.set_size(id, Some(*size));
+                for (id, measured) in &sizes {
+                    if measured.complete {
+                        sized.set_size(id, Some(measured.bytes));
+                    }
                 }
                 for id in sizes.keys() {
-                    ctx.emit(formula_finding(&sized, id, prefix.as_deref()).size(sizes[id]))
-                        .await;
-                }
-                let entries: Vec<(PathBuf, CachedSize)> =
-                    std::mem::take(&mut *fresh.lock().unwrap());
-                if !entries.is_empty() {
-                    let paths_save = ctx.paths.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        SizeCache::open(&size_cache::db_path(&paths_save))
-                            .and_then(|mut c| c.upsert_batch(&entries))
-                    })
-                    .await;
+                    let measured = sizes[id];
+                    let mut finding = formula_finding(&sized, id, prefix.as_deref());
+                    if measured.complete {
+                        finding = finding.size(measured.bytes);
+                    }
+                    if let Some(meta) = finding.meta.as_object_mut() {
+                        meta.insert("size_complete".into(), json!(measured.complete));
+                    }
+                    ctx.emit(finding).await;
                 }
             }
         }
@@ -900,7 +931,8 @@ mod tests {
     async fn autoremove_failure_is_unknown_not_none() {
         let mock = MockCommandRunner::new()
             .on("brew", &["info", "--json=v2", "--installed"], INFO_JSON)
-            .on("brew", &["outdated", "--json=v2"], OUTDATED_JSON);
+            .on("brew", &["outdated", "--json=v2"], OUTDATED_JSON)
+            .on_fail("brew", &["autoremove", "--dry-run"], 1, "unavailable");
         let findings = run_scan(Arc::new(mock)).await;
         assert!(by_title(&findings, "pcre2").meta["autoremove_candidate"].is_null());
         let summary = by_title(&findings, "Homebrew autoremove candidates");
@@ -911,6 +943,12 @@ mod tests {
     #[tokio::test]
     async fn info_failure_falls_back_to_list_partial() {
         let mock = MockCommandRunner::new()
+            .on_fail(
+                "brew",
+                &["info", "--json=v2", "--installed"],
+                1,
+                "unavailable",
+            )
             .on(
                 "brew",
                 &["list", "--formula", "--versions"],
@@ -918,7 +956,10 @@ mod tests {
             )
             .on("brew", &["list", "--cask", "--versions"], "slack 4.35.0\n");
         let findings = run_scan(Arc::new(mock)).await;
-        assert_eq!(findings.len(), 3);
+        assert_eq!(findings.len(), 4);
+        assert!(findings
+            .iter()
+            .any(|finding| finding.meta["complete"] == false));
         let wget = by_title(&findings, "wget");
         assert_eq!(wget.meta["completeness"], "partial");
         assert_eq!(wget.meta["install_reason"], "unknown");
@@ -932,11 +973,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_brew_emits_single_info_finding_and_returns_ok() {
-        let findings = run_scan(Arc::new(MockCommandRunner::new())).await;
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].title, "Homebrew not found");
-        assert_eq!(findings[0].severity, Severity::Info);
+    async fn failed_brew_commands_report_unavailable_not_missing() {
+        let mock = MockCommandRunner::new()
+            .on_fail(
+                "brew",
+                &["info", "--json=v2", "--installed"],
+                1,
+                "unavailable",
+            )
+            .on_fail(
+                "brew",
+                &["list", "--formula", "--versions"],
+                1,
+                "unavailable",
+            );
+        let findings = run_scan(Arc::new(mock)).await;
+        assert!(findings
+            .iter()
+            .all(|finding| finding.meta["complete"] == false));
+        assert!(findings
+            .iter()
+            .any(|finding| finding.title == "Homebrew inventory unavailable"));
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.title == "Homebrew not found"));
     }
 
     #[test]

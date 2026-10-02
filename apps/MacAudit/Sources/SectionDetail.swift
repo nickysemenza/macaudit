@@ -8,45 +8,50 @@ struct SectionDetail: View {
     var body: some View {
         let all = store.findings(in: meta.id)
         let findings = store.visibleFindings(in: meta.id)
-        Group {
-            if all.isEmpty {
-                emptyState
-            } else if findings.isEmpty {
-                ContentUnavailableView.search(text: store.searchText)
-            } else {
-                switch meta.view {
-                case .overview:
-                    OverviewView(findings: findings)
-                case .tree, .table:
-                    VStack(spacing: 0) {
-                        SectionChartHeader(section: meta.id, findings: all)
-                        if meta.view == .tree {
-                            TreeView(findings: findings)
-                        } else {
-                            TableView(findings: findings)
+        VStack(spacing: 0) {
+            Text(meta.id == .fs ? "Disk: selected Explore root; fixed targets are Global Audit" : "Global Audit · independent of Explore root")
+                .font(.caption).foregroundStyle(.secondary).padding(8)
+            Group {
+                if all.isEmpty {
+                    emptyState
+                } else if findings.isEmpty {
+                    ContentUnavailableView.search(text: store.searchText)
+                } else {
+                    switch meta.view {
+                    case .overview:
+                        OverviewView(findings: findings)
+                    case .tree, .table:
+                        VStack(spacing: 0) {
+                            SectionChartHeader(section: meta.id, findings: all)
+                            if meta.view == .tree {
+                                TreeView(findings: findings)
+                            } else {
+                                TableView(findings: findings)
+                            }
                         }
                     }
                 }
             }
+            AuditPageControls()
         }
     }
 
     @ViewBuilder
     private var emptyState: some View {
         switch store.status(of: meta.id) {
-        case .scanning(let msg, _, _):
+        case let .scanning(msg, _, _):
             VStack(spacing: 12) {
                 ProgressView()
                 Text(msg.isEmpty ? "Scanning…" : msg).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-        case .failed(let error):
+        case let .failed(error):
             ContentUnavailableView {
                 Label("Scan failed", systemImage: "exclamationmark.triangle")
             } description: {
                 Text(error)
             } actions: {
-                Button("Retry") { store.rescan(meta.id) }
+                Button("Refresh All") { store.rescanAll() }.disabled(!store.canRefresh)
             }
         case .done:
             ContentUnavailableView("Nothing found", systemImage: "checkmark.circle")
@@ -54,7 +59,7 @@ struct SectionDetail: View {
             ContentUnavailableView {
                 Label("Not scanned", systemImage: "magnifyingglass")
             } actions: {
-                Button("Scan") { store.rescan(meta.id) }
+                Button("Refresh All") { store.rescanAll() }.disabled(!store.canRefresh)
             }
         }
     }
@@ -102,5 +107,6 @@ struct MarkToggle: View {
         .toggleStyle(.checkbox)
         .labelsHidden()
         .help("Mark for cleanup")
+        .accessibilityLabel("Mark finding \(id) for cleanup")
     }
 }

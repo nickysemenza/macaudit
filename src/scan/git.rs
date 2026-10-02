@@ -18,15 +18,14 @@
 //!
 //! **Sizes**: each surviving repo's `.git` directory — what git itself
 //! stores: objects, packs, stashes, worktree metadata — is `du`'d through
-//! the shared size cache (same mtime+TTL semantics as Disk artifacts) and
+//! the same-run size cache (complete measurements only) and
 //! emitted as a deferred size update. Deliberately *not* the whole checkout:
 //! that would be dominated by untracked build output (`target/`,
 //! `node_modules/`), which the Disk section already itemises and the
 //! Projects section attributes.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -35,9 +34,9 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::model::{Finding, FindingKind, Remedy, RemedyCommand, ScannerId, Severity};
-use crate::scan::sizing::du_blocks;
+use crate::scan::sizing::du_blocks_shared;
 use crate::scan::{ScanCtx, Scanner};
-use crate::size_cache::{self, is_fresh, root_mtime_secs, CachedSize, SizeCache};
+use crate::size_cache::{CachedSize, SizeSnapshot};
 
 /// Max repos inspected at once.
 const MAX_CONCURRENCY: usize = 8;
@@ -75,30 +74,21 @@ impl Scanner for GitScanner {
             return Ok(());
         };
 
-        // Shared size cache (same db + staleness semantics as Disk artifacts).
-        let paths_load = ctx.paths.clone();
-        let cache: Arc<HashMap<PathBuf, CachedSize>> = Arc::new(
-            tokio::task::spawn_blocking(move || {
-                SizeCache::open(&size_cache::db_path(&paths_load))
-                    .and_then(|c| c.load_all())
-                    .unwrap_or_default()
-            })
-            .await
-            .unwrap_or_default(),
-        );
-        let fresh_entries: Arc<Mutex<Vec<(PathBuf, CachedSize)>>> =
-            Arc::new(Mutex::new(Vec::new()));
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let ttl_hours = ctx.config.scan.size_cache_ttl_hours;
+        let cache_load = ctx.paths.size_cache.clone();
+        let cache: SizeSnapshot =
+            tokio::task::spawn_blocking(move || cache_load.load_all().unwrap_or_default())
+                .await
+                .unwrap_or_default();
 
         let sem = Arc::new(Semaphore::new(MAX_CONCURRENCY));
-        let mut set: JoinSet<()> = JoinSet::new();
+        let mut set: JoinSet<anyhow::Result<()>> = JoinSet::new();
 
         let mut guard = rx_arc.lock().await;
-        while let Some(disc) = guard.recv().await {
+        while let Some(disc) = tokio::select! {
+            biased;
+            _ = ctx.token.cancelled() => None,
+            discovered = guard.recv() => discovered,
+        } {
             if ctx.token.is_cancelled() {
                 break;
             }
@@ -107,10 +97,13 @@ impl Scanner for GitScanner {
                 continue;
             }
             // Backpressure: acquire before spawning so at most N run at once.
-            let permit = sem.clone().acquire_owned().await?;
+            let permit = tokio::select! {
+                biased;
+                _ = ctx.token.cancelled() => break,
+                permit = sem.clone().acquire_owned() => permit?,
+            };
             let ctx = ctx.clone();
             let cache = cache.clone();
-            let fresh = fresh_entries.clone();
             set.spawn(async move {
                 let _permit = permit;
                 let root = disc.root;
@@ -119,13 +112,13 @@ impl Scanner for GitScanner {
                 // vendored checkout (SwiftPM/pip/etc. clones under a gitignored
                 // build dir) — skip it.
                 if let Some(ancestor) = nearest_ancestor_repo(&root, &ctx.paths.home) {
-                    if is_ignored_by(&ctx, &ancestor, &root).await {
-                        return;
+                    if is_ignored_by(&ctx, &ancestor, &root).await? {
+                        return Ok(());
                     }
                 }
 
-                let Some(finding) = inspect_repo(&ctx, root.clone()).await else {
-                    return;
+                let Some(finding) = inspect_repo(&ctx, root.clone()).await? else {
+                    return Ok(());
                 };
 
                 // Attach the `.git` size: cached when fresh, else emit unsized
@@ -133,11 +126,7 @@ impl Scanner for GitScanner {
                 // on the `.git` path so entries never collide with anything
                 // keyed on the checkout root.
                 let git_dir = root.join(".git");
-                let root_mtime = root_mtime_secs(&git_dir);
-                let cached = cache
-                    .get(&git_dir)
-                    .copied()
-                    .filter(|c| is_fresh(c, root_mtime, now_secs, ttl_hours));
+                let cached = cache.get(&git_dir).copied();
                 match cached {
                     Some(c) => {
                         let mut f = finding.size(c.size);
@@ -150,48 +139,55 @@ impl Scanner for GitScanner {
                         ctx.emit(finding.clone()).await;
                         let du_root = git_dir.clone();
                         let token = ctx.token.clone();
-                        let size = tokio::task::spawn_blocking(move || {
-                            du_blocks(&du_root, &|| token.is_cancelled())
+                        let measured = tokio::task::spawn_blocking(move || {
+                            du_blocks_shared(&du_root, &|| token.is_cancelled())
                         })
                         .await
-                        .unwrap_or(0);
+                        .ok();
                         // Same rule as fs.rs: never emit/record a size measured
                         // under cancellation — it's a partial sum.
                         if ctx.token.is_cancelled() {
-                            return;
+                            return Err(crate::runner::CommandError::Cancelled.into());
                         }
-                        fresh.lock().unwrap().push((
-                            git_dir,
-                            CachedSize {
-                                size,
-                                computed_at: now_secs,
-                                root_mtime,
-                            },
-                        ));
-                        ctx.emit(finding.size(size)).await;
+                        let Some(measured) = measured else {
+                            return Ok(());
+                        };
+                        let mut finding = finding;
+                        if measured.complete {
+                            let _ = ctx.paths.size_cache.clone().upsert_batch(&[(
+                                git_dir,
+                                CachedSize {
+                                    size: measured.bytes,
+                                },
+                            )]);
+                            finding = finding.size(measured.bytes);
+                        }
+                        if let Some(meta) = finding.meta.as_object_mut() {
+                            meta.insert("size_complete".into(), json!(measured.complete));
+                        }
+                        ctx.emit(finding).await;
                     }
                     None => ctx.emit(finding).await, // path gone (tests/races)
                 }
+                Ok(())
             });
         }
         // Release the lock so nothing else blocks, then drain in-flight work.
         drop(guard);
-        while set.join_next().await.is_some() {}
-
-        // Persist freshly measured sizes (best-effort; skipped on cancellation
-        // so a partial scan can't poison the cache).
-        let entries: Vec<(PathBuf, CachedSize)> = if ctx.token.is_cancelled() {
-            Vec::new()
-        } else {
-            std::mem::take(&mut *fresh_entries.lock().unwrap())
-        };
-        if !entries.is_empty() {
-            let paths_save = ctx.paths.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                SizeCache::open(&size_cache::db_path(&paths_save))
-                    .and_then(|mut c| c.upsert_batch(&entries))
-            })
-            .await;
+        let mut failure = None;
+        while let Some(result) = set.join_next().await {
+            let result = result.unwrap_or_else(|error| Err(error.into()));
+            if let Err(error) = result {
+                if failure.is_none() || crate::runner::is_resource_limit(&error) {
+                    failure = Some(error);
+                }
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        if ctx.cancelled() {
+            return Err(crate::runner::CommandError::Cancelled.into());
         }
         Ok(())
     }
@@ -224,49 +220,98 @@ fn nearest_ancestor_repo(root: &Path, home: &Path) -> Option<PathBuf> {
 /// Is `path` gitignored from the perspective of `ancestor_repo`? Uses
 /// `git check-ignore -q` (exit 0 = ignored, 1 = not, anything else = unknown ⇒
 /// treated as not ignored so we never silently drop a real repo).
-async fn is_ignored_by(ctx: &ScanCtx, ancestor_repo: &Path, path: &Path) -> bool {
-    let repo = ancestor_repo.to_string_lossy().into_owned();
-    let target = path.to_string_lossy().into_owned();
-    matches!(
-        ctx.runner
-            .run(
-                "git",
-                &["-C", &repo, "check-ignore", "-q", "--", &target],
-                &ctx.token,
-            )
-            .await,
-        Ok(out) if out.status == 0
-    )
+async fn git_command(
+    ctx: &ScanCtx,
+    args: &[&str],
+) -> Result<crate::runner::CmdOutput, crate::runner::CommandError> {
+    let result = crate::scan::run_command(ctx, "git", args, Duration::from_secs(30)).await;
+    if let Err(error) = &result {
+        crate::scan::report_command_error(ctx, "git", error).await;
+    }
+    result
 }
 
-/// Inspect one repo root. Returns `None` only if the repo can't be queried at
-/// all (e.g. `git status` errors) — otherwise emits a best-effort finding.
-async fn inspect_repo(ctx: &ScanCtx, root: PathBuf) -> Option<Finding> {
-    let root_str = root.to_string_lossy().into_owned();
+async fn is_ignored_by(
+    ctx: &ScanCtx,
+    ancestor_repo: &Path,
+    path: &Path,
+) -> Result<bool, crate::runner::CommandError> {
+    let repo = ancestor_repo.to_string_lossy().into_owned();
+    let target = path.to_string_lossy().into_owned();
+    match git_command(
+        ctx,
+        &[
+            "--no-optional-locks",
+            "-C",
+            &repo,
+            "check-ignore",
+            "-q",
+            "--",
+            &target,
+        ],
+    )
+    .await
+    {
+        Ok(out) if out.status == 0 => Ok(true),
+        Ok(out) if out.status == 1 => Ok(false),
+        Ok(out) => {
+            crate::scan::report_command_error(
+                ctx,
+                "git",
+                &crate::runner::CommandError::Unavailable(anyhow::anyhow!(
+                    "git check-ignore exited with status {}",
+                    out.status
+                )),
+            )
+            .await;
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
 
-    let status = ctx
-        .runner
-        .run(
-            "git",
-            &["-C", &root_str, "status", "--porcelain=v2", "--branch"],
-            &ctx.token,
-        )
-        .await
-        .ok()?;
+async fn inspect_repo(
+    ctx: &ScanCtx,
+    root: PathBuf,
+) -> Result<Option<Finding>, crate::runner::CommandError> {
+    let root_str = root.to_string_lossy().into_owned();
+    let status = git_command(
+        ctx,
+        &[
+            "--no-optional-locks",
+            "-C",
+            &root_str,
+            "status",
+            "--porcelain=v2",
+            "--branch",
+        ],
+    )
+    .await?;
     if !status.success() {
-        return None;
+        crate::scan::report_command_error(
+            ctx,
+            "git",
+            &crate::runner::CommandError::Unavailable(anyhow::anyhow!(
+                "git status exited with status {}",
+                status.status
+            )),
+        )
+        .await;
+        return Ok(None);
     }
     let st = parse_status(&status.stdout_str());
-
-    // Last-commit time — best effort (empty repos have no commits).
-    let last_used = match ctx
-        .runner
-        .run(
-            "git",
-            &["-C", &root_str, "log", "-1", "--format=%ct"],
-            &ctx.token,
-        )
-        .await
+    let last_used = match git_command(
+        ctx,
+        &[
+            "--no-optional-locks",
+            "-C",
+            &root_str,
+            "log",
+            "-1",
+            "--format=%ct",
+        ],
+    )
+    .await
     {
         Ok(out) if out.success() => out
             .stdout_str()
@@ -274,24 +319,47 @@ async fn inspect_repo(ctx: &ScanCtx, root: PathBuf) -> Option<Finding> {
             .parse::<u64>()
             .ok()
             .map(|secs| UNIX_EPOCH + Duration::from_secs(secs)),
-        _ => None,
+        Ok(_) => None,
+        Err(error) => return Err(error),
     };
-
-    // Stash count — best effort.
-    let stash_count = match ctx
-        .runner
-        .run("git", &["-C", &root_str, "stash", "list"], &ctx.token)
-        .await
+    if ctx.cancelled() {
+        return Err(crate::runner::CommandError::Cancelled);
+    }
+    let stash_count = match git_command(
+        ctx,
+        &["--no-optional-locks", "-C", &root_str, "stash", "list"],
+    )
+    .await
     {
         Ok(out) if out.success() => out
             .stdout_str()
             .lines()
-            .filter(|l| !l.trim().is_empty())
+            .filter(|line| !line.trim().is_empty())
             .count(),
-        _ => 0,
+        Ok(out) => {
+            crate::scan::report_command_error(
+                ctx,
+                "git",
+                &crate::runner::CommandError::Unavailable(anyhow::anyhow!(
+                    "git stash list exited with status {}",
+                    out.status
+                )),
+            )
+            .await;
+            0
+        }
+        Err(error) => return Err(error),
     };
-
-    Some(build_finding(&root, &root_str, st, last_used, stash_count))
+    if ctx.cancelled() {
+        return Err(crate::runner::CommandError::Cancelled);
+    }
+    Ok(Some(build_finding(
+        &root,
+        &root_str,
+        st,
+        last_used,
+        stash_count,
+    )))
 }
 
 /// Parsed `git status --porcelain=v2 --branch` signals.
@@ -503,7 +571,15 @@ mod tests {
         // First run: check-ignore says IGNORED (exit 0) ⇒ repo skipped entirely.
         let runner = MockCommandRunner::new().on(
             "git",
-            &["-C", &outer_s, "check-ignore", "-q", "--", &inner_s],
+            &[
+                "--no-optional-locks",
+                "-C",
+                &outer_s,
+                "check-ignore",
+                "-q",
+                "--",
+                &inner_s,
+            ],
             "",
         );
         let (mut ctx, mut rx, repo_tx) = ctx_with(runner);
@@ -524,21 +600,47 @@ mod tests {
         let runner = MockCommandRunner::new()
             .on_fail(
                 "git",
-                &["-C", &outer_s, "check-ignore", "-q", "--", &inner_s],
+                &[
+                    "--no-optional-locks",
+                    "-C",
+                    &outer_s,
+                    "check-ignore",
+                    "-q",
+                    "--",
+                    &inner_s,
+                ],
                 1,
                 "",
             )
             .on(
                 "git",
-                &["-C", &inner_s, "status", "--porcelain=v2", "--branch"],
+                &[
+                    "--no-optional-locks",
+                    "-C",
+                    &inner_s,
+                    "status",
+                    "--porcelain=v2",
+                    "--branch",
+                ],
                 "# branch.head main\n# branch.ab +0 -0\n",
             )
             .on(
                 "git",
-                &["-C", &inner_s, "log", "-1", "--format=%ct"],
+                &[
+                    "--no-optional-locks",
+                    "-C",
+                    &inner_s,
+                    "log",
+                    "-1",
+                    "--format=%ct",
+                ],
                 "1700000000\n",
             )
-            .on("git", &["-C", &inner_s, "stash", "list"], "");
+            .on(
+                "git",
+                &["--no-optional-locks", "-C", &inner_s, "stash", "list"],
+                "",
+            );
         let (mut ctx, mut rx, repo_tx) = ctx_with(runner);
         ctx.paths = Arc::new(Paths::from_home(home.path()));
         repo_tx.send(RepoDiscovery { root: inner }).unwrap();
@@ -572,19 +674,38 @@ mod tests {
         let runner = MockCommandRunner::new()
             .on(
                 "git",
-                &["-C", &repo_s, "status", "--porcelain=v2", "--branch"],
+                &[
+                    "--no-optional-locks",
+                    "-C",
+                    &repo_s,
+                    "status",
+                    "--porcelain=v2",
+                    "--branch",
+                ],
                 "# branch.head main\n# branch.ab +0 -0\n",
             )
             .on(
                 "git",
-                &["-C", &repo_s, "log", "-1", "--format=%ct"],
+                &[
+                    "--no-optional-locks",
+                    "-C",
+                    &repo_s,
+                    "log",
+                    "-1",
+                    "--format=%ct",
+                ],
                 "1700000000\n",
             )
-            .on("git", &["-C", &repo_s, "stash", "list"], "");
+            .on(
+                "git",
+                &["--no-optional-locks", "-C", &repo_s, "stash", "list"],
+                "",
+            );
         let (mut ctx, mut rx, repo_tx) = ctx_with(runner);
         ctx.paths = Arc::new(Paths::from_home(home.path()));
         repo_tx.send(RepoDiscovery { root: repo.clone() }).unwrap();
         drop(repo_tx);
+        let run_cache = ctx.paths.size_cache.clone();
         GitScanner.scan(ctx).await.unwrap();
 
         let mut sized: Option<Finding> = None;
@@ -606,12 +727,16 @@ mod tests {
             "working tree leaked into .git size: {bytes}"
         );
 
-        let db = size_cache::db_path(&Paths::from_home(home.path()));
-        let cache = SizeCache::open(&db).unwrap().load_all().unwrap();
+        let cache = run_cache.load_all().unwrap();
         assert!(
             cache.contains_key(&repo.join(".git")),
-            ".git size persisted to cache"
+            ".git complete size retained only in run cache"
         );
+        assert!(Paths::from_home(home.path())
+            .size_cache
+            .load_all()
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -622,15 +747,33 @@ mod tests {
         let runner = MockCommandRunner::new()
             .on(
                 "git",
-                &["-C", repo, "status", "--porcelain=v2", "--branch"],
+                &[
+                    "--no-optional-locks",
+                    "-C",
+                    repo,
+                    "status",
+                    "--porcelain=v2",
+                    "--branch",
+                ],
                 "# branch.head main\n",
             )
             .on(
                 "git",
-                &["-C", repo, "log", "-1", "--format=%ct"],
+                &[
+                    "--no-optional-locks",
+                    "-C",
+                    repo,
+                    "log",
+                    "-1",
+                    "--format=%ct",
+                ],
                 "1700000000\n",
             )
-            .on("git", &["-C", repo, "stash", "list"], "");
+            .on(
+                "git",
+                &["--no-optional-locks", "-C", repo, "stash", "list"],
+                "",
+            );
         let (ctx, mut rx, repo_tx) = ctx_with(runner);
         repo_tx
             .send(RepoDiscovery {
@@ -676,17 +819,31 @@ mod tests {
         let runner = MockCommandRunner::new()
             .on(
                 "git",
-                &["-C", repo, "status", "--porcelain=v2", "--branch"],
+                &[
+                    "--no-optional-locks",
+                    "-C",
+                    repo,
+                    "status",
+                    "--porcelain=v2",
+                    "--branch",
+                ],
                 "# branch.head main\n# branch.ab +3 -0\n1 .M N... 100644 100644 100644 a b f.rs\n",
             )
             .on(
                 "git",
-                &["-C", repo, "log", "-1", "--format=%ct"],
+                &[
+                    "--no-optional-locks",
+                    "-C",
+                    repo,
+                    "log",
+                    "-1",
+                    "--format=%ct",
+                ],
                 "1700000000\n",
             )
             .on(
                 "git",
-                &["-C", repo, "stash", "list"],
+                &["--no-optional-locks", "-C", repo, "stash", "list"],
                 "stash@{0}: WIP\nstash@{1}: WIP2\n",
             );
 
@@ -726,15 +883,33 @@ mod tests {
         let runner = MockCommandRunner::new()
             .on(
                 "git",
-                &["-C", repo, "status", "--porcelain=v2", "--branch"],
+                &[
+                    "--no-optional-locks",
+                    "-C",
+                    repo,
+                    "status",
+                    "--porcelain=v2",
+                    "--branch",
+                ],
                 "# branch.head main\n# branch.upstream origin/main\n# branch.ab +0 -0\n",
             )
             .on(
                 "git",
-                &["-C", repo, "log", "-1", "--format=%ct"],
+                &[
+                    "--no-optional-locks",
+                    "-C",
+                    repo,
+                    "log",
+                    "-1",
+                    "--format=%ct",
+                ],
                 "1699999999\n",
             )
-            .on("git", &["-C", repo, "stash", "list"], "");
+            .on(
+                "git",
+                &["--no-optional-locks", "-C", repo, "stash", "list"],
+                "",
+            );
 
         let (ctx, mut rx, repo_tx) = ctx_with(runner);
         repo_tx

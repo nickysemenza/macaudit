@@ -11,6 +11,7 @@ pub mod config;
 pub mod correlate;
 pub mod engine;
 pub mod fake;
+pub mod inventory;
 pub mod model;
 pub mod net;
 pub mod output;

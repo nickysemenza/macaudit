@@ -31,6 +31,7 @@ TARGET=aarch64-apple-darwin
 
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
+TARGET_DIR=$(cargo devtools target-directory)
 case "$STAGE" in /*) ;; *) STAGE="$ROOT/$STAGE" ;; esac
 
 # The tag is the only version source: build.rs bakes MACAUDIT_VERSION into
@@ -43,7 +44,7 @@ export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
 
 echo "== cargo build (release, $TARGET)"
 cargo build --release --locked -p macaudit --target "$TARGET"
-CLI="$ROOT/target/$TARGET/release/macaudit"
+CLI="$TARGET_DIR/$TARGET/release/macaudit"
 
 echo "== engine static library + Swift bindings"
 scripts/build-ffi.sh --release
@@ -66,6 +67,7 @@ fi
 DERIVED="$ROOT/build/DerivedData"
 xcodebuild -quiet -project apps/MacAudit/MacAudit.xcodeproj -scheme MacAudit \
   -configuration Release -destination 'platform=macOS,arch=arm64' \
+  -onlyUsePackageVersionsFromResolvedFile -skipMacroValidation \
   -derivedDataPath "$DERIVED" ARCHS=arm64 \
   "${XCODE_SIGN_ARGS[@]}" CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO \
   "MARKETING_VERSION=$VERSION" "CURRENT_PROJECT_VERSION=$BUILD_NUMBER" \
@@ -77,6 +79,7 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE"
 ditto "$APP" "$STAGE/MacAudit.app"
 cp "$CLI" "$STAGE/macaudit"
+cargo devtools third-party-notices "$STAGE/THIRD-PARTY-NOTICES.txt"
 
 echo "== codesign macaudit"
 # The hardened runtime and a secure timestamp are what notarization checks

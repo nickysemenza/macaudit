@@ -7,18 +7,15 @@ struct SectionSidebar: View {
     var body: some View {
         @Bindable var store = store
         List(selection: $store.selectedItem) {
-            Label("Storage", systemImage: "internaldrive")
-                .tag(SidebarItem.storage)
-            Label("Projects", systemImage: "folder.badge.gearshape")
-                .tag(SidebarItem.projects)
-            Label("Apps", systemImage: "app.badge")
-                .tag(SidebarItem.apps)
-            Label("Folders", systemImage: "folder")
+            Label("Explore", systemImage: "folder")
                 .tag(SidebarItem.folders)
-            Section("Sections") {
+            Section("Audit") {
+                Label("Audit Overview", systemImage: "internaldrive").tag(SidebarItem.storage)
+                Label("Projects · Global", systemImage: "folder.badge.gearshape").tag(SidebarItem.projects)
+                Label("Apps · Global", systemImage: "app.badge").tag(SidebarItem.apps)
                 // Projects/App Storage are top-level lenses above, not
                 // generic scanner sections — kept out of this list and the
-                // Rescan-All menu (`MacAuditApp.swift`) the same way.
+                // Refresh-All menu (`MacAuditApp.swift`) the same way.
                 ForEach(store.scanSections, id: \.id) { meta in
                     SectionRow(meta: meta).tag(SidebarItem.section(meta.id))
                 }
@@ -34,7 +31,7 @@ struct SectionSidebar: View {
                         .foregroundStyle(.orange)
                 }
                 HStack {
-                    Text("Reclaimable")
+                    Text("Loaded-page reclaimable")
                     Spacer()
                     Text(Formatting.bytes(store.totalReclaimableBytes))
                         .monospacedDigit()
@@ -82,7 +79,8 @@ private struct SectionRow: View {
             trailing(status)
         }
         .contextMenu {
-            Button("Rescan \(meta.title)") { store.rescan(meta.id) }
+            Button("Refresh All") { store.rescanAll() }
+                .disabled(!store.canRefresh)
         }
     }
 
@@ -91,7 +89,7 @@ private struct SectionRow: View {
         switch status {
         case .idle:
             EmptyView()
-        case .scanning(let msg, let done, let total):
+        case let .scanning(msg, done, total):
             Group {
                 if let total, total > 0 {
                     ProgressView(value: Double(done), total: Double(total))

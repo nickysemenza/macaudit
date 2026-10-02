@@ -44,7 +44,7 @@ use crate::model::{Finding, FindingKind, Remedy, RemedyCommand, ScanEvent, Scann
 use crate::scan::sizing::on_disk_bytes;
 use crate::scan::volume;
 use crate::scan::{ScanCtx, Scanner};
-use crate::size_cache::{self, is_fresh, root_mtime_secs, CachedSize, SizeCache};
+use crate::size_cache::{CachedSize, SizeCache, SizeSnapshot};
 
 const GROUP_BACKUP: &str = "Backup";
 const GROUP_BACKUP_SET: &str = "Backup set";
@@ -1442,15 +1442,13 @@ struct SizingShared {
     gen: u64,
     token: tokio_util::sync::CancellationToken,
     home: PathBuf,
-    cache: HashMap<PathBuf, CachedSize>,
-    fresh: Mutex<Vec<(PathBuf, CachedSize)>>,
+    cache: SizeSnapshot,
+    measurements: SizeCache,
     totals: Mutex<EstimateTotals>,
     last_emit: Mutex<Instant>,
     enumeration: Option<Enumeration>,
     quota_bytes: Option<u64>,
     data_used_bytes: Option<u64>,
-    now_secs: i64,
-    ttl_hours: u64,
     /// Reset between the two sizing phases so each gets the full budget.
     deadline: Mutex<Instant>,
     budget_secs: u64,
@@ -1471,23 +1469,16 @@ impl SizingShared {
         self.token.is_cancelled()
     }
 
-    /// Measure one path (cache first), never caching partial or zero results:
-    /// with an unchanged root mtime a wrong size would be served as fresh for
-    /// the whole TTL, and a privacy-protected tree reads as empty.
+    /// Measure one path using complete, nonzero measurements from this run only.
     fn measure(&self, path: &Path, skip: Option<&HashSet<PathBuf>>) -> Option<Measured> {
-        let root_mtime = root_mtime_secs(path);
         // A hub walk's total depends on which children it left out, so it is
         // cached under a key that includes the skip set; a different set of
-        // exclusions next run simply misses the cache.
+        // exclusions within this run simply misses the cache.
         let cache_key = match skip {
             None => path.to_path_buf(),
             Some(skip) => path.join(format!("#macaudit-tm-hub-{:016x}", skip_set_hash(skip))),
         };
-        if let Some(c) = self
-            .cache
-            .get(&cache_key)
-            .filter(|c| c.size > 0 && is_fresh(c, root_mtime, self.now_secs, self.ttl_hours))
-        {
+        if let Some(c) = self.cache.get(&cache_key).filter(|c| c.size > 0) {
             return Some(Measured {
                 bytes: c.size,
                 complete: true,
@@ -1496,48 +1487,43 @@ impl SizingShared {
             });
         }
         let deadline = *self.deadline.lock().unwrap();
-        let m = if path.is_dir() && is_permission_denied(path) {
-            Measured {
+        let m = match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_dir() && is_permission_denied(path) => Measured {
                 protected: true,
                 ..Measured::default()
+            },
+            Ok(meta) if meta.is_dir() => {
+                let empty = HashSet::new();
+                let b = crate::scan::sizing::du_blocks_bounded_except(
+                    path,
+                    skip.unwrap_or(&empty),
+                    self.max_entries.max(1),
+                    deadline,
+                    &|| self.cancelled(),
+                );
+                Measured {
+                    bytes: b.bytes,
+                    entries: b.entries,
+                    complete: b.complete,
+                    ..Measured::default()
+                }
             }
-        } else if path.is_dir() {
-            let empty = HashSet::new();
-            let b = crate::scan::sizing::du_blocks_bounded_except(
-                path,
-                skip.unwrap_or(&empty),
-                self.max_entries.max(1),
-                deadline,
-                &|| self.cancelled(),
-            );
-            Measured {
-                bytes: b.bytes,
-                entries: b.entries,
-                complete: b.complete,
-                ..Measured::default()
-            }
-        } else {
-            Measured {
-                bytes: std::fs::metadata(path)
-                    .map(|m| on_disk_bytes(&m))
-                    .unwrap_or(0),
+            Ok(meta) if meta.is_file() => Measured {
+                bytes: on_disk_bytes(&meta),
                 entries: 1,
                 complete: true,
                 ..Measured::default()
-            }
+            },
+            _ => Measured::default(),
         };
         if self.cancelled() {
             return None;
         }
         if m.complete && m.bytes > 0 {
-            self.fresh.lock().unwrap().push((
-                cache_key,
-                CachedSize {
-                    size: m.bytes,
-                    computed_at: self.now_secs,
-                    root_mtime,
-                },
-            ));
+            let _ = self
+                .measurements
+                .clone()
+                .upsert_batch(&[(cache_key, CachedSize { size: m.bytes })]);
         }
         Some(m)
     }
@@ -1612,18 +1598,11 @@ async fn run_sizing(
     data_used_bytes: Option<u64>,
 ) {
     let tm_cfg = &ctx.config.time_machine;
-    let paths_load = ctx.paths.clone();
-    let cache: HashMap<PathBuf, CachedSize> = tokio::task::spawn_blocking(move || {
-        SizeCache::open(&size_cache::db_path(&paths_load))
-            .and_then(|c| c.load_all())
-            .unwrap_or_default()
-    })
-    .await
-    .unwrap_or_default();
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let cache_load = ctx.paths.size_cache.clone();
+    let cache: SizeSnapshot =
+        tokio::task::spawn_blocking(move || cache_load.load_all().unwrap_or_default())
+            .await
+            .unwrap_or_default();
 
     let shared = Arc::new(SizingShared {
         tx: ctx.tx.clone(),
@@ -1631,14 +1610,12 @@ async fn run_sizing(
         token: ctx.token.clone(),
         home: home.to_path_buf(),
         cache,
-        fresh: Mutex::new(Vec::new()),
+        measurements: ctx.paths.size_cache.clone(),
         totals: Mutex::new(EstimateTotals::default()),
         last_emit: Mutex::new(Instant::now()),
         enumeration,
         quota_bytes,
         data_used_bytes,
-        now_secs,
-        ttl_hours: ctx.config.scan.size_cache_ttl_hours,
         deadline: Mutex::new(
             Instant::now() + Duration::from_secs(tm_cfg.estimate_budget_secs.max(1)),
         ),
@@ -1686,18 +1663,6 @@ async fn run_sizing(
             budget_secs: tm_cfg.estimate_budget_secs,
             max_entries: tm_cfg.estimate_max_entries_per_root,
         }))
-        .await;
-    }
-
-    // Persist freshly measured sizes (best-effort; never load-bearing).
-    let entries: Vec<(PathBuf, CachedSize)> = std::mem::take(&mut *shared.fresh.lock().unwrap());
-    if !entries.is_empty() {
-        let paths_save = ctx.paths.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            if let Ok(mut cache) = SizeCache::open(&size_cache::db_path(&paths_save)) {
-                let _ = cache.upsert_batch(&entries);
-            }
-        })
         .await;
     }
 }
@@ -1843,7 +1808,7 @@ fn estimate_finding(state: &EstimateState<'_>) -> Finding {
     let roots_partial =
         t.roots_done.saturating_sub(t.roots_complete) + roots_total.saturating_sub(t.roots_done);
     let roots_skipped = en.protected.len();
-    let complete = state.finished && roots_partial == 0;
+    let complete = state.finished && roots_partial == 0 && roots_skipped == 0;
     let included_bytes = t.included_bytes;
     let fits_quota = state.quota_bytes.map(|q| included_bytes <= q);
     let over_soft_limit = state
@@ -1916,7 +1881,7 @@ fn estimate_finding(state: &EstimateState<'_>) -> Finding {
     if !en.skip_paths_known {
         coverage_parts.push("configured exclusion list unavailable".to_string());
     }
-    coverage_parts.push("sizes may come from the size cache (up to 24h old)".to_string());
+    coverage_parts.push("measurements are from the current run only".to_string());
 
     let mut meta = json!({
         "group": GROUP_BACKUP_SET,
@@ -2113,9 +2078,204 @@ com.apple.TimeMachine.2024-06-15-093015.local
         map.into_values().collect()
     }
 
+    fn assert_command_coverage(findings: &[Finding], programs: &[&str]) {
+        let mut coverage: Vec<&Finding> = findings
+            .iter()
+            .filter(|finding| finding.meta["group"] == "Coverage")
+            .collect();
+        coverage.sort_by(|left, right| left.title.cmp(&right.title));
+        let mut titles: Vec<String> = programs
+            .iter()
+            .map(|program| format!("{program} data unavailable"))
+            .collect();
+        titles.sort();
+        assert_eq!(
+            coverage
+                .iter()
+                .map(|finding| &finding.title)
+                .collect::<Vec<_>>(),
+            titles.iter().collect::<Vec<_>>()
+        );
+        for finding in coverage {
+            assert_eq!(finding.kind, FindingKind::LocalSnapshot);
+            assert_eq!(finding.severity, Severity::Attention);
+            assert_eq!(finding.meta["context"], "audit_host");
+            assert_eq!(finding.meta["complete"], false);
+            assert_eq!(finding.meta["error_kind"], "unavailable");
+            assert!(finding.detail.contains("no response registered"));
+            assert!(finding.remedies.is_empty());
+        }
+    }
+
     fn write_file(path: &Path, bytes: usize) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, vec![b'x'; bytes]).unwrap();
+    }
+
+    fn sizing_shared(cache: SizeCache) -> SizingShared {
+        let (tx, _) = tokio::sync::mpsc::channel(1);
+        SizingShared {
+            tx,
+            gen: 1,
+            token: tokio_util::sync::CancellationToken::new(),
+            home: PathBuf::from("/unused"),
+            cache: cache.load_all().unwrap(),
+            measurements: cache,
+            totals: Mutex::new(EstimateTotals::default()),
+            last_emit: Mutex::new(Instant::now()),
+            enumeration: None,
+            quota_bytes: None,
+            data_used_bytes: None,
+            deadline: Mutex::new(Instant::now() + Duration::from_secs(60)),
+            budget_secs: 60,
+            max_entries: 1000,
+            candidate_min_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn intentional_pruning_is_complete_and_cache_reuse_is_same_run_only() {
+        let root = tempfile::tempdir().unwrap();
+        let kept = root.path().join("kept");
+        let excluded = root.path().join("excluded");
+        write_file(&kept.join("file"), 4096);
+        write_file(&excluded.join("file"), 8192);
+        let skip = HashSet::from([excluded]);
+        let cache = SizeCache::new();
+        let measured = sizing_shared(cache.clone())
+            .measure(root.path(), Some(&skip))
+            .unwrap();
+        assert!(measured.complete);
+        assert_eq!(
+            measured.bytes,
+            crate::scan::sizing::du_blocks(&kept, &|| false)
+        );
+        assert!(!measured.cached);
+        assert!(
+            sizing_shared(cache.clone())
+                .measure(root.path(), Some(&skip))
+                .unwrap()
+                .cached
+        );
+        let whole = sizing_shared(cache).measure(root.path(), None).unwrap();
+        assert!(!whole.cached);
+        assert!(whole.bytes > measured.bytes);
+        assert!(
+            !sizing_shared(SizeCache::new())
+                .measure(root.path(), Some(&skip))
+                .unwrap()
+                .cached
+        );
+    }
+
+    #[test]
+    fn pruning_never_hides_real_limits_or_cancellation() {
+        let root = tempfile::tempdir().unwrap();
+        let excluded = root.path().join("excluded");
+        write_file(&excluded.join("file"), 4096);
+        write_file(&root.path().join("kept/file"), 4096);
+        let skip = HashSet::from([excluded]);
+        for deadline_expired in [false, true] {
+            let cache = SizeCache::new();
+            let mut shared = sizing_shared(cache.clone());
+            if deadline_expired {
+                *shared.deadline.lock().unwrap() = Instant::now() - Duration::from_secs(1);
+            } else {
+                shared.max_entries = 1;
+            }
+            let measured = shared.measure(root.path(), Some(&skip)).unwrap();
+            assert!(!measured.complete);
+            assert!(cache.load_all().unwrap().is_empty());
+        }
+        let cache = SizeCache::new();
+        let shared = sizing_shared(cache.clone());
+        shared.token.cancel();
+        assert!(shared.measure(root.path(), Some(&skip)).is_none());
+        assert!(cache.load_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn missing_measurement_is_incomplete_and_not_cached() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("missing");
+        let cache = SizeCache::new();
+        let measured = sizing_shared(cache.clone()).measure(&path, None).unwrap();
+        assert!(!measured.complete);
+        assert!(!measured.cached);
+        assert!(cache.load_all().unwrap().is_empty());
+
+        write_file(&path, 4096);
+        let recovered = sizing_shared(cache.clone()).measure(&path, None).unwrap();
+        assert!(recovered.complete);
+        assert!(!recovered.cached);
+        assert_eq!(
+            recovered.bytes,
+            on_disk_bytes(&std::fs::metadata(&path).unwrap())
+        );
+        assert_eq!(
+            cache.load_all().unwrap().get(&path).unwrap().size,
+            recovered.bytes
+        );
+        let reused = sizing_shared(cache).measure(&path, None).unwrap();
+        assert!(reused.complete);
+        assert!(reused.cached);
+        assert_eq!(reused.bytes, recovered.bytes);
+    }
+
+    #[test]
+    fn file_measurement_uses_physical_blocks_and_never_follows_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("sparse");
+        std::fs::File::create(&file)
+            .unwrap()
+            .set_len(1024 * 1024)
+            .unwrap();
+        let measured = sizing_shared(SizeCache::new())
+            .measure(&file, None)
+            .unwrap();
+        assert!(measured.complete);
+        assert_eq!(
+            measured.bytes,
+            on_disk_bytes(&std::fs::metadata(&file).unwrap())
+        );
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let cache = SizeCache::new();
+        let measured = sizing_shared(cache.clone()).measure(&link, None).unwrap();
+        assert!(!measured.complete);
+        assert_eq!(measured.bytes, 0);
+        assert!(cache.load_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn protected_backup_paths_keep_the_estimate_partial() {
+        let enumeration = Enumeration {
+            hub_walks: vec![HubWalk {
+                hub: PathBuf::from("/unused"),
+                skip: HashSet::new(),
+            }],
+            protected: vec![PathBuf::from("/unused/protected")],
+            skip_paths_known: true,
+            ..Enumeration::default()
+        };
+        let finding = estimate_finding(&EstimateState {
+            home: Path::new("/unused"),
+            enumeration: &enumeration,
+            totals: EstimateTotals {
+                roots_done: 1,
+                roots_complete: 1,
+                ..EstimateTotals::default()
+            },
+            quota_bytes: None,
+            data_used_bytes: None,
+            finished: true,
+            budget_secs: 60,
+            max_entries: 1000,
+        });
+        assert_eq!(finding.meta["status"], "partial");
+        assert_eq!(finding.meta["complete"], false);
+        assert_eq!(finding.meta["roots_skipped"], 1);
+        assert!(finding.coverage.unwrap().contains("current run only"));
     }
 
     #[test]
@@ -2294,7 +2454,7 @@ com.apple.TimeMachine.2024-06-15-093015.local
     }
 
     #[tokio::test]
-    async fn blank_runner_emits_only_info_and_returns_ok() {
+    async fn blank_runner_emits_info_and_unavailable_coverage_and_returns_ok() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("root");
         let home = root.join("Users/fixture");
@@ -2309,9 +2469,13 @@ com.apple.TimeMachine.2024-06-15-093015.local
         let ctx = ctx_with(MockCommandRunner::new(), &home, tx);
         scanner.scan(ctx).await.unwrap();
         let findings = drain(&mut rx);
-        assert!(!findings.is_empty());
+        assert_eq!(findings.len(), 7);
+        assert_command_coverage(&findings, &["osascript", "diskutil", "defaults", "tmutil"]);
         assert!(
-            findings.iter().all(|f| f.severity == Severity::Info),
+            findings
+                .iter()
+                .filter(|f| f.meta["group"] != "Coverage")
+                .all(|f| f.severity == Severity::Info),
             "{:?}",
             findings
                 .iter()
@@ -2428,9 +2592,7 @@ com.apple.TimeMachine.2024-06-15-093015.local
             + du(&home.join("Library/Developer"))
             + std::fs::metadata(home.join("loose.txt"))
                 .map(|m| on_disk_bytes(&m))
-                .unwrap()
-            // The scanner's own size cache lives under this fake home.
-            + du(&home.join(".local"));
+                .unwrap();
         let expected_excluded = du(&home.join("dev")) + du(&home.join("Library/Caches"));
 
         let est = findings
@@ -2458,6 +2620,13 @@ com.apple.TimeMachine.2024-06-15-093015.local
             .as_deref()
             .unwrap()
             .contains("1 other user home"));
+        assert!(est
+            .coverage
+            .as_deref()
+            .unwrap()
+            .contains("current run only"));
+        assert!(!est.coverage.as_deref().unwrap().contains("24h"));
+        assert!(!home.join(".local/state/macaudit").exists());
 
         let exclusions: Vec<&Finding> = findings
             .iter()
@@ -2495,17 +2664,15 @@ com.apple.TimeMachine.2024-06-15-093015.local
         assert!(!cargo.remedies[0].destructive);
         assert!(cargo.remedies[1].alternative);
 
-        assert_eq!(
-            findings
-                .iter()
-                .filter(|f| f.kind == FindingKind::LocalSnapshot)
-                .count(),
-            2
-        );
-        assert!(findings
+        assert_command_coverage(&findings, &["osascript", "diskutil", "defaults"]);
+        let snapshots: Vec<&Finding> = findings
             .iter()
-            .filter(|f| f.kind == FindingKind::LocalSnapshot)
-            .all(|f| f.meta["group"] == GROUP_SNAPSHOTS && f.severity == Severity::Reclaimable));
+            .filter(|f| f.kind == FindingKind::LocalSnapshot && f.meta["group"] == GROUP_SNAPSHOTS)
+            .collect();
+        assert_eq!(snapshots.len(), 2);
+        assert!(snapshots
+            .iter()
+            .all(|f| f.severity == Severity::Reclaimable));
     }
 
     #[test]

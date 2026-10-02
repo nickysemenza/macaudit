@@ -20,6 +20,27 @@ pub struct Paths {
     pub state_dir: PathBuf,
     /// `~/Library/Caches/macaudit` (etag caches etc., v1.1)
     pub cache_dir: PathBuf,
+    /// Bounded measurements shared only by scanners in this run.
+    pub size_cache: crate::size_cache::SizeCache,
+    pub(crate) catalog_cache: Option<std::sync::Arc<CatalogCache>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CatalogCache {
+    pub value: tokio::sync::Mutex<Option<crate::net::catalog::CaskCatalog>>,
+    _memory: crate::inventory::Reservation,
+}
+
+impl CatalogCache {
+    fn new(
+        budget: &std::sync::Arc<crate::inventory::MemoryBudget>,
+    ) -> Option<std::sync::Arc<Self>> {
+        let memory = budget.reserve(std::mem::size_of::<Self>() + 64).ok()?;
+        Some(std::sync::Arc::new(Self {
+            value: tokio::sync::Mutex::new(None),
+            _memory: memory,
+        }))
+    }
 }
 
 impl Paths {
@@ -37,12 +58,30 @@ impl Paths {
     /// Build all derived paths from a home directory. Used by `resolve()` and
     /// directly by tests with a tempdir.
     pub fn from_home(home: impl Into<PathBuf>) -> Self {
+        Self::with_memory_budget(home, crate::inventory::MemoryBudget::shared())
+    }
+
+    pub fn with_memory_budget(
+        home: impl Into<PathBuf>,
+        budget: std::sync::Arc<crate::inventory::MemoryBudget>,
+    ) -> Self {
         let home = home.into();
         Paths {
             config_dir: home.join(".config/macaudit"),
             state_dir: home.join(".local/state/macaudit"),
             cache_dir: home.join("Library/Caches/macaudit"),
+            catalog_cache: CatalogCache::new(&budget),
+            size_cache: crate::size_cache::SizeCache::with_budget(budget),
             home,
+        }
+    }
+
+    /// Preserve host paths while isolating measurements from all prior runs.
+    pub fn with_fresh_measurements(&self) -> Self {
+        Self {
+            size_cache: crate::size_cache::SizeCache::with_budget(self.size_cache.memory_budget()),
+            catalog_cache: CatalogCache::new(&self.size_cache.memory_budget()),
+            ..self.clone()
         }
     }
 
@@ -67,14 +106,6 @@ impl Paths {
     /// Default project-indexing roots when config doesn't specify any.
     pub fn default_roots(&self) -> Vec<PathBuf> {
         vec![self.home.clone()]
-    }
-
-    /// Default Disk-walk roots when `[scan] roots` is empty: the whole boot
-    /// volume. Mount points are never crossed, so other volumes, the VM and
-    /// Preboot volumes and `/System/Volumes/Data` (reached through firmlinks
-    /// instead) stay out; `roots = ["~"]` restores a home-only walk.
-    pub fn default_disk_roots() -> Vec<PathBuf> {
-        vec![PathBuf::from("/")]
     }
 
     /// The `$PATH` of *this* process, split into entries. Kept here so the
@@ -228,9 +259,6 @@ pub struct ToolsConfig {
     pub verify_limit: usize,
     /// Per-probe timeout.
     pub verify_timeout_secs: u64,
-    /// Persist a JSON audit report of every cleanup under
-    /// `<state_dir>/cleanup-reports/`.
-    pub write_cleanup_reports: bool,
     /// Additional npm global prefixes to inspect (besides the well-known ones).
     pub extra_npm_prefixes: Vec<String>,
     pub pnpm_home: String,
@@ -257,7 +285,6 @@ impl Default for ToolsConfig {
             verify_after_cleanup: true,
             verify_limit: 25,
             verify_timeout_secs: 5,
-            write_cleanup_reports: true,
             extra_npm_prefixes: Vec::new(),
             pnpm_home: "~/Library/pnpm".to_string(),
             cargo_home: "~/.cargo".to_string(),
@@ -303,15 +330,13 @@ impl Default for TimeMachineConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ScanConfig {
-    /// Disk-walk roots (tilde-expanded at use). Empty ⇒ `["/"]`, the whole
-    /// boot volume; `["~"]` limits the Disk section to the home directory.
+    /// Disk-walk root (tilde-expanded at use). Empty means Home for standalone
+    /// scanners; the supervising run replaces it with its validated root.
     pub roots: Vec<String>,
     /// Never descend into these (tilde-expanded).
     pub ignore: Vec<String>,
     /// Loose files larger than this are flagged.
     pub large_file_threshold_gb: f64,
-    /// How long a cached artifact size stays fresh before it's re-measured.
-    pub size_cache_ttl_hours: u64,
 }
 
 /// Network policy (spec M7). All network access is optional and degrades
@@ -321,21 +346,15 @@ pub struct ScanConfig {
 pub struct NetworkConfig {
     /// Disable all network access.
     pub offline: bool,
-    /// Refresh the cask catalog at most this often (ETag-revalidated).
-    pub catalog_max_age_days: u64,
     /// Max GitHub release lookups that may hit the network per scan.
     pub github_max_checks_per_scan: usize,
-    /// How long a cached GitHub release result stays fresh.
-    pub github_cache_ttl_hours: u64,
 }
 
 impl Default for NetworkConfig {
     fn default() -> Self {
         NetworkConfig {
             offline: false,
-            catalog_max_age_days: 7,
             github_max_checks_per_scan: 10,
-            github_cache_ttl_hours: 72,
         }
     }
 }
@@ -376,7 +395,6 @@ impl Default for ScanConfig {
             roots: Vec::new(),
             ignore: Vec::new(),
             large_file_threshold_gb: 1.0,
-            size_cache_ttl_hours: 24,
         }
     }
 }
@@ -391,13 +409,11 @@ impl Default for BehaviorConfig {
 }
 
 impl Config {
-    /// Load config from the given file, returning defaults if it doesn't exist.
+    /// Read only an explicitly selected configuration file. Default runs use
+    /// `Config::default()` without consulting the filesystem.
     pub fn load(path: &Path) -> anyhow::Result<Config> {
-        match std::fs::read_to_string(path) {
-            Ok(text) => Ok(toml::from_str(&text)?),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
-            Err(e) => Err(e.into()),
-        }
+        let text = std::fs::read_to_string(path)?;
+        Ok(toml::from_str(&text)?)
     }
 
     /// Large-file threshold in bytes.
@@ -429,10 +445,48 @@ mod tests {
     }
 
     #[test]
-    fn default_config_parses_and_missing_file_is_default() {
-        let c = Config::load(Path::new("/nonexistent/xyz/config.toml")).unwrap();
+    fn defaults_need_no_configuration_file() {
+        let c = Config::default();
         assert_eq!(c.behavior.delete_mode, DeleteMode::Trash);
         assert_eq!(c.behavior.stale_after_days, 90);
+    }
+
+    #[test]
+    fn serialization_omits_removed_persistence_settings() {
+        let config: Config = toml::from_str(
+            "[scan]\nsize_cache_ttl_hours = 1\n[network]\ncatalog_max_age_days = 1\ngithub_cache_ttl_hours = 1\n[tools]\nwrite_cleanup_reports = true\n",
+        )
+        .unwrap();
+        let encoded = toml::to_string(&config).unwrap();
+        for removed in [
+            "size_cache_ttl_hours",
+            "catalog_max_age_days",
+            "github_cache_ttl_hours",
+            "write_cleanup_reports",
+        ] {
+            assert!(!encoded.contains(removed));
+        }
+    }
+
+    #[test]
+    fn missing_explicit_config_errors_without_creating_it() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("missing/config.toml");
+        assert!(Config::load(&config).is_err());
+        assert!(!home.path().join("missing").exists());
+    }
+
+    #[test]
+    fn explicit_config_is_read_without_modification() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("explicit.toml");
+        let text = "[behavior]\ndelete_mode = 'rm'\n";
+        std::fs::write(&config, text).unwrap();
+        assert_eq!(
+            Config::load(&config).unwrap().behavior.delete_mode,
+            DeleteMode::Rm
+        );
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
     }
 
     #[test]
@@ -472,16 +526,19 @@ mod tests {
     }
 
     #[test]
-    fn login_shell_path_reads_last_line_of_probe_output() {
+    fn login_shell_path_does_not_execute_startup_configuration() {
         let dir = tempfile::tempdir().unwrap();
-        let sh = stub_shell(dir.path(), "echo noise\necho /opt/homebrew/bin:/usr/bin:");
-        let got = login_shell_path(&sh, std::time::Duration::from_secs(5)).unwrap();
-        assert_eq!(
-            got,
-            vec![
-                PathBuf::from("/opt/homebrew/bin"),
-                PathBuf::from("/usr/bin")
-            ]
+        let sentinel = dir.path().join("startup-executed");
+        let rc = dir.path().join(".zshrc");
+        std::fs::write(&rc, format!("printf executed > '{}'\n", sentinel.display())).unwrap();
+        let sh = stub_shell(
+            dir.path(),
+            &format!(". '{}'\necho /opt/homebrew/bin:/usr/bin:", rc.display()),
+        );
+        assert!(login_shell_path(&sh, std::time::Duration::from_secs(5)).is_none());
+        assert!(
+            !sentinel.exists(),
+            "shell startup configuration must not run"
         );
     }
 

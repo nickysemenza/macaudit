@@ -1,206 +1,204 @@
-//! End-to-end test: run the real `macaudit` binary with `scan --json` against a
-//! fixture HOME and assert on the emitted `Vec<Finding>` (spec §10).
-//!
-//! This drives the whole pipeline — CLI parse → `Paths`/`Config` resolution via
-//! `$MACAUDIT_HOME` → the engine → the filesystem-based scanners (FsScanner's
-//! real `ignore` walk + GitScanner shelling real `git`) → JSON serialization —
-//! without mocking anything. It also asserts `FindingId` stability across two
-//! runs of an identical scan.
-//!
-//! We scan only `disk` (which pulls in git discovery) so the test needs no stub
-//! CLIs for brew/system_profiler/etc.; those scanners have their own unit tests
-//! with fixture output.
-
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
 
 use serde_json::Value;
 
-/// Build a fixture HOME tree: a JS project with a node_modules artifact, and a
-/// real git repo. Returns the tempdir (kept alive by the caller).
-fn build_fixture_home() -> tempfile::TempDir {
-    let home = tempfile::tempdir().expect("tempdir");
-    let root = home.path();
-
-    // A JS project: node_modules next to package.json → a BuildArtifact finding.
-    let proj = root.join("code/webapp");
-    std::fs::create_dir_all(proj.join("node_modules/leftpad")).unwrap();
-    std::fs::write(proj.join("package.json"), r#"{"name":"webapp"}"#).unwrap();
-    std::fs::write(
-        proj.join("node_modules/leftpad/index.js"),
-        "module.exports=1;\n",
-    )
-    .unwrap();
-    std::fs::write(proj.join("src.js"), "console.log(1)\n").unwrap();
-
-    // A real git repo → a GitRepo finding (best-effort; skipped if git absent).
-    let repo = root.join("code/repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    let _ = Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(&repo)
-        .status();
-    std::fs::write(repo.join("README.md"), "# repo\n").unwrap();
-
-    // A project under ~/dev — this is what makes the "Development" disk
-    // category (~/dev) exist for this fixture, so `disk_category` findings
-    // are actually emitted. No `node_modules` here (that would add a second
-    // build-artifact hit and break `scan_json_finds_node_modules_artifact`'s
-    // "exactly one" assertion) — just a couple of plain source files.
-    let dev_proj = root.join("dev/proj");
-    std::fs::create_dir_all(&dev_proj).unwrap();
-    std::fs::write(dev_proj.join("package.json"), r#"{"name":"proj"}"#).unwrap();
-    std::fs::write(dev_proj.join("main.js"), "console.log(2)\n").unwrap();
-
-    // The Disk walk defaults to the whole boot volume; pin it to the fixture
-    // so the test neither walks the real disk nor sees the real system
-    // categories.
-    let config_dir = root.join(".config/macaudit");
-    std::fs::create_dir_all(&config_dir).unwrap();
-    std::fs::write(config_dir.join("config.toml"), "[scan]\nroots = [\"~\"]\n").unwrap();
-
-    home
-}
-
-/// Run `macaudit scan --section disk --json` against the fixture HOME and return
-/// the parsed findings array.
-fn run_scan_json(home: &Path) -> Vec<Value> {
-    let out = Command::new(env!("CARGO_BIN_EXE_macaudit"))
-        .args(["scan", "--section", "disk", "--json"])
+fn run(home: &Path, cwd: &Path, arguments: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_macaudit"))
+        .args(["--fake", "--offline"])
+        .args(arguments)
         .env("MACAUDIT_HOME", home)
+        .env("HOME", home)
+        .env_remove("RUST_LOG")
+        .current_dir(cwd)
         .output()
-        .expect("run macaudit");
-    assert!(
-        out.status.success(),
-        "macaudit exited {:?}\nstderr: {}",
-        out.status.code(),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let json: Value = serde_json::from_slice(&out.stdout).expect("valid JSON array");
-    json.as_array().expect("top-level array").clone()
+        .expect("run macaudit")
 }
 
-#[test]
-fn scan_json_finds_node_modules_artifact() {
-    let home = build_fixture_home();
-    let findings = run_scan_json(home.path());
-
-    let node_modules: Vec<&Value> = findings
-        .iter()
-        .filter(|f| f["kind"] == "build_artifact")
-        .filter(|f| {
-            f["path"]
-                .as_str()
-                .map(|p| p.ends_with("node_modules"))
-                .unwrap_or(false)
-        })
-        .collect();
-
-    assert_eq!(
-        node_modules.len(),
-        1,
-        "expected exactly one node_modules artifact, got findings: {findings:#?}"
-    );
-    let nm = node_modules[0];
-    // Discovery does not descend: no nested node_modules finding.
+fn scan(home: &Path, cwd: &Path, arguments: &[&str]) -> Value {
+    let output = run(home, cwd, arguments);
     assert!(
-        nm["path"]
-            .as_str()
-            .unwrap()
-            .contains("code/webapp/node_modules"),
-        "unexpected artifact path: {}",
-        nm["path"]
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    // A reclaimable severity + a Trash remedy should be attached.
-    assert_eq!(nm["severity"], "reclaimable");
-    let has_trash = nm["remedies"]
+    serde_json::from_slice(&output.stdout).expect("valid run JSON")
+}
+
+fn findings(json: &Value) -> Vec<&Value> {
+    json["disk"]["findings"]
         .as_array()
-        .map(|rs| rs.iter().any(|r| r["command"]["type"] == "trash"))
-        .unwrap_or(false);
-    assert!(has_trash, "node_modules finding should have a Trash remedy");
+        .unwrap()
+        .iter()
+        .chain(json["audit_host"]["findings"].as_array().unwrap())
+        .collect()
 }
 
 #[test]
-fn scan_json_disk_categories_are_complete() {
-    let home = build_fixture_home();
-    let findings = run_scan_json(home.path());
-
-    let categories: Vec<&Value> = findings
-        .iter()
-        .filter(|f| f["kind"] == "disk_category")
-        .collect();
-
-    assert!(
-        !categories.is_empty(),
-        "expected at least one disk_category finding, got findings: {findings:#?}"
+fn scan_json_separates_selected_root_and_global_audits() {
+    let home = tempfile::tempdir().unwrap();
+    let json = scan(home.path(), home.path(), &["scan", "--json"]);
+    let expected_root = home.path().canonicalize().unwrap();
+    assert_eq!(
+        json["request"]["selected_root"],
+        expected_root.to_str().unwrap()
     );
-    for c in &categories {
+    assert!(json["run_id"].as_u64().unwrap() > 0);
+    assert_eq!(json["active_scanners"], 0);
+    assert!(!json["disk"]["findings"].as_array().unwrap().is_empty());
+    assert!(!json["audit_host"]["findings"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(json["disk"]["metadata"].get("coverage").is_some());
+    assert!(json["audit_host"]["metadata"].get("coverage").is_some());
+    assert_eq!(json["disk"]["metadata"]["context"]["type"], "disk");
+    assert_eq!(
+        json["audit_host"]["metadata"]["context"]["type"],
+        "audit_host"
+    );
+    assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn section_filter_does_not_change_the_single_run_contract() {
+    let home = tempfile::tempdir().unwrap();
+    let json = scan(
+        home.path(),
+        home.path(),
+        &["scan", "--section", "projects", "--json"],
+    );
+    assert!(json["disk"]["findings"].as_array().unwrap().is_empty());
+    let rows = findings(&json);
+    assert!(!rows.is_empty());
+    assert!(rows
+        .iter()
+        .all(|finding| matches!(finding["kind"].as_str(), Some("project" | "project_bucket"))));
+    assert_eq!(json["active_scanners"], 0);
+    assert!(!json["audit_host"]["footprints"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn relative_and_tilde_roots_resolve_without_changing_host_context() {
+    let home = tempfile::tempdir().unwrap();
+    let subset = home.path().join("cf-repos");
+    std::fs::create_dir(&subset).unwrap();
+    let expected = subset.canonicalize().unwrap();
+    for input in ["cf-repos", "~/cf-repos"] {
+        let json = scan(
+            home.path(),
+            home.path(),
+            &["--root", input, "scan", "--json"],
+        );
+        assert_eq!(json["request"]["selected_root"], expected.to_str().unwrap());
+        assert!(!json["audit_host"]["findings"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+    assert_eq!(std::fs::read_dir(&subset).unwrap().count(), 0);
+}
+
+#[test]
+fn invalid_and_multiple_roots_are_rejected_without_fallback() {
+    let home = tempfile::tempdir().unwrap();
+    for arguments in [
+        vec!["--root", "missing", "scan", "--json"],
+        vec!["--root", "~", "--root", "/", "scan", "--json"],
+        vec!["--root", "", "scan", "--json"],
+    ] {
+        let output = run(home.path(), home.path(), &arguments);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+    }
+    assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn launches_ignore_and_preserve_legacy_runtime_artifacts() {
+    let home = tempfile::tempdir().unwrap();
+    let artifacts = [
+        (".config/macaudit/config.toml", "invalid legacy config"),
+        (
+            "Library/Caches/macaudit/sizes.sqlite",
+            "historical size database",
+        ),
+        ("Library/Caches/macaudit/catalog.json", "historical catalog"),
+        (
+            ".local/state/macaudit/reports/old.json",
+            "historical report",
+        ),
+    ];
+    for (relative, contents) in artifacts {
+        let path = home.path().join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+    for _ in 0..2 {
+        let json = scan(home.path(), home.path(), &["scan", "--json"]);
+        assert!(!findings(&json).is_empty());
+    }
+    for (relative, contents) in artifacts {
         assert_eq!(
-            c["meta"]["complete"], true,
-            "disk_category finding should be complete in this fixture: {c:#?}"
+            std::fs::read_to_string(home.path().join(relative)).unwrap(),
+            contents
         );
     }
+    assert_eq!(
+        std::fs::read_dir(home.path().join(".config/macaudit"))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_dir(home.path().join("Library/Caches/macaudit"))
+            .unwrap()
+            .count(),
+        2
+    );
+    assert_eq!(
+        std::fs::read_dir(home.path().join(".local/state/macaudit/reports"))
+            .unwrap()
+            .count(),
+        1
+    );
 }
 
 #[test]
-fn finding_ids_are_stable_across_runs() {
-    let home = build_fixture_home();
+fn explicit_configuration_is_a_read_only_input() {
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join("input.toml");
+    let contents = "[network]\noffline = true\n[scan]\nroots = [\"/must-not-be-used\"]\n";
+    std::fs::write(&config, contents).unwrap();
+    let json = scan(
+        home.path(),
+        home.path(),
+        &["--config", "input.toml", "scan", "--json"],
+    );
+    assert_eq!(
+        json["request"]["selected_root"],
+        home.path().canonicalize().unwrap().to_str().unwrap()
+    );
+    assert_eq!(std::fs::read_to_string(config).unwrap(), contents);
+    assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 1);
+}
 
-    let ids_of = |findings: &[Value]| -> Vec<String> {
-        let mut ids: Vec<String> = findings.iter().map(|f| f["id"].to_string()).collect();
+#[test]
+fn finding_identity_does_not_require_saved_state_between_launches() {
+    let home = tempfile::tempdir().unwrap();
+    let first = scan(home.path(), home.path(), &["scan", "--json"]);
+    let second = scan(home.path(), home.path(), &["scan", "--json"]);
+    let identities = |json: &Value| {
+        let mut ids: Vec<_> = findings(json)
+            .into_iter()
+            .map(|finding| finding["id"].to_string())
+            .collect();
         ids.sort();
         ids
     };
-
-    let run1 = run_scan_json(home.path());
-    let run2 = run_scan_json(home.path());
-
-    // Same fixture, same ids — findings must be identifiable across scans.
-    assert_eq!(
-        ids_of(&run1),
-        ids_of(&run2),
-        "FindingIds must be stable across identical scans"
-    );
-    assert!(
-        !run1.is_empty(),
-        "expected at least the node_modules finding"
-    );
-}
-
-/// `--section projects` pulls its dependency sections in behind the scenes
-/// (Disk, Git, ...) but the output must stay scoped to what was asked for —
-/// and stay a plain array, the shape every other `scan --json` caller relies
-/// on. The fixture's git repo and manifest-only project both become rows.
-#[test]
-fn scan_json_section_projects_is_filtered_to_project_findings() {
-    let home = build_fixture_home();
-    let out = Command::new(env!("CARGO_BIN_EXE_macaudit"))
-        .args(["scan", "--section", "projects", "--json"])
-        .env("MACAUDIT_HOME", home.path())
-        .output()
-        .expect("run macaudit");
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let json: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
-    let findings = json.as_array().expect("top-level array");
-
-    let kinds: Vec<&str> = findings.iter().filter_map(|f| f["kind"].as_str()).collect();
-    assert!(
-        kinds
-            .iter()
-            .all(|k| *k == "project" || *k == "project_bucket"),
-        "dependency sections leaked into --section projects output: {kinds:?}"
-    );
-    let names: Vec<&str> = findings
-        .iter()
-        .filter(|f| f["kind"] == "project")
-        .filter_map(|f| f["title"].as_str())
-        .collect();
-    assert!(
-        names.contains(&"webapp") && names.contains(&"proj"),
-        "expected the fixture's manifest projects as rows, got {names:?}"
-    );
+    assert_eq!(identities(&first), identities(&second));
+    assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
 }

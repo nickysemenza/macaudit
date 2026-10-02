@@ -14,16 +14,22 @@ struct TreeView: View {
         let key: String
         let items: [Finding]
         let bytes: UInt64
-        var id: String { key }
+        var id: String {
+            key
+        }
     }
 
-    private var groups: [Group] {
+    @State private var preparedGroups: [Group] = []
+    @State private var preparedSource: [Finding] = []
+
+    private nonisolated static func groups(_ findings: [Finding]) -> [Group] {
         let byKey = Dictionary(grouping: findings, by: \.group)
         return byKey.map { key, items in
             Group(
                 key: key,
                 items: items.sorted { ($0.sizeBytes ?? 0, $1.title) > ($1.sizeBytes ?? 0, $0.title) },
-                bytes: items.reduce(0) { $0 + ($1.sizeBytes ?? 0) })
+                bytes: items.reduce(0) { $0 + ($1.sizeBytes ?? 0) }
+            )
         }
         .sorted { ($0.bytes, $1.key) > ($1.bytes, $0.key) }
     }
@@ -31,7 +37,7 @@ struct TreeView: View {
     var body: some View {
         @Bindable var store = store
         List(selection: $store.selectedFinding) {
-            ForEach(groups) { group in
+            ForEach(preparedSource == findings ? preparedGroups : []) { group in
                 Section {
                     if !collapsed.contains(group.key) {
                         ForEach(group.items) { f in
@@ -39,23 +45,42 @@ struct TreeView: View {
                         }
                     }
                 } header: {
-                    HStack {
-                        Image(systemName: collapsed.contains(group.key) ? "chevron.right" : "chevron.down")
-                            .font(.caption)
-                            .frame(width: 12)
-                        Text(group.key)
-                        Text("\(group.items.count)").foregroundStyle(.secondary)
-                        Spacer()
-                        if group.bytes > 0 {
-                            Text(Formatting.bytes(group.bytes)).monospacedDigit().foregroundStyle(.secondary)
+                    Button {
+                        if collapsed.contains(group.key) {
+                            collapsed.remove(group.key)
+                        } else {
+                            collapsed.insert(group.key)
+                        }
+                    } label: {
+                        HStack {
+                            Image(systemName: collapsed.contains(group.key) ? "chevron.right" : "chevron.down")
+                                .font(.caption)
+                                .frame(width: 12)
+                            Text(group.key)
+                            Text("\(group.items.count)").foregroundStyle(.secondary)
+                            Spacer()
+                            if group.bytes > 0 {
+                                Text(Formatting.bytes(group.bytes)).monospacedDigit().foregroundStyle(.secondary)
+                            }
                         }
                     }
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        if collapsed.contains(group.key) { collapsed.remove(group.key) } else { collapsed.insert(group.key) }
-                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("\(group.key), \(group.items.count) findings")
+                    .accessibilityValue(collapsed.contains(group.key) ? "Collapsed" : "Expanded")
                 }
             }
+        }
+        .onKeyPress(.space) {
+            guard let selected = store.selectedFinding else { return .ignored }
+            store.toggleMark(selected)
+            return .handled
+        }
+        .task(id: findings) {
+            let source = findings
+            let grouped = await Task.detached { Self.groups(source) }.value
+            guard !Task.isCancelled else { return }
+            preparedGroups = grouped
+            preparedSource = source
         }
     }
 }
@@ -72,6 +97,7 @@ struct FindingRow: View {
                 if !finding.detail.isEmpty {
                     Text(finding.detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
+                Text(finding.auditScopeLabel).font(.caption2).foregroundStyle(.secondary)
             }
             Spacer()
             if finding.sizeBytes != nil {

@@ -81,6 +81,7 @@ pub fn du_blocks_bounded_except(
 pub struct SharedSize {
     pub bytes: u64,
     pub externally_linked: u64,
+    pub complete: bool,
 }
 
 pub fn du_blocks_shared(root: &Path, cancelled: &(dyn Fn() -> bool + Sync)) -> SharedSize {
@@ -94,6 +95,7 @@ pub fn du_blocks_shared(root: &Path, cancelled: &(dyn Fn() -> bool + Sync)) -> S
     SharedSize {
         bytes: r.root.alloc,
         externally_linked: r.externally_linked,
+        complete: r.complete,
     }
 }
 
@@ -108,11 +110,21 @@ fn du_options(opts: WalkOptions) -> WalkOptions {
 }
 
 fn size(root: &Path, opts: WalkOptions, cancelled: &(dyn Fn() -> bool + Sync)) -> BoundedSize {
+    let intentional_pruning = !opts.excludes.is_empty();
     let r = walk::walk(root, du_options(opts), &NoVisitor, None, cancelled);
+    let complete = r.complete
+        || (intentional_pruning
+            && r.coverage.excluded > 0
+            && r.coverage.unreadable == 0
+            && r.coverage.dataless == 0
+            && !r.coverage.cancelled
+            && !r.coverage.resource_limited
+            && !r.coverage.deadline
+            && !r.coverage.entry_limit);
     BoundedSize {
         bytes: r.root.alloc,
         entries: r.entries,
-        complete: r.complete,
+        complete,
     }
 }
 
@@ -131,9 +143,18 @@ pub fn on_disk_bytes(meta: &std::fs::Metadata) -> u64 {
 /// On-disk size of a single path (file or directory root's own entry, not
 /// recursive). For a directory use `du_blocks`.
 pub fn path_on_disk_bytes(path: &Path) -> Option<u64> {
+    let _materialization = walk::listing::MaterializationGuard::enter().ok()?;
     let meta = std::fs::symlink_metadata(path).ok()?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::MetadataExt;
+        if meta.st_flags() & 0x4000_0000 != 0 {
+            return None;
+        }
+    }
     if meta.is_dir() {
-        Some(du_blocks(path, &|| false))
+        let measurement = du_blocks_shared(path, &|| false);
+        measurement.complete.then_some(measurement.bytes)
     } else {
         Some(on_disk_bytes(&meta))
     }

@@ -11,7 +11,9 @@ struct OwnerDetailView: View {
     @Environment(AuditStore.self) private var store
     let axis: AttributionAxis
 
-    private var browser: OwnerBrowser? { store.owners[axis] }
+    private var browser: OwnerBrowser? {
+        store.owners[axis]
+    }
 
     var body: some View {
         if let browser, let owner = browser.selectedOwner {
@@ -35,10 +37,11 @@ struct OwnerDetailView: View {
                         }
                     }
                     Button {
-                        store.rescan(axis.sectionId)
+                        store.rescanAll()
                     } label: {
-                        Label("Rescan", systemImage: "arrow.clockwise")
+                        Label("Refresh All", systemImage: "arrow.clockwise")
                     }
+                    .disabled(!store.canRefresh)
                 }
             }
         } else {
@@ -69,11 +72,25 @@ struct OwnerDetailView: View {
             Divider()
             switch browser.viewMode {
             case .list:
-                EntryGroupedTable(store: store, axis: axis, groups: footprint.groups)
+                EntryGroupedTable(store: store, axis: axis, groups: browser.displayedGroups)
                     .frame(maxHeight: .infinity)
             case .treemap:
-                EntryTreemap(store: store, axis: axis, groups: footprint.groups)
+                EntryTreemap(store: store, axis: axis, groups: browser.displayedGroups)
                     .frame(maxHeight: .infinity)
+            }
+            HStack {
+                Text("\(browser.loadedEntryCount) of \(browser.totalEntries) owner entries loaded · omitted mass stays Other")
+                    .font(.caption)
+                Spacer()
+                if browser.isLoadingEntries {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Load More Entries") { browser.loadMoreEntries() }
+                    .disabled(browser.nextEntriesCursor == nil || browser.isLoadingEntries
+                        || browser.loadedEntryCount >= OwnerBrowser.entryLimit)
+            }.padding(10)
+            if let error = browser.entriesError {
+                Text(error).font(.caption).foregroundStyle(.red)
             }
         } else if browser.isLoading || store.isScanning {
             VStack(spacing: 12) {
@@ -85,9 +102,9 @@ struct OwnerDetailView: View {
             ContentUnavailableView {
                 Label("Not resolved yet", systemImage: "hourglass")
             } description: {
-                Text("This owner hasn't been resolved by a scan yet. Rescan \(axis.title) to try again.")
+                Text("This owner hasn't been resolved by a scan yet. Refresh All to try again.")
             } actions: {
-                Button("Rescan") { store.rescan(axis.sectionId) }
+                Button("Refresh All") { store.rescanAll() }.disabled(!store.canRefresh)
             }
         }
     }
@@ -174,11 +191,13 @@ private struct ByKindBreakdown: View {
             rows: groups.map {
                 BarRow(
                     name: $0.kind.label, parts: [(label: $0.kind.label, value: Double($0.bytes))],
-                    color: Palette.color(forKindLabel: $0.kind.label))
+                    color: Palette.color(forKindLabel: $0.kind.label)
+                )
             },
             title: "By kind",
             format: { Formatting.bytes(UInt64(max(0, $0))) },
-            selected: $selected)
+            selected: $selected
+        )
     }
 }
 
@@ -215,7 +234,7 @@ private struct ProjectStrip: View {
                     Text(footprint.ports.map(String.init).joined(separator: ", ")).font(.caption).foregroundStyle(.secondary)
                 }
             }
-            if footprint.worktrees.isEmpty && footprint.processes.isEmpty && footprint.ports.isEmpty {
+            if footprint.worktrees.isEmpty, footprint.processes.isEmpty, footprint.ports.isEmpty {
                 Text("No worktrees, live processes, or listening ports right now.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -232,13 +251,19 @@ private struct EntryGroupedTable: View {
     let axis: AttributionAxis
     let groups: [FootprintGroup]
 
-    private var browser: OwnerBrowser? { store.owners[axis] }
-    private var allEntries: [FootprintEntry] { groups.flatMap(\.entries) }
+    private var browser: OwnerBrowser? {
+        store.owners[axis]
+    }
+
+    private var allEntries: [FootprintEntry] {
+        groups.flatMap(\.entries)
+    }
 
     private var selection: Binding<String?> {
         Binding(
             get: { browser?.selectedEntry?.path },
-            set: { path in browser?.selectedEntry = allEntries.first { $0.path == path } })
+            set: { path in browser?.selectedEntry = allEntries.first { $0.path == path } }
+        )
     }
 
     var body: some View {
@@ -293,28 +318,60 @@ private struct EntryTreemap: View {
     let store: AuditStore
     let axis: AttributionAxis
     let groups: [FootprintGroup]
+    @State private var cells: [TreemapCell] = []
+    @State private var byPath: [String: FootprintEntry] = [:]
 
-    private var browser: OwnerBrowser? { store.owners[axis] }
-    private var entries: [FootprintEntry] { groups.flatMap(\.entries) }
+    private var browser: OwnerBrowser? {
+        store.owners[axis]
+    }
+
+    private var entries: [FootprintEntry] {
+        groups.flatMap(\.entries)
+    }
 
     var body: some View {
         GeometryReader { geo in
-            let bounds = CGRect(origin: .zero, size: geo.size).insetBy(dx: 2, dy: 2)
-            let items = entries.map { Squarify.Item(id: $0.path, value: Double($0.bytes)) }
-            let byPath = Dictionary(uniqueKeysWithValues: entries.map { ($0.path, $0) })
-            let cells = Squarify.layout(items, in: bounds).compactMap { cell -> TreemapCell? in
-                guard let entry = byPath[cell.id] else { return nil }
-                return TreemapCell(
-                    id: cell.id, title: entry.label, bytes: entry.bytes, rect: cell.rect, depth: 0,
-                    fill: Palette.color(forKindLabel: entry.kind.label).opacity(0.4))
-            }
-
             TreemapCanvas(
                 cells: cells,
                 selected: browser?.selectedEntry?.path,
                 onSelect: { cell in
                     browser?.selectedEntry = byPath[cell.id]
-                })
+                }
+            )
+            .task(id: EntrySceneRequest(size: geo.size, groups: groups)) {
+                cells = []
+                byPath = [:]
+                let groups = groups
+                let size = geo.size
+                let result = await Task.detached { Self.layout(groups: groups, size: size) }.value
+                guard !Task.isCancelled else { return }
+                cells = result.0
+                byPath = result.1
+            }
         }
     }
+
+    private nonisolated static func layout(groups: [FootprintGroup], size: CGSize) -> ([TreemapCell], [String: FootprintEntry]) {
+        let entries = groups.flatMap(\.entries).sorted { $0.bytes > $1.bytes }
+        let byPath = Dictionary(entries.prefix(2047).map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
+        var items = byPath.values.map { Squarify.Item(id: $0.path, value: Double($0.bytes)) }
+        let represented = byPath.values.reduce(UInt64(0)) { $0 + $1.bytes }
+        let total = groups.reduce(UInt64(0)) { $0 + $1.bytes }
+        let residual = Double(total > represented ? total - represented : 0)
+        if residual > 0 {
+            items.append(Squarify.Item(id: "Other entries", value: residual))
+        }
+        let bounds = CGRect(origin: .zero, size: size).insetBy(dx: 2, dy: 2)
+        let cells = Squarify.layout(items, in: bounds).map { cell in
+            let entry = byPath[cell.id]
+            return TreemapCell(id: cell.id, title: entry?.label ?? "Other entries", bytes: entry?.bytes ?? UInt64(residual),
+                               rect: cell.rect, depth: 0, fill: Palette.color(forKindLabel: entry?.kind.label ?? "Other").opacity(0.4))
+        }
+        return (cells, byPath)
+    }
+}
+
+private struct EntrySceneRequest: Equatable {
+    let size: CGSize
+    let groups: [FootprintGroup]
 }

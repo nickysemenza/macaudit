@@ -196,7 +196,11 @@ pub(crate) fn apple_data(env: &ResolveEnv<'_>) -> Vec<(PathBuf, &'static str, En
 /// tree carries no file nodes, so this only ever returns subdirectories.
 fn tree_child_names(env: &ResolveEnv<'_>, dir: &Path) -> Vec<String> {
     node_at(env.trees, dir)
-        .map(|node| node.children.iter().map(|c| c.name.to_string()).collect())
+        .map(|node| {
+            node.children()
+                .map(|child| child.name().into_owned())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -298,6 +302,53 @@ fn push_file_hub(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attribution::testutil::{tree_fixture, EnvFixture};
+    use crate::scan::walk::DirNode;
+
+    #[test]
+    fn vendor_candidates_use_inventory_child_names() {
+        let hub = Path::new("/home/dev/Library/Application Support");
+        let root_node = DirNode {
+            name: hub.to_string_lossy().into(),
+            children: vec![
+                DirNode {
+                    name: "Vendor name".into(),
+                    children: vec![DirNode {
+                        name: "App name".into(),
+                        ..DirNode::default()
+                    }]
+                    .into_boxed_slice(),
+                    ..DirNode::default()
+                },
+                DirNode {
+                    name: "com.example.app".into(),
+                    children: vec![DirNode {
+                        name: "not-a-vendor-child".into(),
+                        ..DirNode::default()
+                    }]
+                    .into_boxed_slice(),
+                    ..DirNode::default()
+                },
+            ]
+            .into_boxed_slice(),
+            ..DirNode::default()
+        };
+        let mut fixture = EnvFixture::new();
+        fixture.trees.push(tree_fixture(hub, &root_node));
+        let env = fixture.env();
+        let mut candidates = Vec::new();
+        push_depth1_and_vendor2(&env, hub, EntryKind::Data, &mut candidates);
+        assert_eq!(candidates.len(), 3);
+        let app = candidates
+            .iter()
+            .find(|candidate| candidate.name == "App name")
+            .unwrap();
+        assert_eq!(app.path, hub.join("Vendor name/App name"));
+        assert_eq!(app.vendor.as_deref(), Some("Vendor name"));
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.parent_kind == EntryKind::Data));
+    }
 
     #[test]
     fn push_file_hub_strips_the_suffix_and_skips_named_entries() {

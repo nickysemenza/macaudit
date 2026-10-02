@@ -47,11 +47,12 @@ struct FullDiskAccessBanner: View {
     private var openSettings: some View {
         Button("Open Privacy Settings…") {
             NSWorkspace.shared.open(
-                URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!)
+                URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!
+            )
         }
     }
 
     private var rescan: some View {
-        Button("Rescan Disk") { store.rescan(.fs) }
+        Button("Refresh All") { store.rescanAll() }.disabled(!store.canRefresh)
     }
 }

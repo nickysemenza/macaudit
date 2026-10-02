@@ -11,13 +11,14 @@
 //! published as `ScanEvent::DirTree` for drill-down views.
 //!
 //! Concurrency contract (spec §1): the sync walk runs inside
-//! `spawn_blocking`; rayon threads bridge back with `blocking_send` for
-//! events and a non-blocking `send` on the unbounded repo pipe (see
+//! `spawn_blocking`; rayon threads bridge back with cancellation-aware sends for
+//! events and a non-blocking `send` on the bounded repo pipe (see
 //! `scan::pipe` for why it must never block). The
 //! visitor (and with it `repo_tx`) is dropped the instant the walk finishes
 //! so GitScanner's channel closes before the post-walk derivations.
 
 use std::collections::{HashMap, HashSet};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -25,9 +26,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use serde_json::json;
 
+#[cfg(test)]
+use crate::inventory::MemoryBudget;
+use crate::inventory::Reservation;
 use crate::model::{Finding, FindingKind, Remedy, RemedyCommand, ScanEvent, ScannerId, Severity};
 use crate::scan::pipe::{RepoDiscovery, RepoSender};
-use crate::scan::sizing::{du_blocks, du_blocks_shared};
+use crate::scan::sizing::du_blocks_shared;
 use crate::scan::walk::{
     self, DirAction, DirNode, DirTree, Entry, Flags, Kind, Visitor, WalkOptions, WalkStats,
 };
@@ -92,7 +96,7 @@ fn artifact_ctx(name: &str, path: &Path, siblings: &[Entry]) -> ArtifactCtx {
     let (repo_root, worktree) = enclosing_repo(path);
     let (pnpm_store, pnpm_import_method) = if name == "node_modules" && path.join(".pnpm").is_dir()
     {
-        let scalars = std::fs::read_to_string(path.join(".modules.yaml"))
+        let scalars = crate::scan::read_head(&path.join(".modules.yaml"), 64 * 1024)
             .map(|t| crate::scan::global_tools::flatyaml::top_level_scalars(&t))
             .unwrap_or_default();
         (
@@ -136,7 +140,7 @@ fn enclosing_repo(path: &Path) -> (Option<PathBuf>, Option<(PathBuf, String)>) {
             return (Some(dir.to_path_buf()), None);
         }
         if git.is_file() {
-            let worktree = std::fs::read_to_string(&git).ok().and_then(|t| {
+            let worktree = crate::scan::read_head(&git, 64 * 1024).and_then(|t| {
                 let gitdir = t.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim();
                 let gitdir = if Path::new(gitdir).is_absolute() {
                     PathBuf::from(gitdir)
@@ -192,6 +196,7 @@ fn root_flags(root: &Path, home: &Path) -> Flags {
 /// last clone to drop releases `repo_tx` and closes the fs→git pipe.
 struct FsVisitor {
     tx: tokio::sync::mpsc::Sender<ScanEvent>,
+    runtime: tokio::runtime::Handle,
     gen: u64,
     token: tokio_util::sync::CancellationToken,
     config: Arc<crate::config::Config>,
@@ -199,27 +204,105 @@ struct FsVisitor {
     home: PathBuf,
     /// `~/Library` — sized into the tree, never classified.
     library: PathBuf,
-    large_file_threshold: u64,
     stale_after_days: u64,
-    /// git-only scan: feed `repo_tx`, walk nothing else, emit no findings.
+    /// git-only scan: feed `repo_tx`, emit only discovery coverage.
     discovery_only: bool,
     /// Artifacts found so far, awaiting their rolled-up size.
     hits: Mutex<HashMap<PathBuf, Hit>>,
     /// Data-library packages found so far (path → label).
     packages: Mutex<HashMap<PathBuf, &'static str>>,
+    memory: Mutex<Reservation>,
+    resource_limited: std::sync::atomic::AtomicBool,
+}
+
+struct DetectedPaths {
+    artifacts: Vec<(PathBuf, Hit)>,
+    packages: HashMap<PathBuf, &'static str>,
+    _memory: Reservation,
+}
+
+async fn deliver_event(
+    tx: &tokio::sync::mpsc::Sender<ScanEvent>,
+    token: &tokio_util::sync::CancellationToken,
+    event: ScanEvent,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = token.cancelled() => false,
+        result = tx.send(event) => result.is_ok(),
+    }
 }
 
 impl FsVisitor {
+    fn reserve_detection(&self, path: &Path) -> bool {
+        if self
+            .memory
+            .lock()
+            .unwrap()
+            .grow(4096 + path.as_os_str().len() * 8)
+            .is_ok()
+        {
+            true
+        } else {
+            self.resource_limited
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            false
+        }
+    }
+
     fn emit(&self, f: Finding) {
-        let _ = self.tx.blocking_send(ScanEvent::Finding {
-            scanner: ScannerId::Fs,
-            gen: self.gen,
-            finding: Box::new(f),
-        });
+        let _ = self.runtime.block_on(deliver_event(
+            &self.tx,
+            &self.token,
+            ScanEvent::Finding {
+                scanner: ScannerId::Fs,
+                gen: self.gen,
+                finding: Box::new(f),
+            },
+        ));
     }
 }
 
 impl Visitor for FsVisitor {
+    fn inventory_publisher(&self, root: &Path) -> Option<walk::InventoryPublisher> {
+        if self.discovery_only {
+            return None;
+        }
+        let tx = self.tx.clone();
+        let token = self.token.clone();
+        let gen = self.gen;
+        let root = root.to_path_buf();
+        let started = Instant::now();
+        Some(Arc::new(move |inventory| {
+            if token.is_cancelled() {
+                return;
+            }
+            let Ok(node) = inventory.bounded_copy(2048) else {
+                return;
+            };
+            let tree = Arc::new(DirTree {
+                root: root.clone(),
+                files: node.files,
+                entries: None,
+                externally_linked: None,
+                dirs: node.dirs,
+                bytes: node.alloc,
+                errors: node.errors,
+                node,
+                top_files: Vec::new(),
+                complete: false,
+                coverage: walk::WalkCoverage::default(),
+                memory: None,
+                scanned_at: SystemTime::now(),
+                elapsed: started.elapsed(),
+            });
+            let _ = tx.try_send(ScanEvent::DirTree {
+                scanner: ScannerId::Fs,
+                gen,
+                tree,
+            });
+        }))
+    }
     fn on_child_dir(
         &self,
         parent: &Path,
@@ -273,9 +356,16 @@ impl Visitor for FsVisitor {
         // sizes (packfiles are real bytes) but are never loose large files.
         if name == ".git" {
             if let Some(tx) = self.repo_tx.as_ref() {
-                let _ = tx.send(RepoDiscovery {
-                    root: parent.to_path_buf(),
-                });
+                if tx
+                    .send(RepoDiscovery {
+                        root: parent.to_path_buf(),
+                    })
+                    .is_err()
+                    && !self.token.is_cancelled()
+                {
+                    self.resource_limited
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             return if self.discovery_only {
                 DirAction::Skip
@@ -291,13 +381,18 @@ impl Visitor for FsVisitor {
                 return DirAction::Skip;
             }
             if let Some(label) = data_library_label(ext) {
-                self.packages.lock().unwrap().insert(path, label);
+                if self.reserve_detection(&path) {
+                    self.packages.lock().unwrap().insert(path, label);
+                }
             }
             return DirAction::Descend(flags | IN_PACKAGE | Flags::NOT_LOOSE | Flags::NO_TOP);
         }
         if is_artifact(name, &path, siblings, &self.config) {
             if self.discovery_only {
                 return DirAction::Skip;
+            }
+            if !self.reserve_detection(&path) {
+                return DirAction::Descend(flags | IN_ARTIFACT | Flags::NOT_LOOSE | Flags::NO_TOP);
             }
             let last_used = siblings_max_mtime(siblings);
             let stale = is_stale(last_used, self.stale_after_days);
@@ -319,7 +414,7 @@ impl Visitor for FsVisitor {
         DirAction::Descend(flags)
     }
 
-    fn on_dir_done(&self, dir: &Path, node: &DirNode, _flags: Flags) {
+    fn on_dir_done(&self, dir: &Path, _node: &DirNode, _flags: Flags) {
         if self.token.is_cancelled() {
             return;
         }
@@ -333,19 +428,10 @@ impl Visitor for FsVisitor {
                     &h.label,
                     h.last_used,
                     h.stale,
-                    Some(node.alloc),
+                    None,
                     &h.ctx,
                     None,
                 ));
-            }
-            return;
-        }
-        drop(hit);
-        if let Some(label) = self.packages.lock().unwrap().get(dir) {
-            // TCC-protected libraries look empty to a process without access;
-            // an empty package is simply not reported.
-            if node.alloc > self.large_file_threshold {
-                self.emit(large_package_finding(dir, label, node.alloc));
             }
         }
     }
@@ -360,7 +446,7 @@ impl Scanner for FsScanner {
     async fn scan(&self, mut ctx: ScanCtx) -> anyhow::Result<()> {
         // Resolve roots (tilde-expanded) or fall back to the home dir.
         let roots: Vec<PathBuf> = if ctx.config.scan.roots.is_empty() {
-            crate::config::Paths::default_disk_roots()
+            vec![ctx.paths.home.clone()]
         } else {
             ctx.config
                 .scan
@@ -369,6 +455,10 @@ impl Scanner for FsScanner {
                 .map(|r| ctx.paths.expand(r))
                 .collect()
         };
+        anyhow::ensure!(
+            roots.len() == 1,
+            "disk exploration requires exactly one root"
+        );
         let ignore_paths: Vec<PathBuf> = ctx
             .config
             .scan
@@ -392,17 +482,25 @@ impl Scanner for FsScanner {
 
         let visitor = Arc::new(FsVisitor {
             tx: tx.clone(),
+            runtime: tokio::runtime::Handle::current(),
             gen,
             token: token.clone(),
             config: config.clone(),
             repo_tx,
             home: paths.home.clone(),
             library: paths.home.join("Library"),
-            large_file_threshold: config.large_file_threshold_bytes(),
             stale_after_days: config.behavior.stale_after_days,
             discovery_only,
             hits: Mutex::new(HashMap::new()),
             packages: Mutex::new(HashMap::new()),
+            memory: Mutex::new(
+                paths
+                    .size_cache
+                    .memory_budget()
+                    .reserve(0)
+                    .expect("zero-byte reservation"),
+            ),
+            resource_limited: std::sync::atomic::AtomicBool::new(false),
         });
         let stats = Arc::new(WalkStats::default());
 
@@ -431,7 +529,8 @@ impl Scanner for FsScanner {
             max_entries: None,
             // Discovery-only reproduces the cheap git-root sweep: no tree, no
             // largest-file bookkeeping, and the visitor skips everything else.
-            keep_tree: !discovery_only,
+            keep_tree: false,
+            keep_inventory: !discovery_only,
             root_flags: Flags::NONE,
             top_n: if discovery_only { 0 } else { LARGEST_FILES * 4 },
             threshold: if discovery_only {
@@ -440,14 +539,11 @@ impl Scanner for FsScanner {
                 Some(config.large_file_threshold_bytes())
             },
         };
-        let results = tokio::task::spawn_blocking(move || {
+        let mut results = tokio::task::spawn_blocking(move || {
             let mut out = Vec::new();
             for root in roots {
                 if walk_token.is_cancelled() {
                     break;
-                }
-                if !root.exists() {
-                    continue;
                 }
                 let started = Instant::now();
                 let opts = WalkOptions {
@@ -474,12 +570,78 @@ impl Scanner for FsScanner {
 
         // The walk is over: hand the remaining state to the post-walk pass
         // and drop the visitor so `repo_tx` closes and GitScanner can finish.
-        let hits: Vec<(PathBuf, Hit)> = std::mem::take(&mut *visitor.hits.lock().unwrap())
-            .into_iter()
-            .collect();
+        let detected = DetectedPaths {
+            artifacts: std::mem::take(&mut *visitor.hits.lock().unwrap())
+                .into_iter()
+                .collect(),
+            packages: std::mem::take(&mut *visitor.packages.lock().unwrap()),
+            _memory: std::mem::replace(
+                &mut *visitor.memory.lock().unwrap(),
+                paths
+                    .size_cache
+                    .memory_budget()
+                    .reserve(0)
+                    .expect("zero-byte reservation"),
+            ),
+        };
+        if visitor
+            .resource_limited
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            for (_, result, _) in &mut results {
+                result.complete = false;
+                result.resource_limited = true;
+                result.coverage.resource_limited = true;
+            }
+        }
         drop(visitor);
 
-        if discovery_only || token.is_cancelled() {
+        if discovery_only {
+            let mut coverage = walk::WalkCoverage::default();
+            let mut complete = !results.is_empty();
+            for (_, result, _) in &results {
+                let observed = &result.coverage;
+                coverage.unreadable = coverage.unreadable.saturating_add(observed.unreadable);
+                coverage.excluded = coverage.excluded.saturating_add(observed.excluded);
+                coverage.dataless = coverage.dataless.saturating_add(observed.dataless);
+                coverage.aliases = coverage.aliases.saturating_add(observed.aliases);
+                coverage.mounts = coverage.mounts.saturating_add(observed.mounts);
+                coverage.cancelled |= observed.cancelled;
+                coverage.resource_limited |= observed.resource_limited || result.resource_limited;
+                coverage.summaries_truncated |= observed.summaries_truncated;
+                coverage.deadline |= observed.deadline;
+                coverage.entry_limit |= observed.entry_limit;
+                complete &= result.complete && result.errors == 0 && !result.resource_limited;
+            }
+            coverage.cancelled |= token.is_cancelled();
+            complete &= !coverage.cancelled && !coverage.resource_limited;
+            let event = ScanEvent::Finding {
+                scanner: ScannerId::Fs,
+                gen,
+                finding: Box::new(
+                    Finding::new(
+                        FindingKind::ToolCoverage,
+                        "fs:host-discovery-coverage",
+                        "Host filesystem discovery coverage",
+                    )
+                    .severity(Severity::Info)
+                    .meta(json!({
+                        "context": "audit_host",
+                        "host_discovery": true,
+                        "complete": complete,
+                        "walk_coverage": coverage,
+                    })),
+                ),
+            };
+            if token.is_cancelled() {
+                let _ = tx.try_send(event);
+            } else {
+                let _ = deliver_event(&tx, &token, event).await;
+            }
+            return Ok(());
+        }
+
+        if token.is_cancelled() {
             return Ok(());
         }
 
@@ -491,8 +653,10 @@ impl Scanner for FsScanner {
             .map(|(_, _, s)| s.elapsed())
             .max()
             .unwrap_or_default();
-        let _ = tx
-            .send(ScanEvent::Progress {
+        if !deliver_event(
+            &tx,
+            &token,
+            ScanEvent::Progress {
                 scanner: ScannerId::Fs,
                 gen,
                 msg: format!(
@@ -504,15 +668,19 @@ impl Scanner for FsScanner {
                 ),
                 done: files,
                 total: None,
-            })
-            .await;
+            },
+        )
+        .await
+        {
+            return Ok(());
+        }
 
         let tx2 = tx.clone();
         let token2 = token.clone();
         let paths2 = paths.clone();
         let threshold = config.large_file_threshold_bytes();
         tokio::task::spawn_blocking(move || {
-            derive_from_trees(&paths2, &tx2, gen, &token2, results, hits, threshold)
+            derive_from_trees(&paths2, &tx2, gen, &token2, results, detected, threshold)
         })
         .await?;
         Ok(())
@@ -544,16 +712,18 @@ async fn report_progress(
             stats.dirs.load(Relaxed),
             humansize::format_size(stats.bytes.load(Relaxed), humansize::BINARY)
         );
-        if tx
-            .send(ScanEvent::Progress {
+        if !deliver_event(
+            &tx,
+            &stop,
+            ScanEvent::Progress {
                 scanner: ScannerId::Fs,
                 gen,
                 msg,
                 done: files,
                 total: None,
-            })
-            .await
-            .is_err()
+            },
+        )
+        .await
         {
             return;
         }
@@ -569,45 +739,41 @@ fn derive_from_trees(
     gen: u64,
     token: &tokio_util::sync::CancellationToken,
     results: Vec<(PathBuf, walk::WalkResult, Instant)>,
-    hits: Vec<(PathBuf, Hit)>,
+    detected: DetectedPaths,
     threshold: u64,
 ) {
+    let runtime = tokio::runtime::Handle::current();
     let send = |f: Finding| {
-        let _ = tx.blocking_send(ScanEvent::Finding {
-            scanner: ScannerId::Fs,
-            gen,
-            finding: Box::new(f),
-        });
+        let _ = runtime.block_on(deliver_event(
+            tx,
+            token,
+            ScanEvent::Finding {
+                scanner: ScannerId::Fs,
+                gen,
+                finding: Box::new(f),
+            },
+        ));
     };
     let cancelled = || token.is_cancelled();
 
-    // pnpm-linked node_modules: how much is hard-linked from the store is a
-    // per-tree question, so it gets its own bounded walk.
-    for (path, hit) in hits.iter().filter(|(_, h)| h.ctx.pnpm_store.is_some()) {
-        if cancelled() {
-            return;
-        }
-        let s = du_blocks_shared(path, &cancelled);
-        if cancelled() {
-            return;
-        }
-        send(artifact_finding(
-            path,
-            &hit.label,
-            hit.last_used,
-            hit.stale,
-            Some(s.bytes),
-            &hit.ctx,
-            Some(s.externally_linked),
-        ));
-    }
-
     let trees: Vec<Arc<DirTree>> = results
         .into_iter()
-        .map(|(root, r, started)| {
-            let mut threshold_files = r.threshold_files.clone();
+        .map(|(root, mut r, started)| {
+            let mut threshold_files = std::mem::take(&mut r.threshold_files);
             let mut top_files = r.top_files.clone();
             let tree = Arc::new(DirTree::from_result(root, r, started));
+            let _ = runtime.block_on(deliver_event(
+                tx,
+                token,
+                ScanEvent::DirTree {
+                    scanner: ScannerId::Fs,
+                    gen,
+                    tree: tree.clone(),
+                },
+            ));
+            if cancelled() {
+                return tree;
+            }
             // Loose files over the threshold: Attention, trashable.
             threshold_files.sort_by_key(|f| std::cmp::Reverse(f.alloc));
             let over: HashSet<&Path> = threshold_files.iter().map(|f| f.path.as_path()).collect();
@@ -628,20 +794,69 @@ fn derive_from_trees(
         return;
     }
 
+    for (path, hit) in &detected.artifacts {
+        if cancelled() {
+            return;
+        }
+        if hit.ctx.pnpm_store.is_some() {
+            let size = du_blocks_shared(path, &cancelled);
+            if cancelled() {
+                return;
+            }
+            send(artifact_finding(
+                path,
+                &hit.label,
+                hit.last_used,
+                hit.stale,
+                size.complete.then_some(size.bytes),
+                &hit.ctx,
+                Some(size.externally_linked),
+            ));
+        } else if let Some(node) = find_node(&trees, path) {
+            let complete = trees
+                .iter()
+                .find(|tree| path.starts_with(&tree.root))
+                .is_some_and(|tree| tree.complete);
+            send(artifact_finding(
+                path,
+                &hit.label,
+                hit.last_used,
+                hit.stale,
+                complete.then_some(node.alloc),
+                &hit.ctx,
+                None,
+            ));
+        }
+    }
+
+    for (path, label) in &detected.packages {
+        if cancelled() {
+            return;
+        }
+        if let Some(node) = find_node(&trees, path) {
+            if node.alloc > threshold {
+                let complete = trees
+                    .iter()
+                    .find(|tree| path.starts_with(&tree.root))
+                    .is_some_and(|tree| tree.complete);
+                send(large_package_finding(
+                    path,
+                    label,
+                    complete.then_some(node.alloc),
+                ));
+            }
+        }
+    }
+
     size_fixed_paths(paths, &send, &cancelled, &trees);
     size_disk_categories(paths, &send, &cancelled, &trees);
-
-    for tree in trees {
-        let _ = tx.blocking_send(ScanEvent::DirTree {
-            scanner: ScannerId::Fs,
-            gen,
-            tree,
-        });
-    }
 }
 
 /// The node for `path` in whichever tree contains it.
-fn find_node<'a>(trees: &'a [Arc<DirTree>], path: &Path) -> Option<&'a DirNode> {
+fn find_node<'a>(
+    trees: &'a [Arc<DirTree>],
+    path: &Path,
+) -> Option<crate::inventory::DirectoryRef<'a>> {
     trees
         .iter()
         .find(|t| path.starts_with(&t.root))
@@ -755,9 +970,13 @@ fn size_disk_categories(
             continue;
         }
         let entries = files + dirs;
-        let complete = errors == 0;
+        let complete = errors == 0
+            && trees
+                .iter()
+                .filter(|tree| root.starts_with(&tree.root))
+                .all(|tree| tree.complete);
         let coverage = if complete {
-            format!("Measured exactly: {files} files in {dirs} folders.")
+            format!("Measured allocation: {files} unique files in {dirs} folders; APFS shared extents are not deduplicated.")
         } else {
             let hint = match category.unreadable {
                 Unreadable::FullDiskAccess => "grant Full Disk Access to include them",
@@ -858,14 +1077,17 @@ fn data_library_label(ext: &str) -> Option<&'static str> {
 /// A large data-library package, sized whole by the sizing pool. `Info`, in
 /// its own group, Reveal only: it is context for where the disk went, never
 /// a cleanup candidate — a library is managed by its app.
-fn large_package_finding(path: &Path, label: &str, size: u64) -> Finding {
+fn large_package_finding(path: &Path, label: &str, size: Option<u64>) -> Finding {
     let key = path.to_string_lossy();
     let name = path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     let ext = package_extension(&name).unwrap_or("");
-    Finding::new(
+    let measured = size
+        .map(|bytes| humansize::format_size(bytes, humansize::BINARY))
+        .unwrap_or_else(|| "allocation incomplete".into());
+    let mut finding = Finding::new(
         FindingKind::LargeFile,
         &key,
         format!("Large package — {name}"),
@@ -873,12 +1095,11 @@ fn large_package_finding(path: &Path, label: &str, size: u64) -> Finding {
     .path(path.to_path_buf())
     .detail(format!(
         "{label} ({}); a macOS package managed by its app — shown for size only, not a cleanup candidate",
-        humansize::format_size(size, humansize::BINARY)
+        measured
     ))
-    .size(size)
     .severity(Severity::Info)
-    .provenance("du over the whole package; contents never listed individually")
-    .meta(json!({ "group": "Data libraries", "package": ext, "package_label": label }))
+    .provenance("selected-root inventory allocation; package contents never exposed individually")
+    .meta(json!({ "group": "Data libraries", "package": ext, "package_label": label, "complete": size.is_some() }))
     .remedy(Remedy {
         label: "Reveal in Finder".into(),
         command: RemedyCommand::RevealInFinder {
@@ -888,7 +1109,14 @@ fn large_package_finding(path: &Path, label: &str, size: u64) -> Finding {
         destructive: false,
         alternative: false,
         guard: None,
-    })
+    });
+    if let Some(size) = size {
+        finding = finding.size(size);
+    } else {
+        finding = finding
+            .coverage("Allocation is incomplete; no exact size or reclaim estimate is reported.");
+    }
+    finding
 }
 
 /// Is `name` (a directory) a recognized build artifact, given its marker?
@@ -1069,13 +1297,14 @@ fn large_file_finding(path: &Path, size: u64) -> Finding {
         .detail("Large loose file over the size threshold".to_string())
         .size(size)
         .severity(Severity::Attention)
+        .coverage("Measured allocation is not assured reclaim: hardlinks and APFS shared extents may retain data, and moving a file to Trash does not immediately free space.")
         .meta(json!({ "group": "Large files" }))
         .remedy(Remedy {
             label: "Move to Trash".into(),
             command: RemedyCommand::Trash {
                 path: path.to_path_buf(),
             },
-            reclaims_bytes: Some(size),
+            reclaims_bytes: None,
             destructive: true,
             alternative: false,
             guard: None,
@@ -1252,47 +1481,397 @@ fn size_fixed_paths(
     cancelled: &(dyn Fn() -> bool + Sync),
     trees: &[Arc<DirTree>],
 ) {
+    size_fixed_paths_guarded(
+        paths,
+        send,
+        cancelled,
+        trees,
+        crate::scan::walk::listing::MaterializationGuard::enter(),
+        2048,
+    );
+}
+
+fn size_fixed_paths_guarded(
+    paths: &crate::config::Paths,
+    send: &dyn Fn(Finding),
+    cancelled: &(dyn Fn() -> bool + Sync),
+    trees: &[Arc<DirTree>],
+    policy: std::io::Result<crate::scan::walk::listing::MaterializationGuard>,
+    entry_limit: usize,
+) {
+    const MAX_SELECTION_BYTES: usize = 32 * 1024 * 1024;
+    const DIRECTORY_BUFFER_BYTES: usize = 64 * 1024;
+    let budget = paths.size_cache.memory_budget();
+    let resource_error = || std::io::Error::from_raw_os_error(libc::ENOMEM);
+    fn child_path(root: &Path, name: &[u8]) -> std::io::Result<PathBuf> {
+        use std::os::unix::ffi::OsStringExt;
+        let resource_error = || std::io::Error::from_raw_os_error(libc::ENOMEM);
+        let bytes = root
+            .as_os_str()
+            .len()
+            .checked_add(name.len())
+            .and_then(|bytes| bytes.checked_add(1))
+            .ok_or_else(resource_error)?;
+        let mut raw_path = Vec::new();
+        raw_path
+            .try_reserve_exact(bytes)
+            .map_err(|_| resource_error())?;
+        raw_path.extend_from_slice(root.as_os_str().as_bytes());
+        raw_path.push(b'/');
+        raw_path.extend_from_slice(name);
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(raw_path)))
+    }
+    fn charge_selection(
+        memory: &mut Reservation,
+        selected: &mut usize,
+        entry_limit: usize,
+        bytes: usize,
+    ) -> std::io::Result<()> {
+        let resource_error = || std::io::Error::from_raw_os_error(libc::ENOMEM);
+        let charged = bytes.checked_mul(4).ok_or_else(resource_error)?;
+        if *selected >= entry_limit || memory.bytes().saturating_add(charged) > MAX_SELECTION_BYTES
+        {
+            return Err(resource_error());
+        }
+        memory.grow(charged).map_err(|_| resource_error())?;
+        *selected += 1;
+        Ok(())
+    }
     for target in FIXED_TARGETS {
         if cancelled() {
             return;
         }
-        let root = paths.expand(target.rel);
-        if !root.exists() {
-            continue;
+        let root_bytes = paths
+            .home
+            .as_os_str()
+            .len()
+            .saturating_add(target.rel.len())
+            .saturating_add(1);
+        let root_memory = budget.reserve(
+            root_bytes
+                .saturating_mul(4)
+                .saturating_add(DIRECTORY_BUFFER_BYTES),
+        );
+        if root_memory.is_err() {
+            send(fixed_finding(
+                Path::new(target.rel),
+                target.kind,
+                &target.remedy,
+                None,
+            ).coverage("Fixed-path inspection stopped at the shared memory limit; allocation and child coverage are incomplete."));
+            return;
         }
-        if target.per_subdir {
-            match find_node(trees, &root) {
-                Some(node) => {
-                    for child in &node.children {
-                        let p = root.join(&*child.name);
-                        send(fixed_finding(&p, target.kind, &target.remedy, child.alloc));
-                    }
-                }
-                None => {
-                    let Ok(rd) = std::fs::read_dir(&root) else {
-                        continue;
-                    };
-                    for entry in rd.flatten() {
-                        let p = entry.path();
-                        if !p.is_dir() {
-                            continue;
-                        }
-                        let size = du_blocks(&p, cancelled);
-                        send(fixed_finding(&p, target.kind, &target.remedy, size));
-                    }
+        let _root_memory = root_memory.unwrap();
+        let root = paths.expand(target.rel);
+        let inspect = || -> std::io::Result<()> {
+            if let Err(error) = &policy {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("no-materialization policy failed: {error}"),
+                ));
+            }
+            let metadata = match std::fs::symlink_metadata(&root) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            if metadata.file_type().is_symlink() {
+                return Err(std::io::Error::from_raw_os_error(libc::ELOOP));
+            }
+            #[cfg(target_os = "macos")]
+            {
+                use std::os::macos::fs::MetadataExt;
+                if metadata.is_dir() && metadata.st_flags() & 0x4000_0000 != 0 {
+                    return Err(std::io::Error::from_raw_os_error(libc::EDEADLK));
                 }
             }
-        } else {
-            let size = match find_node(trees, &root) {
-                Some(node) => node.alloc,
-                None => du_blocks(&root, cancelled),
-            };
-            send(fixed_finding(&root, target.kind, &target.remedy, size));
+            if target.per_subdir {
+                let mut selection_memory = budget.reserve(0).map_err(|_| resource_error())?;
+                let mut selected = 0usize;
+                if let Some(node) = find_node(trees, &root) {
+                    let complete = trees
+                        .iter()
+                        .find(|tree| root.starts_with(&tree.root))
+                        .is_some_and(|tree| tree.complete);
+                    for child in node.children() {
+                        if cancelled() {
+                            return Ok(());
+                        }
+                        let bytes = root
+                            .as_os_str()
+                            .len()
+                            .checked_add(child.raw_name().len())
+                            .and_then(|bytes| bytes.checked_add(1))
+                            .ok_or_else(resource_error)?;
+                        charge_selection(&mut selection_memory, &mut selected, entry_limit, bytes)?;
+                        let child_path = child_path(&root, child.raw_name())?;
+                        send(fixed_finding(
+                            &child_path,
+                            target.kind,
+                            &target.remedy,
+                            complete.then_some(child.alloc),
+                        ));
+                    }
+                    if !complete {
+                        return Err(std::io::Error::other(
+                            "retained directory coverage is incomplete",
+                        ));
+                    }
+                } else {
+                    let mut read = std::fs::read_dir(&root)?;
+                    loop {
+                        if cancelled() {
+                            return Ok(());
+                        }
+                        let name_bytes = std::mem::size_of::<libc::dirent>();
+                        let bytes = root
+                            .as_os_str()
+                            .len()
+                            .checked_add(name_bytes)
+                            .and_then(|bytes| bytes.checked_add(1))
+                            .ok_or_else(resource_error)?;
+                        charge_selection(&mut selection_memory, &mut selected, entry_limit, bytes)?;
+                        let Some(entry) = read.next() else { break };
+                        let entry = entry?;
+                        if !entry.file_type()?.is_dir() {
+                            continue;
+                        }
+                        let name = entry.file_name();
+                        if name.len() > name_bytes {
+                            return Err(resource_error());
+                        }
+                        let child_path = child_path(&root, name.as_bytes())?;
+                        let size = du_blocks_shared(&child_path, cancelled);
+                        send(fixed_finding(
+                            &child_path,
+                            target.kind,
+                            &target.remedy,
+                            size.complete.then_some(size.bytes),
+                        ));
+                    }
+                }
+            } else {
+                let size = match find_node(trees, &root) {
+                    Some(node) => trees
+                        .iter()
+                        .find(|tree| root.starts_with(&tree.root))
+                        .is_some_and(|tree| tree.complete)
+                        .then_some(node.alloc),
+                    None => {
+                        let size = du_blocks_shared(&root, cancelled);
+                        size.complete.then_some(size.bytes)
+                    }
+                };
+                send(fixed_finding(&root, target.kind, &target.remedy, size));
+            }
+            Ok(())
+        };
+        if let Err(error) = inspect() {
+            send(fixed_finding(&root, target.kind, &target.remedy, None).coverage(format!(
+                "Fixed-path inspection is incomplete: {error}; no exact allocation or complete child coverage is reported."
+            )));
         }
     }
 }
 
-fn fixed_finding(path: &Path, kind: FindingKind, fixed_remedy: &FixedRemedy, size: u64) -> Finding {
+#[cfg(test)]
+mod fixed_path_tests {
+    use super::*;
+    use crate::scan::walk::listing::MaterializationGuard;
+    use std::cell::RefCell;
+
+    fn collect(
+        paths: &crate::config::Paths,
+        policy: std::io::Result<MaterializationGuard>,
+        entry_limit: usize,
+    ) -> Vec<Finding> {
+        let findings = RefCell::new(Vec::new());
+        size_fixed_paths_guarded(
+            paths,
+            &|finding| findings.borrow_mut().push(finding),
+            &|| false,
+            &[],
+            policy,
+            entry_limit,
+        );
+        findings.into_inner()
+    }
+
+    #[test]
+    fn guard_failure_is_partial_even_when_no_targets_exist() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = crate::config::Paths::from_home(home.path());
+        let findings = collect(
+            &paths,
+            Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+            2048,
+        );
+        assert_eq!(findings.len(), FIXED_TARGETS.len());
+        for finding in findings {
+            assert_eq!(finding.size_bytes, None);
+            assert_eq!(finding.meta["complete"], false);
+            assert!(finding
+                .coverage
+                .unwrap()
+                .contains("no-materialization policy failed"));
+            assert!(finding
+                .remedies
+                .iter()
+                .all(|remedy| remedy.reclaims_bytes.is_none()));
+        }
+    }
+
+    #[test]
+    fn fallback_streams_children_and_refuses_symlinks() {
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let caches = home.path().join("Library/Caches");
+        std::fs::create_dir_all(caches.join("actual")).unwrap();
+        std::fs::write(caches.join("file"), b"not a directory").unwrap();
+        std::os::unix::fs::symlink(outside.path(), caches.join("link")).unwrap();
+        let findings = collect(
+            &crate::config::Paths::from_home(home.path()),
+            MaterializationGuard::enter(),
+            2048,
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].path.as_deref(),
+            Some(caches.join("actual").as_path())
+        );
+        assert!(findings[0].size_bytes.is_some());
+    }
+
+    #[test]
+    fn selection_limit_reports_the_unmeasured_hub() {
+        let home = tempfile::tempdir().unwrap();
+        let caches = home.path().join("Library/Caches");
+        for name in ["a", "b", "c"] {
+            std::fs::create_dir_all(caches.join(name)).unwrap();
+        }
+        let findings = collect(
+            &crate::config::Paths::from_home(home.path()),
+            MaterializationGuard::enter(),
+            2,
+        );
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|finding| finding.size_bytes.is_some())
+                .count(),
+            2
+        );
+        let hub = findings
+            .iter()
+            .find(|finding| finding.path.as_deref() == Some(caches.as_path()))
+            .unwrap();
+        assert_eq!(hub.size_bytes, None);
+        assert_eq!(hub.meta["complete"], false);
+        assert!(hub.coverage.as_deref().unwrap().contains("child coverage"));
+    }
+
+    #[test]
+    fn shared_selection_budget_is_held_then_released() {
+        let home = tempfile::tempdir().unwrap();
+        let caches = home.path().join("Library/Caches");
+        for name in ["a", "b", "c"] {
+            std::fs::create_dir_all(caches.join(name)).unwrap();
+        }
+        let budget = MemoryBudget::new(256 * 1024);
+        let paths = crate::config::Paths::with_memory_budget(home.path(), budget.clone());
+        let root_bytes = paths.home.as_os_str().len() + "~/Library/Caches".len() + 1;
+        let root_charge = root_bytes * 4 + 64 * 1024;
+        let selection_charge =
+            (caches.as_os_str().len() + std::mem::size_of::<libc::dirent>() + 1) * 4;
+        let _pressure = budget
+            .reserve(budget.limit() - budget.used() - root_charge - selection_charge - 1)
+            .unwrap();
+        let baseline = budget.used();
+        let findings = RefCell::new(Vec::new());
+        size_fixed_paths_guarded(
+            &paths,
+            &|finding| {
+                if finding.size_bytes.is_some() {
+                    assert!(budget.used() > baseline + 64 * 1024);
+                }
+                findings.borrow_mut().push(finding);
+            },
+            &|| false,
+            &[],
+            MaterializationGuard::enter(),
+            2048,
+        );
+        let findings = findings.into_inner();
+        let hub = findings
+            .iter()
+            .find(|finding| finding.path.as_deref() == Some(caches.as_path()))
+            .unwrap();
+        assert_eq!(hub.size_bytes, None);
+        assert_eq!(hub.meta["complete"], false);
+        assert_eq!(budget.used(), baseline);
+        assert!(budget.peak() <= budget.limit());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fixed_path_callbacks_run_with_materialization_disabled_and_restore_policy() {
+        extern "C" {
+            fn getiopolicy_np(policy_type: libc::c_int, scope: libc::c_int) -> libc::c_int;
+        }
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("Library/Caches/actual")).unwrap();
+        let paths = crate::config::Paths::from_home(home.path());
+        let previous = unsafe { getiopolicy_np(3, 1) };
+        let callbacks = std::cell::Cell::new(0);
+        size_fixed_paths(
+            &paths,
+            &|_| {
+                assert_eq!(unsafe { getiopolicy_np(3, 1) }, 1);
+                callbacks.set(callbacks.get() + 1);
+            },
+            &|| false,
+            &[],
+        );
+        assert_eq!(callbacks.get(), 1);
+        assert_eq!(unsafe { getiopolicy_np(3, 1) }, previous);
+    }
+
+    #[test]
+    fn root_reservation_failure_never_reports_exact_zero() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = crate::config::Paths::with_memory_budget(home.path(), MemoryBudget::new(0));
+        let findings = collect(&paths, MaterializationGuard::enter(), 2048);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].size_bytes, None);
+        assert_eq!(findings[0].meta["complete"], false);
+        assert!(findings[0]
+            .coverage
+            .as_deref()
+            .unwrap()
+            .contains("shared memory limit"));
+    }
+
+    #[test]
+    fn directory_open_failure_is_partial_not_empty() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("Library")).unwrap();
+        std::fs::write(home.path().join("Library/Caches"), b"not a directory").unwrap();
+        let findings = collect(
+            &crate::config::Paths::from_home(home.path()),
+            MaterializationGuard::enter(),
+            2048,
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].size_bytes, None);
+        assert_eq!(findings[0].meta["complete"], false);
+    }
+}
+fn fixed_finding(
+    path: &Path,
+    kind: FindingKind,
+    fixed_remedy: &FixedRemedy,
+    size: Option<u64>,
+) -> Finding {
     let key = path.to_string_lossy();
     let name = path
         .file_name()
@@ -1306,7 +1885,7 @@ fn fixed_finding(path: &Path, kind: FindingKind, fixed_remedy: &FixedRemedy, siz
                 command: RemedyCommand::Trash {
                     path: path.to_path_buf(),
                 },
-                reclaims_bytes: Some(size),
+                reclaims_bytes: size,
                 destructive: true,
                 alternative: false,
                 guard: None,
@@ -1350,12 +1929,17 @@ fn fixed_finding(path: &Path, kind: FindingKind, fixed_remedy: &FixedRemedy, siz
         FindingKind::IosBackup => "iOS Backups",
         _ => "Caches",
     };
-    Finding::new(kind, &key, name)
+    let mut finding = Finding::new(kind, &key, name)
         .path(path.to_path_buf())
-        .size(size)
         .severity(severity)
-        .meta(json!({ "group": group }))
-        .remedy(remedy)
+        .meta(json!({ "group": group, "context": "audit_host", "complete": size.is_some() }))
+        .remedy(remedy);
+    if let Some(size) = size {
+        finding = finding.size(size);
+    } else {
+        finding = finding.coverage("Allocation is unavailable or incomplete; no exact size or reclaim estimate is reported.");
+    }
+    finding
 }
 
 #[cfg(test)]
@@ -1418,6 +2002,32 @@ mod tests {
             }
         }
         out
+    }
+
+    #[tokio::test]
+    async fn standalone_scan_defaults_to_home() {
+        let home = tempfile::tempdir().unwrap();
+        let repository = home.path().join("repository");
+        fs::create_dir_all(repository.join(".git")).unwrap();
+        let (mut ctx, _events, discoveries) = ctx_for(home.path(), true, true, vec![]);
+        Arc::make_mut(&mut ctx.config).scan.roots.clear();
+        FsScanner.scan(ctx).await.unwrap();
+        let discovery = discoveries.unwrap().try_recv().unwrap();
+        assert_eq!(discovery.root, repository);
+    }
+
+    #[tokio::test]
+    async fn standalone_scan_rejects_multiple_roots() {
+        let home = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let (mut ctx, mut events, _) = ctx_for(home.path(), false, false, vec![]);
+        Arc::make_mut(&mut ctx.config)
+            .scan
+            .roots
+            .push(second.path().to_string_lossy().into_owned());
+        let error = FsScanner.scan(ctx).await.unwrap_err();
+        assert!(error.to_string().contains("exactly one root"));
+        assert!(events.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1702,7 +2312,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovery_only_pipes_git_but_emits_nothing() {
+    async fn discovery_only_pipes_git_and_emits_only_host_coverage() {
         let home = tempfile::tempdir().unwrap();
         let repo = home.path().join("r");
         fs::create_dir_all(repo.join(".git")).unwrap();
@@ -1713,7 +2323,15 @@ mod tests {
         let (ctx, rx, repo_rx) = ctx_for(home.path(), true, true, vec![]);
         FsScanner.scan(ctx).await.unwrap();
 
-        assert!(drain(rx).is_empty(), "discovery-only emits no findings");
+        let findings = drain(rx);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].meta["context"], "audit_host");
+        assert_eq!(findings[0].meta["host_discovery"], true);
+        assert!(findings[0].meta["complete"].is_boolean());
+        assert!(findings[0].meta["walk_coverage"].is_object());
+        assert!(findings[0].path.is_none());
+        assert!(findings[0].size_bytes.is_none());
+        assert!(findings[0].remedies.is_empty());
         let mut repo_rx = repo_rx.unwrap();
         assert!(repo_rx.try_recv().is_ok(), "still feeds the git pipe");
     }
@@ -1868,6 +2486,47 @@ mod tests {
         assert!(!f.remedies[0].destructive);
     }
 
+    #[test]
+    fn incomplete_package_never_claims_an_exact_allocation() {
+        let finding = large_package_finding(
+            Path::new("/fixture/Photos.photoslibrary"),
+            "Photos library",
+            None,
+        );
+        assert_eq!(finding.size_bytes, None);
+        assert_eq!(finding.meta["complete"], false);
+        assert!(finding.coverage.unwrap().contains("incomplete"));
+        assert!(finding.remedies.iter().all(|remedy| !remedy.destructive));
+    }
+
+    #[tokio::test]
+    async fn package_allocation_uses_final_hardlink_ownership() {
+        let home = tempfile::tempdir().unwrap();
+        let library = home.path().join("Pictures/Photos.photoslibrary");
+        big_file(&library.join("shared.bin"));
+        big_file(&library.join("unique.bin"));
+        fs::hard_link(library.join("shared.bin"), home.path().join("aaa.bin")).unwrap();
+        let (ctx, mut receiver) = ctx_tiny_threshold(home.path());
+        FsScanner.scan(ctx).await.unwrap();
+        let mut finding = None;
+        let mut inventory = None;
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                ScanEvent::Finding {
+                    finding: observed, ..
+                } if observed.path.as_deref() == Some(library.as_path()) => {
+                    assert!(finding.is_none());
+                    finding = Some(observed);
+                }
+                ScanEvent::DirTree { tree, .. } if tree.complete => inventory = Some(tree),
+                _ => {}
+            }
+        }
+        let tree = inventory.unwrap();
+        let measured = tree.node.find(home.path(), &library).unwrap();
+        assert_eq!(finding.unwrap().size_bytes, Some(measured.alloc));
+    }
+
     #[tokio::test]
     async fn code_packages_are_skipped_silently() {
         let home = tempfile::tempdir().unwrap();
@@ -1912,13 +2571,12 @@ mod tests {
         assert_eq!(f.kind, FindingKind::LargeFile);
         // A big file may be wanted, so it's flagged for attention, not auto-reclaimable.
         assert_eq!(f.severity, Severity::Attention);
-        // Primary remedy: a reversible Trash that reclaims the file's size.
         assert!(matches!(
             &f.remedies[0].command,
             RemedyCommand::Trash { path } if path == Path::new("/Users/x/Movies/huge.mkv")
         ));
         assert!(f.remedies[0].destructive);
-        assert_eq!(f.remedies[0].reclaims_bytes, Some(5_000_000_000));
+        assert_eq!(f.remedies[0].reclaims_bytes, None);
         // Secondary: inspect before deleting.
         assert!(matches!(
             f.remedies[1].command,
@@ -1940,7 +2598,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn categories_are_exact_and_complete() {
+    async fn categories_report_complete_allocation_with_shared_extent_caveat() {
         let home = tempfile::tempdir().unwrap();
         let docs = home.path().join("Documents");
         fs::create_dir_all(docs.join("a/b")).unwrap();
@@ -1969,7 +2627,12 @@ mod tests {
             .coverage
             .as_deref()
             .unwrap()
-            .starts_with("Measured exactly"));
+            .starts_with("Measured allocation"));
+        assert!(f
+            .coverage
+            .as_deref()
+            .unwrap()
+            .contains("APFS shared extents"));
     }
 
     #[tokio::test]
@@ -2084,11 +2747,9 @@ mod tests {
         while let Ok(ev) = rx.try_recv() {
             events.push(ev);
         }
-        assert_eq!(
-            events.len(),
-            0,
-            "discovery-only must emit no events at all (no findings, no Progress, no DirTree)"
-        );
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], ScanEvent::Finding { finding, .. }
+            if finding.meta["host_discovery"] == true));
     }
 
     #[tokio::test]
@@ -2342,7 +3003,9 @@ mod tests {
         let (ctx, rx, repo_rx) = whole_disk_ctx(root.path(), &home, true);
         FsScanner.scan(ctx).await.unwrap();
 
-        assert!(drain(rx).is_empty());
+        let findings = drain(rx);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].meta["host_discovery"], true);
         let mut repos = Vec::new();
         let mut repo_rx = repo_rx.unwrap();
         while let Ok(d) = repo_rx.try_recv() {
@@ -2419,6 +3082,286 @@ mod tests {
             b.size_bytes,
             Some(crate::scan::sizing::du_blocks(&caches.join("b"), &|| false))
         );
+    }
+
+    fn saturated_event_channel() -> (mpsc::Sender<ScanEvent>, mpsc::Receiver<ScanEvent>) {
+        let (tx, rx) = mpsc::channel(1);
+        tx.try_send(ScanEvent::Progress {
+            scanner: ScannerId::Fs,
+            gen: 1,
+            msg: "fixture saturation".into(),
+            done: 0,
+            total: None,
+        })
+        .unwrap();
+        (tx, rx)
+    }
+
+    #[tokio::test]
+    async fn saturated_progress_delivery_observes_cancellation_with_receiver_alive() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let home = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = saturated_event_channel();
+        let stop = CancellationToken::new();
+        let mut progress = Box::pin(report_progress(
+            tx,
+            1,
+            Arc::new(WalkStats::default()),
+            stop.clone(),
+            home.path().to_path_buf(),
+        ));
+        std::future::poll_fn(|context| {
+            assert!(progress.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::sleep(PROGRESS_INTERVAL + Duration::from_millis(5)).await;
+        std::future::poll_fn(|context| {
+            assert!(progress.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(1), progress)
+            .await
+            .expect("cancellation interrupts the pending progress send");
+        assert!(matches!(rx.try_recv(), Ok(ScanEvent::Progress { msg, .. })
+            if msg == "fixture saturation"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn saturated_finding_delivery_cancels_and_closes_repository_pipe() {
+        let home = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = saturated_event_channel();
+        let token = CancellationToken::new();
+        let (repo_tx, mut repo_rx) = repo_channel();
+        let visitor = FsVisitor {
+            tx,
+            runtime: tokio::runtime::Handle::current(),
+            gen: 1,
+            token: token.clone(),
+            config: Arc::new(Config::default()),
+            repo_tx: Some(repo_tx),
+            home: home.path().to_path_buf(),
+            library: home.path().join("Library"),
+            stale_after_days: 30,
+            discovery_only: false,
+            hits: Mutex::new(HashMap::new()),
+            packages: Mutex::new(HashMap::new()),
+            memory: Mutex::new(MemoryBudget::new(4096).reserve(0).unwrap()),
+            resource_limited: std::sync::atomic::AtomicBool::new(false),
+        };
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut worker = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            visitor.emit(Finding::new(
+                FindingKind::ToolCoverage,
+                "fixture",
+                "Fixture",
+            ));
+        });
+        started_rx.await.unwrap();
+        token.cancel();
+        let completed = tokio::time::timeout(Duration::from_secs(1), &mut worker).await;
+        if completed.is_err() {
+            drop(rx);
+            worker.await.unwrap();
+            panic!("finding delivery ignored cancellation with a live receiver");
+        }
+        completed.unwrap().unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(1), repo_rx.recv())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(matches!(rx.try_recv(), Ok(ScanEvent::Progress { .. })));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn saturated_scan_cancellation_finishes_and_closes_repository_pipe() {
+        let home = tempfile::tempdir().unwrap();
+        let repository = home.path().join("repository");
+        fs::create_dir_all(repository.join(".git")).unwrap();
+        fs::create_dir_all(repository.join("target")).unwrap();
+        fs::write(repository.join("Cargo.toml"), "[package]\nname='fixture'\n").unwrap();
+        let (mut ctx, original_rx, repo_rx) = ctx_for(home.path(), true, false, vec![]);
+        drop(original_rx);
+        let (tx, mut rx) = saturated_event_channel();
+        ctx.tx = tx;
+        let token = ctx.token.clone();
+        let mut repo_rx = repo_rx.unwrap();
+        let mut scanner = tokio::spawn(async move { FsScanner.scan(ctx).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut scanner)
+                .await
+                .is_err()
+        );
+        token.cancel();
+        let completed = tokio::time::timeout(Duration::from_secs(2), &mut scanner).await;
+        if completed.is_err() {
+            drop(rx);
+            scanner.await.unwrap().unwrap();
+            panic!("scan cancellation hung on a saturated, live event receiver");
+        }
+        completed.unwrap().unwrap().unwrap();
+        if let Some(discovered) = tokio::time::timeout(Duration::from_secs(1), repo_rx.recv())
+            .await
+            .unwrap()
+        {
+            assert_eq!(discovered.root, repository);
+        }
+        assert!(tokio::time::timeout(Duration::from_secs(1), repo_rx.recv())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(matches!(rx.try_recv(), Ok(ScanEvent::Progress { .. })));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn aborted_scan_retains_detection_memory_until_derivation_worker_exits() {
+        let home = tempfile::tempdir().unwrap();
+        let target = home.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(
+            home.path().join("Cargo.toml"),
+            "[package]\nname='fixture'\n",
+        )
+        .unwrap();
+        big_file(&home.path().join("loose.bin"));
+        let budget = MemoryBudget::new(4 * 1024 * 1024);
+        let paths = Arc::new(Paths::with_memory_budget(home.path(), budget.clone()));
+        let baseline = budget.used();
+        let detection_bytes = 4096 + target.as_os_str().len() * 8;
+        let (mut ctx, original_rx, _) = ctx_for(home.path(), false, false, vec![]);
+        drop(original_rx);
+        let (tx, mut rx) = mpsc::channel(1);
+        let observer = tx.clone();
+        ctx.tx = tx;
+        ctx.paths = paths.clone();
+        let token = ctx.token.clone();
+        let mut scanner = tokio::spawn(async move { FsScanner.scan(ctx).await });
+
+        let indexed = tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(event) = rx.recv().await {
+                if matches!(event, ScanEvent::Progress { msg, .. } if msg.starts_with("Indexed ")) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        let blocked = tokio::time::timeout(Duration::from_secs(2), async {
+            while observer.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if !matches!(indexed, Ok(true)) || blocked.is_err() {
+            token.cancel();
+            drop(rx);
+            let _ = tokio::time::timeout(Duration::from_secs(2), &mut scanner).await;
+            scanner.abort();
+            panic!("derivation did not reach the saturated event delivery");
+        }
+
+        scanner.abort();
+        let aborted = scanner.await.unwrap_err();
+        let retained_after_abort = budget.used();
+        token.cancel();
+        let released = tokio::time::timeout(Duration::from_secs(2), async {
+            while budget.used() != baseline {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(aborted.is_cancelled());
+        assert!(
+            retained_after_abort >= baseline + detection_bytes,
+            "worker-owned detections lost their charge after abort: {retained_after_abort}"
+        );
+        released.expect("worker exit releases detection memory without dropping the receiver");
+        assert!(matches!(rx.try_recv(), Ok(ScanEvent::DirTree { .. })));
+    }
+
+    #[tokio::test]
+    async fn cancelled_discovery_reports_partial_coverage_and_closes_repository_pipe() {
+        let home = tempfile::tempdir().unwrap();
+        let (ctx, rx, repo_rx) = ctx_for(home.path(), true, true, vec![]);
+        ctx.token.cancel();
+        FsScanner.scan(ctx).await.unwrap();
+        let findings = drain(rx);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].meta["host_discovery"], true);
+        assert_eq!(findings[0].meta["complete"], false);
+        assert_eq!(findings[0].meta["walk_coverage"]["cancelled"], true);
+        assert!(repo_rx.unwrap().recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn unreadable_discovery_root_reports_partial_coverage() {
+        let home = tempfile::tempdir().unwrap();
+        let (mut ctx, rx, repo_rx) = ctx_for(home.path(), true, true, vec![]);
+        let mut config = (*ctx.config).clone();
+        config.scan.roots = vec![home.path().join("missing").to_string_lossy().into_owned()];
+        ctx.config = Arc::new(config);
+        FsScanner.scan(ctx).await.unwrap();
+        let findings = drain(rx);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].meta["host_discovery"], true);
+        assert_eq!(findings[0].meta["complete"], false);
+        assert!(
+            findings[0].meta["walk_coverage"]["unreadable"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(repo_rx.unwrap().recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn protected_hardlink_alias_keeps_safe_loose_candidate_without_assured_reclaim() {
+        let home = tempfile::tempdir().unwrap();
+        let loose = home.path().join("z-visible.bin");
+        let protected = home.path().join(".Trash/a-protected.bin");
+        big_file(&loose);
+        fs::create_dir_all(protected.parent().unwrap()).unwrap();
+        fs::hard_link(&loose, &protected).unwrap();
+
+        let (ctx, rx) = ctx_tiny_threshold(home.path());
+        FsScanner.scan(ctx).await.unwrap();
+        let findings = drain(rx);
+        let candidate = findings
+            .iter()
+            .find(|finding| {
+                finding.kind == FindingKind::LargeFile
+                    && finding.meta["group"] == "Large files"
+                    && finding.path.as_deref() == Some(loose.as_path())
+            })
+            .expect("the safe loose alias remains a threshold candidate");
+        assert!(candidate.size_bytes.unwrap() > 16 * 1024);
+        let trash = candidate
+            .remedies
+            .iter()
+            .find(
+                |remedy| matches!(&remedy.command, RemedyCommand::Trash { path } if path == &loose),
+            )
+            .expect("only the loose alias is offered for Trash");
+        assert_eq!(trash.reclaims_bytes, None);
+        let coverage = candidate.coverage.as_deref().unwrap();
+        assert!(
+            coverage.contains("hardlinks")
+                && coverage.contains("APFS")
+                && coverage.contains("Trash")
+        );
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.kind == FindingKind::LargeFile
+                && finding.path.as_deref() == Some(protected.as_path())));
     }
 
     #[tokio::test]

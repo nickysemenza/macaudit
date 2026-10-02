@@ -1,11 +1,13 @@
 import Charts
 import SwiftUI
 
-struct Slice: Identifiable, Hashable {
+struct Slice: Identifiable, Hashable, Sendable {
     let name: String
     let value: Double
     var count: Int = 0
-    var id: String { name }
+    var id: String {
+        name
+    }
 }
 
 /// Sector donut with a centred total and hover/click selection. `format`
@@ -16,7 +18,9 @@ struct DonutChart: View {
     var format: (Double) -> String = { String(Int($0)) }
     @Binding var selected: String?
 
-    private var total: Double { slices.reduce(0) { $0 + $1.value } }
+    private var total: Double {
+        slices.reduce(0) { $0 + $1.value }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -39,7 +43,8 @@ struct DonutChart: View {
                         guard let angle else { selected = nil; return }
                         var acc = 0.0
                         selected = slices.first { s in acc += s.value; return angle <= acc }?.name
-                    }))
+                    }
+                ))
                 .chartBackground { _ in
                     VStack(spacing: 0) {
                         let s = slices.first { $0.name == selected }

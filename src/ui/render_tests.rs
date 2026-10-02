@@ -105,6 +105,22 @@ fn app_with_fixtures() -> AppState {
     app
 }
 
+fn app_with_cleanup_fixtures() -> (AppState, tempfile::TempDir) {
+    let targets = tempfile::tempdir().unwrap();
+    let installed = targets.path().join("wget");
+    std::fs::create_dir(&installed).unwrap();
+    let mut app = app_with_fixtures();
+    let finding = app
+        .findings
+        .get_mut(&ScannerId::Brew)
+        .unwrap()
+        .values_mut()
+        .find(|finding| finding.title == "wget")
+        .unwrap();
+    finding.path = Some(installed);
+    (app, targets)
+}
+
 #[test]
 fn golden_overview() {
     let mut app = app_with_fixtures();
@@ -198,7 +214,7 @@ fn golden_app_storage_table_with_detail() {
 #[test]
 fn draw_smoke_test_cleanup_modes_and_explorer() {
     use crate::cleanup::{ExecEvent, PreflightReport};
-    let mut app = app_with_fixtures();
+    let (mut app, _targets) = app_with_cleanup_fixtures();
     // Brew explorer: expand the first explicitly installed formula both ways.
     app.handle(Action::Char('3'));
     app.handle(Action::Down);
@@ -227,7 +243,7 @@ fn draw_smoke_test_cleanup_modes_and_explorer() {
     assert_eq!(app.mode, Mode::Cleanup);
     let req = app.pending_execute.take().unwrap();
     app.apply_exec(ExecEvent::PreflightDone(Box::new(PreflightReport {
-        ok: req.actions,
+        ok: req.confirmed.ok,
         ..Default::default()
     })));
     app.apply_exec(ExecEvent::ActionStarted(0));
@@ -282,7 +298,7 @@ fn golden_tools_tree_with_detail() {
 
 #[test]
 fn golden_confirm_with_impact() {
-    let mut app = app_with_fixtures();
+    let (mut app, _targets) = app_with_cleanup_fixtures();
     app.handle(Action::Char('3'));
     // Mark wget (explicitly installed); openssl@3 is still needed and
     // carries no uninstall remedy, so marking it plans nothing.

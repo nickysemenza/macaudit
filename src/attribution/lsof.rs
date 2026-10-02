@@ -1,21 +1,15 @@
-//! One shared `lsof` snapshot for every consumer that needs "what files does
-//! a running process have open": the Projects axis's live-process join
-//! (`projects::resolvers::procs`) and the App Storage axis's tier-4 observed-
-//! open evidence (`apps::linkers`). A single `lsof -F pcfn` pass, cached for
-//! 60s (resolvers run once per project/candidate within the same resolve
-//! pass, so without caching every one would pay for its own `lsof` call),
-//! replaces the two separate `lsof` pipelines — and their two separate `-F`
-//! parsers — both axes used to run.
+//! Bounded, budget-owned `lsof` snapshots with no reuse across invocations.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+
+use crate::inventory::{MemoryBudget, Reservation};
 
 use super::model::ResolveEnv;
 
-/// How long a cached snapshot stays valid.
-const CACHE_TTL: Duration = Duration::from_secs(60);
+const MAX_OPEN_FILES: usize = 65_536;
+const MAX_USER_BYTES: usize = 4096;
 
 /// One open file from `lsof -F pcfn`: the pid and command that opened it,
 /// its file descriptor (`"cwd"`, a number, `"txt"`, ...), and the path
@@ -28,71 +22,123 @@ pub struct OpenFile {
     pub path: PathBuf,
 }
 
-static LSOF_CACHE: Mutex<Option<(Instant, Arc<Vec<OpenFile>>)>> = Mutex::new(None);
+#[derive(Debug)]
+struct SnapshotData {
+    files: Vec<OpenFile>,
+    _memory: Reservation,
+}
 
-/// The current (cached) snapshot of every open file `lsof -a -u $USER -d
+#[derive(Clone, Debug, Default)]
+pub struct OpenFiles {
+    data: Option<Arc<SnapshotData>>,
+}
+
+impl std::ops::Deref for OpenFiles {
+    type Target = [OpenFile];
+    fn deref(&self) -> &[OpenFile] {
+        self.data.as_ref().map_or(&[], |data| &data.files)
+    }
+}
+
+/// A fresh snapshot of every open file `lsof -a -u $USER -d
 /// ^txt,^mem -F pcfn` reports — every file descriptor except the executable
 /// text image and memory-mapped files, which are noisy and never a cwd or a
 /// real "this app has X open" signal. Best-effort: `env.run_blocking`
 /// failing (no Tokio runtime, `lsof` missing, timeout) degrades to an empty
 /// snapshot, same as every other best-effort external command in this crate.
-pub fn snapshot(env: &ResolveEnv<'_>) -> Arc<Vec<OpenFile>> {
-    {
-        let cache = LSOF_CACHE.lock().unwrap();
-        if let Some((at, files)) = cache.as_ref() {
-            if at.elapsed() < CACHE_TTL {
-                return files.clone();
-            }
-        }
-    }
+pub fn snapshot(env: &ResolveEnv<'_>) -> OpenFiles {
+    let budget = env.paths.size_cache.memory_budget();
+    let Ok(_user_memory) = budget.reserve(MAX_USER_BYTES) else {
+        return OpenFiles::default();
+    };
     let user = std::env::var("USER").unwrap_or_default();
-    let files = env
-        .run_blocking(
-            "lsof",
-            &["-a", "-u", &user, "-d", "^txt,^mem", "-F", "pcfn"],
-        )
-        .map(|out| parse(&String::from_utf8_lossy(&out)))
-        .unwrap_or_default();
-    let files = Arc::new(files);
-    *LSOF_CACHE.lock().unwrap() = Some((Instant::now(), files.clone()));
-    files
+    if user.len() > MAX_USER_BYTES {
+        return OpenFiles::default();
+    }
+    let Some(output) = env.run_blocking(
+        "lsof",
+        &["-a", "-u", &user, "-d", "^txt,^mem", "-F", "pcfn"],
+    ) else {
+        return OpenFiles::default();
+    };
+    let Ok(_decode_memory) = budget.reserve(output.len().saturating_mul(3)) else {
+        return OpenFiles::default();
+    };
+    parse_with_budget(&String::from_utf8_lossy(&output), &budget)
 }
 
 /// Parse `lsof -F pcfn` output: a `p<pid>` line starts a process block,
 /// `c<command>` names it, then each `f<fd>`/`n<path>` pair (`f` always
 /// precedes its `n`) is one open file belonging to that process.
-pub fn parse(output: &str) -> Vec<OpenFile> {
-    let mut out = Vec::new();
+fn records(output: &str, mut visit: impl FnMut(u32, &str, &str, &str)) {
     let mut pid: Option<u32> = None;
-    let mut command: Option<String> = None;
-    let mut fd: Option<String> = None;
+    let mut command: Option<&str> = None;
+    let mut fd: Option<&str> = None;
     for line in output.lines() {
-        if line.is_empty() {
+        let Some(rest) = line.get(1..) else {
             continue;
-        }
-        let (tag, rest) = line.split_at(1);
-        match tag {
-            "p" => {
+        };
+        match line.as_bytes()[0] {
+            b'p' => {
                 pid = rest.parse().ok();
                 command = None;
                 fd = None;
             }
-            "c" => command = Some(rest.to_string()),
-            "f" => fd = Some(rest.to_string()),
-            "n" => {
-                if let (Some(p), Some(c), Some(f)) = (pid, command.clone(), fd.clone()) {
-                    out.push(OpenFile {
-                        pid: p,
-                        command: c,
-                        fd: f,
-                        path: PathBuf::from(rest),
-                    });
+            b'c' => command = Some(rest),
+            b'f' => fd = Some(rest),
+            b'n' => {
+                if let (Some(pid), Some(command), Some(fd)) = (pid, command, fd) {
+                    visit(pid, command, fd, rest);
                 }
             }
             _ => {}
         }
     }
-    out
+}
+
+fn parse_with_budget(output: &str, budget: &Arc<MemoryBudget>) -> OpenFiles {
+    let mut count = 0usize;
+    let mut bytes = Some(std::mem::size_of::<SnapshotData>() + 64);
+    records(output, |_, command, fd, path| {
+        count = count.saturating_add(1);
+        bytes = bytes
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<OpenFile>()))
+            .and_then(|bytes| bytes.checked_add(command.len()))
+            .and_then(|bytes| bytes.checked_add(fd.len()))
+            .and_then(|bytes| bytes.checked_add(path.len()));
+    });
+    if count == 0 || count > MAX_OPEN_FILES {
+        return OpenFiles::default();
+    }
+    let Some(bytes) = bytes else {
+        return OpenFiles::default();
+    };
+    let Ok(memory) = budget.reserve(bytes) else {
+        return OpenFiles::default();
+    };
+    let mut files = Vec::new();
+    if files.try_reserve_exact(count).is_err() {
+        return OpenFiles::default();
+    }
+    records(output, |pid, command, fd, path| {
+        files.push(OpenFile {
+            pid,
+            command: command.to_owned(),
+            fd: fd.to_owned(),
+            path: PathBuf::from(path),
+        });
+    });
+    OpenFiles {
+        data: Some(Arc::new(SnapshotData {
+            files,
+            _memory: memory,
+        })),
+    }
+}
+
+#[cfg(test)]
+fn parse(output: &str) -> OpenFiles {
+    parse_with_budget(output, &MemoryBudget::shared())
 }
 
 /// The cwd (`fd == "cwd"`) of every process in `files`, by pid.
@@ -126,7 +172,7 @@ mod tests {
     fn parses_cwd_and_regular_fds_for_every_process() {
         let files = parse(FIXTURE);
         assert_eq!(
-            files,
+            &*files,
             vec![
                 OpenFile {
                     pid: 1234,
@@ -153,6 +199,7 @@ mod tests {
                     path: "/tmp/x".into(),
                 },
             ]
+            .as_slice()
         );
     }
 
@@ -175,11 +222,61 @@ mod tests {
 
     #[test]
     fn ignores_an_n_line_with_no_preceding_pid_command_or_fd() {
-        assert_eq!(parse("n/Users/dev/cubby\n"), Vec::new());
+        assert!(parse("n/Users/dev/cubby\n").is_empty());
     }
 
     #[test]
     fn empty_output_yields_no_files() {
-        assert_eq!(parse(""), Vec::new());
+        assert!(parse("").is_empty());
+    }
+
+    #[test]
+    fn snapshot_clones_retain_the_reservation_without_copying() {
+        let budget = MemoryBudget::new(1 << 20);
+        let files = parse_with_budget(FIXTURE, &budget);
+        let charged = budget.used();
+        assert!(charged > 0);
+        let clone = files.clone();
+        assert_eq!(budget.used(), charged);
+        assert!(Arc::ptr_eq(
+            files.data.as_ref().unwrap(),
+            clone.data.as_ref().unwrap()
+        ));
+        drop(files);
+        assert_eq!(clone.len(), 4);
+        assert_eq!(budget.used(), charged);
+        drop(clone);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn denied_budget_or_record_limit_produces_no_allocation() {
+        let budget = MemoryBudget::new(1);
+        assert!(parse_with_budget(FIXTURE, &budget).data.is_none());
+        assert_eq!(budget.peak(), 0);
+        let budget = MemoryBudget::new(1 << 20);
+        let output = format!("p1\ncnode\nfcwd\n{}", "n/tmp\n".repeat(MAX_OPEN_FILES + 1));
+        assert!(parse_with_budget(&output, &budget).data.is_none());
+        assert_eq!(budget.peak(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_invocation_fetches_a_fresh_snapshot() {
+        let mut fixture = crate::attribution::testutil::EnvFixture::new();
+        let user = std::env::var("USER").unwrap_or_default();
+        fixture.runner = crate::runner::MockCommandRunner::new().on(
+            "lsof",
+            &["-a", "-u", &user, "-d", "^txt,^mem", "-F", "pcfn"],
+            FIXTURE,
+        );
+        let env = fixture.env();
+        let first = snapshot(&env);
+        let second = snapshot(&env);
+        assert_eq!(&*first, &*second);
+        assert!(!Arc::ptr_eq(
+            first.data.as_ref().unwrap(),
+            second.data.as_ref().unwrap()
+        ));
+        assert_eq!(fixture.runner.calls().len(), 2);
     }
 }

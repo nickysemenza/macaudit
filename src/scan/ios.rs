@@ -106,6 +106,7 @@ impl Scanner for IosScanner {
                 .await;
                 return Ok(());
             }
+            CmdOutcome::Unavailable(_) => return Ok(()),
         };
 
         if udids.is_empty() {
@@ -256,6 +257,7 @@ fn outcome_text(o: &CmdOutcome) -> String {
         CmdOutcome::NotInstalled(e) => e.clone(),
         CmdOutcome::Failed(out) => out.stderr_str().trim().to_string(),
         CmdOutcome::TimedOut => "timed out waiting for the device".to_string(),
+        CmdOutcome::Unavailable(error) => error.to_string(),
     }
 }
 
@@ -429,21 +431,48 @@ fn parse_apps(xml: &[u8]) -> Vec<AppUsage> {
 mod tests {
     use super::*;
     use crate::model::ScanEvent;
-    use crate::runner::MockCommandRunner;
+    use crate::runner::{CmdOutput, CommandRunner, MockCommandRunner};
 
     const UDID: &str = "00008150-001915442138401C";
     const DISK_USAGE: &str = include_str!("../../tests/fixtures/ios/disk_usage.plist");
     const DEVICE_INFO: &str = include_str!("../../tests/fixtures/ios/ideviceinfo.plist");
     const APPS: &str = include_str!("../../tests/fixtures/ios/apps.plist");
 
-    fn ctx_with(mock: MockCommandRunner, tx: tokio::sync::mpsc::Sender<ScanEvent>) -> ScanCtx {
+    struct MissingBinaryRunner {
+        mock: MockCommandRunner,
+        program: &'static str,
+    }
+
+    #[async_trait]
+    impl CommandRunner for MissingBinaryRunner {
+        async fn run(
+            &self,
+            program: &str,
+            args: &[&str],
+            token: &tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<CmdOutput> {
+            if program == self.program {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("{program} fixture executable not found"),
+                )
+                .into());
+            }
+            self.mock.run(program, args, token).await
+        }
+    }
+
+    fn ctx_with(
+        runner: impl CommandRunner + 'static,
+        tx: tokio::sync::mpsc::Sender<ScanEvent>,
+    ) -> ScanCtx {
         ScanCtx {
             tx,
             token: tokio_util::sync::CancellationToken::new(),
             gen: 1,
             config: std::sync::Arc::new(crate::config::Config::default()),
             paths: std::sync::Arc::new(crate::config::Paths::from_home("/tmp/fh")),
-            runner: std::sync::Arc::new(mock),
+            runner: std::sync::Arc::new(runner),
             current: ScannerId::Ios,
             repo_tx: None,
             repo_rx: None,
@@ -463,9 +492,9 @@ mod tests {
             )
     }
 
-    async fn run(mock: MockCommandRunner) -> Vec<Finding> {
+    async fn run(runner: impl CommandRunner + 'static) -> Vec<Finding> {
         let (tx, mut rx) = tokio::sync::mpsc::channel(256);
-        IosScanner.scan(ctx_with(mock, tx)).await.unwrap();
+        IosScanner.scan(ctx_with(runner, tx)).await.unwrap();
         let mut findings = Vec::new();
         while let Ok(ev) = rx.try_recv() {
             if let ScanEvent::Finding { finding, .. } = ev {
@@ -473,6 +502,17 @@ mod tests {
             }
         }
         findings
+    }
+
+    fn assert_command_coverage(finding: &Finding, program: &str, error_kind: &str) {
+        assert_eq!(finding.kind, FindingKind::IosDevice);
+        assert_eq!(finding.title, format!("{program} data unavailable"));
+        assert_eq!(finding.severity, Severity::Attention);
+        assert_eq!(finding.meta["group"], "Coverage");
+        assert_eq!(finding.meta["context"], "audit_host");
+        assert_eq!(finding.meta["complete"], false);
+        assert_eq!(finding.meta["error_kind"], error_kind);
+        assert!(finding.remedies.is_empty());
     }
 
     fn copied_text(f: &Finding) -> Vec<&str> {
@@ -487,15 +527,27 @@ mod tests {
 
     #[tokio::test]
     async fn missing_libimobiledevice_is_one_info_row_with_install_hint() {
-        // The mock errors on any unregistered call, i.e. the spawn fails.
-        let findings = run(MockCommandRunner::new()).await;
-        assert_eq!(findings.len(), 1);
-        let f = &findings[0];
+        let findings = run(MissingBinaryRunner {
+            mock: MockCommandRunner::new(),
+            program: "idevice_id",
+        })
+        .await;
+        assert_eq!(findings.len(), 2);
+        assert_command_coverage(&findings[0], "idevice_id", "not_installed");
+        let f = &findings[1];
         assert_eq!(f.kind, FindingKind::IosDevice);
         assert_eq!(f.severity, Severity::Info);
         assert_eq!(f.title, "libimobiledevice not installed");
         assert_eq!(copied_text(f), vec![INSTALL_ALL]);
         assert!(f.remedies.iter().all(|r| !r.destructive));
+    }
+
+    #[tokio::test]
+    async fn unmatched_probe_is_unavailable_not_a_missing_binary() {
+        let findings = run(MockCommandRunner::new()).await;
+        assert_eq!(findings.len(), 1);
+        assert_command_coverage(&findings[0], "idevice_id", "unavailable");
+        assert!(findings[0].detail.contains("no response registered"));
     }
 
     #[tokio::test]
@@ -517,21 +569,26 @@ mod tests {
                 "ERROR: Could not connect to lockdownd: Please accept the trust dialog on the screen of device",
             );
         let findings = run(mock).await;
-        assert_eq!(findings.len(), 1);
+        assert_eq!(findings.len(), 2);
+        assert_command_coverage(&findings[0], "ideviceinfo", "unavailable");
+        assert!(findings[0].detail.contains("status 255"));
         assert!(
-            findings[0].title.contains("not trusted"),
+            findings[1].title.contains("not trusted"),
             "{}",
-            findings[0].title
+            findings[1].title
         );
-        assert!(findings[0].detail.contains("trust dialog"));
-        assert_eq!(findings[0].meta["udid"], UDID);
+        assert!(findings[1].detail.contains("trust dialog"));
+        assert_eq!(findings[1].meta["udid"], UDID);
     }
 
     #[tokio::test]
     async fn missing_ideviceinstaller_keeps_the_device_row() {
-        let findings = run(device_ok()).await;
-        // Device row (no apps yet) + the apps-unavailable status row.
-        assert_eq!(findings.len(), 2);
+        let findings = run(MissingBinaryRunner {
+            mock: device_ok(),
+            program: "ideviceinstaller",
+        })
+        .await;
+        assert_eq!(findings.len(), 3);
         let device = &findings[0];
         assert_eq!(device.kind, FindingKind::IosDevice);
         assert_eq!(device.meta["apps_bytes"], 0);
@@ -539,8 +596,10 @@ mod tests {
             device.meta["purgeable_bytes"],
             166_055_415_808u64 - 19_632_939_008
         );
-        let status = &findings[1];
+        assert_command_coverage(&findings[1], "ideviceinstaller", "not_installed");
+        let status = &findings[2];
         assert!(status.title.contains("ideviceinstaller not installed"));
+        assert_eq!(status.severity, Severity::Info);
         assert_eq!(copied_text(status), vec![INSTALL_LISTER]);
     }
 
@@ -606,9 +665,13 @@ mod tests {
         let args = list_args(UDID);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let findings = run(device_ok().on_fail("ideviceinstaller", &args, 1, "boom")).await;
-        assert_eq!(findings.len(), 2);
-        assert!(findings[1].title.contains("Could not list apps"));
-        assert_eq!(findings[1].detail, "boom");
-        assert!(findings[1].remedies.is_empty());
+        assert_eq!(findings.len(), 3);
+        assert_eq!(findings[0].kind, FindingKind::IosDevice);
+        assert_eq!(findings[0].meta["udid"], UDID);
+        assert_command_coverage(&findings[1], "ideviceinstaller", "unavailable");
+        assert!(findings[1].detail.contains("status 1"));
+        assert!(findings[2].title.contains("Could not list apps"));
+        assert_eq!(findings[2].detail, "boom");
+        assert!(findings[2].remedies.is_empty());
     }
 }

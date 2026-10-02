@@ -4,10 +4,8 @@
 //! `scan --json` contract, id stability across runs, and `clean --dry-run`
 //! (text and JSON).
 //!
-//! The process `PATH` is pinned so command resolution is deterministic; the
-//! login-shell probe runs `dscl`, which is not mocked here — on a machine
-//! without it the scan degrades to the process PATH, which the assertions
-//! tolerate. Nothing in this test touches the real machine's tools.
+//! Process PATH and HOME are pinned. Shell and npm executables write a
+//! sentinel if invoked, so automatic startup/prefix probes are observable.
 
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -45,8 +43,26 @@ fn build_home() -> (tempfile::TempDir, PathBuf) {
     )
     .unwrap();
     symlink("../lib/node_modules/gone/cli.js", prefix.join("bin/gone")).unwrap();
-    exe(&prefix.join("bin/npm"), "#!/bin/sh\n");
+    exe(
+        &prefix.join("bin/npm"),
+        &format!(
+            "#!/bin/sh\nprintf executed > '{}'\n",
+            home.join("npm-probe-executed").display()
+        ),
+    );
     exe(&prefix.join("bin/node"), "#!/bin/sh\n");
+    std::fs::write(
+        home.join(".zshrc"),
+        format!(
+            "printf executed > '{}'\n",
+            home.join("rc-executed").display()
+        ),
+    )
+    .unwrap();
+    exe(
+        &prefix.join("bin/fish"),
+        "#!/bin/sh\n. \"$MACAUDIT_HOME/.zshrc\"\n",
+    );
 
     // pnpm: current v11 layout + legacy global/5 with a legacy-only package.
     let pnpm = home.join("Library/pnpm");
@@ -237,11 +253,18 @@ fn run(home: &Path, prefix: &Path, args: &[&str]) -> std::process::Output {
         home.join(".cargo/bin").display()
     );
     Command::new(env!("CARGO_BIN_EXE_macaudit"))
+        .arg("--root")
+        .arg(home)
+        .arg("--config")
+        .arg(home.join(".config/macaudit/config.toml"))
         .args(args)
         .env("MACAUDIT_HOME", home)
         .env("PATH", path)
-        .env("SHELL", "/bin/sh") // unsupported login shell ⇒ process PATH only
+        .env("SHELL", prefix.join("bin/fish"))
+        .env("HOME", home)
         .env("HOMEBREW_NO_AUTO_UPDATE", "1")
+        .env("RUST_LOG", "macaudit=debug")
+        .env("NO_COLOR", "1")
         .output()
         .expect("run macaudit")
 }
@@ -267,12 +290,28 @@ fn tools_scan_dry_run_end_to_end() {
     let (tmp, prefix) = build_home();
     let home = tmp.path();
 
-    let first = json_out(&run(
+    let first_output = run(
         home,
         &prefix,
         &["scan", "--section", "tools", "--json", "--offline"],
-    ));
-    let arr = first.as_array().unwrap();
+    );
+    let first = json_out(&first_output);
+    assert!(!home.join("rc-executed").exists());
+    assert!(!home.join("npm-probe-executed").exists());
+    let trace = String::from_utf8_lossy(&first_output.stderr);
+    for metric in ["remaining_workers=", "run_id="] {
+        assert!(trace.contains(metric), "missing {metric}: {trace}");
+    }
+    let arr = first["audit_host"]["findings"].as_array().unwrap();
+    assert_eq!(
+        first["request"]["selected_root"],
+        home.canonicalize().unwrap().to_string_lossy().as_ref()
+    );
+    assert_eq!(first["disk"]["metadata"]["context"]["type"], "disk");
+    assert_eq!(
+        first["audit_host"]["metadata"]["context"]["type"],
+        "audit_host"
+    );
     let tools: Vec<&Value> = arr.iter().filter(|f| f["kind"] == "global_tool").collect();
     assert!(tools.len() >= 8, "{}", tools.len());
 
@@ -395,16 +434,28 @@ fn tools_scan_dry_run_end_to_end() {
         &["scan", "--section", "tools", "--json", "--offline"],
     ));
     let ids = |v: &Value| -> Vec<String> {
-        let mut v: Vec<String> = v
+        let mut v: Vec<String> = v["audit_host"]["findings"]
             .as_array()
             .unwrap()
             .iter()
+            .filter(|finding| finding["kind"] == "global_tool")
             .map(|f| f["id"].to_string())
             .collect();
         v.sort();
         v
     };
     assert_eq!(ids(&first), ids(&second));
+
+    let tool_json = json_out(&run(home, &prefix, &["tools", "--json", "--offline"]));
+    let mut tool_ids: Vec<String> = tool_json
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["kind"] == "global_tool")
+        .map(|finding| finding["id"].to_string())
+        .collect();
+    tool_ids.sort();
+    assert_eq!(ids(&first), tool_ids);
 
     // Dry run: only evidence-backed rows by default; --select for the rest.
     let dry = run(

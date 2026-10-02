@@ -12,9 +12,9 @@ use crate::attribution::model::{
 };
 use crate::attribution::paths as attribution_paths;
 use crate::attribution::projects::{Project, ProjectIndex, ARTIFACT_DIR_NAMES};
+use crate::inventory::DirectoryRef;
 use crate::model::{FindingId, FindingKind, ScannerId};
 use crate::scan::walk::listing::{self, Kind};
-use crate::scan::walk::DirNode;
 
 use super::parsers;
 use super::rules::{
@@ -512,7 +512,8 @@ fn find_in_subtree(
         return Vec::new();
     };
     let mut out = Vec::new();
-    let mut stack: Vec<(PathBuf, &DirNode, usize)> = vec![(root.to_path_buf(), root_node, 0)];
+    let mut stack: Vec<(PathBuf, DirectoryRef<'_>, usize)> =
+        vec![(root.to_path_buf(), root_node, 0)];
     while let Some((path, node, d)) = stack.pop() {
         if let Ok(dir_listing) = listing::list(&path) {
             for entry in &dir_listing.entries {
@@ -530,8 +531,9 @@ fn find_in_subtree(
         if d >= depth {
             continue;
         }
-        for child in node.children.iter() {
-            let cname = &*child.name;
+        for child in node.children() {
+            let child_name = child.name();
+            let cname = child_name.as_ref();
             if cname.starts_with('.') || ARTIFACT_DIR_NAMES.contains(&cname) {
                 continue;
             }
@@ -1027,6 +1029,52 @@ fn baseline_claim(row: &Baseline, path: PathBuf) -> Claim {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attribution::testutil::{tree_fixture, EnvFixture};
+    use crate::scan::walk::DirNode;
+
+    #[test]
+    fn find_in_subtree_uses_inventory_children_depth_and_artifact_pruning() {
+        let root = tempfile::tempdir().unwrap();
+        for relative in ["", "subproject", "subproject/deeper", "target"] {
+            let directory = root.path().join(relative);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("Cargo.toml"), b"[package]\nname = 'test'\n").unwrap();
+        }
+        let root_node = DirNode {
+            name: root.path().to_string_lossy().into(),
+            children: vec![
+                DirNode {
+                    name: "subproject".into(),
+                    children: vec![DirNode {
+                        name: "deeper".into(),
+                        ..DirNode::default()
+                    }]
+                    .into_boxed_slice(),
+                    ..DirNode::default()
+                },
+                DirNode {
+                    name: "target".into(),
+                    ..DirNode::default()
+                },
+            ]
+            .into_boxed_slice(),
+            ..DirNode::default()
+        };
+        let mut fixture = EnvFixture::new();
+        fixture.trees.push(tree_fixture(root.path(), &root_node));
+        let env = fixture.env();
+        assert_eq!(
+            find_in_subtree(root.path(), &["Cargo.toml"], 1, &env),
+            vec![
+                root.path().join("Cargo.toml"),
+                root.path().join("subproject/Cargo.toml")
+            ]
+        );
+        assert_eq!(
+            find_in_subtree(root.path(), &["Cargo.toml"], 0, &env),
+            vec![root.path().join("Cargo.toml")]
+        );
+    }
 
     #[test]
     fn glob_match_handles_stars_anywhere() {

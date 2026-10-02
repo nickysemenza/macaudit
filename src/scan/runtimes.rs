@@ -11,11 +11,19 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use crate::model::{Finding, FindingKind, Remedy, RemedyCommand, ScannerId, Severity};
-use crate::scan::sizing::du_blocks;
+use crate::scan::sizing::{du_blocks_shared, SharedSize};
 use crate::scan::{ScanCtx, Scanner};
 
 #[derive(Default)]
 pub struct RuntimesScanner;
+
+async fn measure_version(ctx: &ScanCtx, path: &Path) -> SharedSize {
+    let root = path.to_path_buf();
+    let token = ctx.token.clone();
+    tokio::task::spawn_blocking(move || du_blocks_shared(&root, &|| token.is_cancelled()))
+        .await
+        .unwrap_or_default()
+}
 
 #[async_trait]
 impl Scanner for RuntimesScanner {
@@ -184,35 +192,49 @@ async fn scan_versions_dir(
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
-        let size = du_blocks(&path, &|| ctx.token.is_cancelled());
+        let measurement = measure_version(ctx, &path).await;
+        let size = measurement.bytes;
         let key = path.to_string_lossy().to_string();
 
         // Severity stays Info: we can't tell which version is active for these
         // managers, so we don't *suggest* deletion — but we still offer a
         // reversible Trash so the user can act on a version they know is unused.
-        let finding = Finding::new(
+        let mut finding = Finding::new(
             FindingKind::RuntimeVersion,
             &key,
             format!("{manager} {runtime} {version}"),
         )
-        .detail(format!("{version} — {size} bytes on disk"))
+        .detail(if measurement.complete {
+            format!("{version} — {size} bytes on disk")
+        } else {
+            format!("{version} — incomplete directory measurement")
+        })
         .path(path.clone())
-        .size(size)
         .severity(Severity::Info)
         .meta(json!({
             "manager": manager,
             "runtime": runtime,
             "version": version,
-            "size_bytes": size,
+            "size_bytes": measurement.complete.then_some(size),
+            "complete": measurement.complete,
         }))
         .remedy(Remedy {
             label: "Move to Trash".to_string(),
             command: RemedyCommand::Trash { path: path.clone() },
-            reclaims_bytes: Some(size),
+            reclaims_bytes: measurement
+                .complete
+                .then_some(size.saturating_sub(measurement.externally_linked)),
             destructive: true,
             alternative: false,
             guard: None,
         });
+        if measurement.complete {
+            finding = finding.size(size);
+        } else {
+            finding = finding.coverage(
+                "Incomplete directory measurement; allocation and reclaimability are unavailable.",
+            );
+        }
         ctx.emit(finding).await;
     }
 }
@@ -300,7 +322,8 @@ async fn scan_rustup(ctx: &ScanCtx, runtime_managers: &mut HashMap<String, HashS
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
-        let size = du_blocks(&path, &|| ctx.token.is_cancelled());
+        let measurement = measure_version(ctx, &path).await;
+        let size = measurement.bytes;
         let is_default = default_map.get(&name).copied();
         // Flag as stale only when we positively know it's not the default and
         // there's more than one toolchain installed (a lone toolchain is fine
@@ -318,8 +341,10 @@ async fn scan_rustup(ctx: &ScanCtx, runtime_managers: &mut HashMap<String, HashS
         let key = path.to_string_lossy().to_string();
         let detail = if stale {
             format!("{name} — not the active default toolchain; consider `rustup toolchain uninstall {name}` if unused")
-        } else {
+        } else if measurement.complete {
             format!("{name} — {size} bytes on disk")
+        } else {
+            format!("{name} — incomplete directory measurement")
         };
 
         let mut finding = Finding::new(
@@ -329,13 +354,13 @@ async fn scan_rustup(ctx: &ScanCtx, runtime_managers: &mut HashMap<String, HashS
         )
         .detail(detail)
         .path(path.clone())
-        .size(size)
         .severity(severity)
         .meta(json!({
             "manager": "rustup",
             "runtime": "rust",
             "version": name,
-            "size_bytes": size,
+            "size_bytes": measurement.complete.then_some(size),
+            "complete": measurement.complete,
             "is_default": is_default,
         }));
         if stale {
@@ -349,11 +374,20 @@ async fn scan_rustup(ctx: &ScanCtx, runtime_managers: &mut HashMap<String, HashS
                         name.clone(),
                     ],
                 },
-                reclaims_bytes: Some(size),
+                reclaims_bytes: measurement
+                    .complete
+                    .then_some(size.saturating_sub(measurement.externally_linked)),
                 destructive: true,
                 alternative: false,
                 guard: None,
             });
+        }
+        if measurement.complete {
+            finding = finding.size(size);
+        } else {
+            finding = finding.coverage(
+                "Incomplete directory measurement; allocation and reclaimability are unavailable.",
+            );
         }
         ctx.emit(finding).await;
     }

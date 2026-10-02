@@ -22,6 +22,7 @@ use crate::attribution::model::{
     self, Axis, Claim, EntryKind, EvidenceTier, Footprint, FootprintSet, Owner, OwnerKind, Proc,
     ProcKind,
 };
+use crate::inventory::{DiskInventory, MemoryBudget};
 use crate::model::{
     Finding, FindingKind, Guard, Remedy, RemedyCommand, ScanEvent, ScannerId, Severity,
 };
@@ -980,6 +981,10 @@ fn fs_fixtures() -> Vec<Finding> {
 /// The synthetic home tree behind the Disk fixtures, so `--fake` runs have
 /// something to browse. Sizes agree with the fixtures where they overlap.
 pub fn dir_tree() -> DirTree {
+    dir_tree_at(Path::new("/Users/dev"))
+}
+
+pub fn dir_tree_at(root: &Path) -> DirTree {
     fn dir(name: &str, own: &[(&str, u64)], children: Vec<DirNode>) -> DirNode {
         let mut node = DirNode {
             name: name.into(),
@@ -1003,7 +1008,7 @@ pub fn dir_tree() -> DirTree {
         node
     }
     let node = dir(
-        "/Users/dev",
+        &root.to_string_lossy(),
         &[(".zsh_history", 180 * KIB)],
         vec![
             dir(
@@ -1139,19 +1144,23 @@ pub fn dir_tree() -> DirTree {
     ]
     .into_iter()
     .map(|(p, alloc)| BigFile {
-        path: PathBuf::from(p),
+        path: root.join(Path::new(p).strip_prefix("/Users/dev").unwrap()),
         alloc,
     })
     .collect();
     DirTree {
-        root: PathBuf::from("/Users/dev"),
+        root: root.to_path_buf(),
         files: node.files,
+        entries: Some(node.files.saturating_add(node.dirs)),
+        externally_linked: Some(0),
         dirs: node.dirs,
         bytes: node.alloc,
         errors: node.errors,
-        node,
+        node: DiskInventory::from_node(&node, MemoryBudget::shared()).unwrap(),
         top_files,
         complete: true,
+        coverage: Default::default(),
+        memory: None,
         scanned_at: SystemTime::now(),
         elapsed: Duration::from_millis(6_400),
     }
@@ -2917,12 +2926,19 @@ impl Scanner for FakeScanner {
             }
         }
         if self.id == ScannerId::Fs && !ctx.cancelled() {
+            let root = ctx
+                .config
+                .scan
+                .roots
+                .first()
+                .map(|root| ctx.paths.expand(root))
+                .unwrap_or_else(|| ctx.paths.home.clone());
             let _ = ctx
                 .tx
                 .send(ScanEvent::DirTree {
                     scanner: ScannerId::Fs,
                     gen: ctx.gen,
-                    tree: std::sync::Arc::new(dir_tree()),
+                    tree: std::sync::Arc::new(dir_tree_at(&root)),
                 })
                 .await;
         }
@@ -2952,6 +2968,26 @@ impl Scanner for FakeScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synthetic_inventory_is_scoped_to_the_selected_root() {
+        let root = Path::new("/fixture/cf-repos");
+        let original = dir_tree();
+        let scoped = dir_tree_at(root);
+        assert_eq!(scoped.root, root);
+        assert_eq!(scoped.bytes, original.bytes);
+        let summary = scoped.summary_at(root, 1).unwrap();
+        assert_eq!(summary.path, root);
+        assert!(summary
+            .children
+            .iter()
+            .all(|child| child.path.starts_with(root)));
+        assert!(scoped
+            .top_files
+            .iter()
+            .all(|file| file.path.starts_with(root)));
+        assert!(scoped.summary_at(Path::new("/Users/dev"), 1).is_none());
+    }
 
     #[test]
     fn every_section_has_enough_realistic_findings() {

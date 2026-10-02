@@ -1,5 +1,6 @@
 ---
 source: src/ui/render_tests.rs
+assertion_line: 120
 expression: "render(&mut app, 150, 44)"
 ---
 " 1  Health        8      │┌ Apps · 8 ─────────────────────────────────────────────────────────────────────┐│ Detail                                   "
@@ -45,4 +46,4 @@ expression: "render(&mut app, 150, 44)"
 "                         ││                                                                               ││                                          "
 "                         ││                                                                               ││                                          "
 "                         │└───────────────────────────────────────────────────────────────────────────────┘│                                          "
-"                         │ ␣:mark  ⏎:open  z:fold  x:exec  r:rescan  /:filter  s:sort:Name↑  p:detail  H:sys-apps  ?:help  q:quit   Selected: 0 · 0 B "
+"                         │ ␣:mark  ⏎:open  z:fold  x:exec  r:rescan  o:root  S:stop  ?:help  q:quit  /:filter  s:sort:Name↑         Selected: 0 · 0 B "

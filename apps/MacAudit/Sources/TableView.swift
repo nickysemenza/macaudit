@@ -7,12 +7,14 @@ struct TableView: View {
     @Environment(AuditStore.self) private var store
     let findings: [Finding]
     @State private var sortOrder: [KeyPathComparator<Finding>] = [
-        KeyPathComparator(\Finding.sortBytes, order: .reverse)
+        KeyPathComparator(\Finding.sortBytes, order: .reverse),
     ]
+    @State private var presented: [Finding] = []
+    @State private var presentedSource: [Finding] = []
 
     var body: some View {
         @Bindable var store = store
-        Table(findings.sorted(using: sortOrder), selection: $store.selectedFinding, sortOrder: $sortOrder) {
+        Table(presentedSource == findings ? presented : [], selection: $store.selectedFinding, sortOrder: $sortOrder) {
             TableColumn("") { f in MarkToggle(store: store, id: f.id) }
                 .width(24)
             TableColumn("Name", value: \.title) { f in
@@ -37,19 +39,54 @@ struct TableView: View {
             TableColumn("Path", value: \.sortPath) { f in
                 Text(f.path ?? "").foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
             }
+            TableColumn("Scope") { finding in
+                Text(finding.auditScopeLabel).font(.caption).foregroundStyle(.secondary)
+            }.width(min: 120, ideal: 150)
         }
         .contextMenu(forSelectionType: UInt64.self) { ids in
             if let id = ids.first, let finding = store.finding(id) {
                 RowContextMenu(store: store, finding: finding)
             }
         }
+        .onKeyPress(.space) {
+            guard let selected = store.selectedFinding else { return .ignored }
+            store.toggleMark(selected)
+            return .handled
+        }
+        .task(id: FindingSortRequest(findings: findings, order: sortOrder)) {
+            let source = findings
+            let order = sortOrder
+            let sorted = await Task.detached { source.sorted(using: order) }.value
+            guard !Task.isCancelled else { return }
+            presented = sorted
+            presentedSource = source
+        }
     }
 }
 
+private struct FindingSortRequest: Equatable {
+    var findings: [Finding]
+    var order: [KeyPathComparator<Finding>]
+}
+
 extension Finding {
-    var sortBytes: UInt64 { sizeBytes ?? 0 }
-    var sortUsed: Date { lastUsed ?? .distantPast }
-    var sortPath: String { path ?? "" }
+    var auditScopeLabel: String {
+        section == .fs && metaJson.range(of: #""context"\s*:\s*"audit_host""#, options: .regularExpression) == nil
+            ? "Selected Explore root" : "Global Audit"
+    }
+
+    var sortBytes: UInt64 {
+        sizeBytes ?? 0
+    }
+
+    var sortUsed: Date {
+        lastUsed ?? .distantPast
+    }
+
+    var sortPath: String {
+        path ?? ""
+    }
+
     var sortSeverity: Int {
         switch severity {
         case .info: 0
@@ -81,6 +118,7 @@ struct RowContextMenu: View {
             }
         }
         Divider()
-        Button("Rescan \(store.meta(for: finding.section)?.title ?? "Section")") { store.rescan(finding.section) }
+        Button("Refresh All") { store.rescanAll() }
+            .disabled(!store.canRefresh)
     }
 }

@@ -6,6 +6,7 @@
 //! no fixed shape to mirror. Paths cross as strings (UniFFI has no path type).
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use macaudit::attribution::model as attrib;
@@ -329,6 +330,20 @@ pub struct Finding {
 
 impl From<&model::Finding> for Finding {
     fn from(f: &model::Finding) -> Self {
+        let timing = crate::diagnostics::serialization("finding_metadata_json");
+        let _timing = timing.enter();
+        let meta_json = if f.meta.is_null() {
+            "{}".to_string()
+        } else {
+            f.meta.to_string()
+        };
+        timing.record("bytes", meta_json.len());
+        let unsupported_path = f.path.as_ref().is_some_and(|path| path.to_str().is_none())
+            || f.remedies.iter().any(|remedy| match &remedy.command {
+                model::RemedyCommand::Trash { path }
+                | model::RemedyCommand::RevealInFinder { path } => path.to_str().is_none(),
+                _ => false,
+            });
         Finding {
             id: f.id.0,
             kind: f.kind.into(),
@@ -336,18 +351,22 @@ impl From<&model::Finding> for Finding {
             group: model::group_key(f),
             title: f.title.clone(),
             detail: f.detail.clone(),
-            path: f.path.as_deref().map(path_string),
+            path: f.path.as_deref().and_then(Path::to_str).map(str::to_owned),
             size_bytes: f.size_bytes,
             last_used: f.last_used,
             severity: f.severity.into(),
-            remedies: f.remedies.iter().map(Remedy::from).collect(),
-            provenance: f.provenance.clone(),
-            coverage: f.coverage.clone(),
-            meta_json: if f.meta.is_null() {
-                "{}".to_string()
+            remedies: if unsupported_path {
+                Vec::new()
             } else {
-                f.meta.to_string()
+                f.remedies.iter().map(Remedy::from).collect()
             },
+            provenance: f.provenance.clone(),
+            coverage: if unsupported_path {
+                Some("unsupported_paths".into())
+            } else {
+                f.coverage.clone()
+            },
+            meta_json,
         }
     }
 }
@@ -412,6 +431,158 @@ pub enum ScanEvent {
         gen: u64,
         findings: Vec<Finding>,
     },
+}
+
+impl ScanEvent {
+    pub fn generation(&self) -> u64 {
+        match self {
+            Self::SectionStarted { gen, .. }
+            | Self::Progress { gen, .. }
+            | Self::Findings { gen, .. }
+            | Self::SectionFinished { gen, .. }
+            | Self::SectionFailed { gen, .. }
+            | Self::Correlated { gen, .. }
+            | Self::Enriched { gen, .. } => *gen,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct SessionMetadata {
+    pub run_id: u64,
+    pub selected_root: String,
+    pub revision: u64,
+    pub started_at_ms: u64,
+    pub queried_at_ms: u64,
+    pub disk_complete: bool,
+    pub disk_errors: u64,
+    pub disk_elapsed_ms: u64,
+    pub audit_complete: bool,
+    pub cancelled: bool,
+    pub disk_coverage: String,
+    pub audit_coverage: String,
+    pub walk_coverage: WalkCoverage,
+    pub disk_stop_reasons: Vec<String>,
+    pub audit_stop_reasons: Vec<String>,
+    pub active_scanners: u64,
+    pub retiring_count: u64,
+    pub retiring_runs: Vec<RetiringRun>,
+    pub query_memory: Option<Arc<crate::QueryMemory>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct RetiringRun {
+    pub run_id: u64,
+    pub active_scanners: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct LiveFilesPage {
+    pub request_id: u64,
+    pub subject_path: String,
+    pub metadata: SessionMetadata,
+    pub observed_at_ms: u64,
+    pub coverage: String,
+    pub files: Vec<TopFile>,
+    pub dataless: u64,
+    pub errors: u64,
+    pub truncated: bool,
+    pub stop_reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct DirectoryPage {
+    pub request_id: u64,
+    pub subject_path: String,
+    pub metadata: SessionMetadata,
+    pub entries: Vec<DirEntry>,
+    pub next_offset: Option<u64>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct DirectorySearchPage {
+    pub request_id: u64,
+    pub query: String,
+    pub metadata: SessionMetadata,
+    pub entries: Vec<DirEntry>,
+    pub files: Vec<TopFile>,
+    pub observed_at_ms: u64,
+    pub coverage: String,
+    pub stop_reasons: Vec<String>,
+    pub truncated: bool,
+    pub cancelled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct FindingsPage {
+    pub metadata: SessionMetadata,
+    pub request_id: u64,
+    pub revision: u64,
+    pub total: u64,
+    pub findings: Vec<Finding>,
+    pub next_offset: Option<u64>,
+    pub next_cursor: Option<FindingsCursor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct FindingsCursor {
+    pub section: SectionId,
+    pub run_id: u64,
+    pub revision: u64,
+    pub request_id: u64,
+    pub offset: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct SectionSummary {
+    pub metadata: SessionMetadata,
+    pub section: SectionId,
+    pub total: u64,
+    pub reported_bytes: u64,
+    pub terminal: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct FootprintEntriesPage {
+    pub metadata: SessionMetadata,
+    pub finding_id: u64,
+    pub request_id: u64,
+    pub revision: u64,
+    pub total: u64,
+    pub entries: Vec<FootprintEntry>,
+    pub next_offset: Option<u64>,
+    pub next_cursor: Option<FootprintCursor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct FootprintCursor {
+    pub finding_id: u64,
+    pub run_id: u64,
+    pub revision: u64,
+    pub request_id: u64,
+    pub offset: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct DirectoryCursor {
+    pub handle: u64,
+    pub run_id: u64,
+    pub revision: u64,
+    pub offset: u64,
+    pub unsupported_paths: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct DirectoryQueryPage {
+    pub metadata: SessionMetadata,
+    pub request_id: u64,
+    pub revision: u64,
+    pub observed_at_ms: u64,
+    pub coverage: String,
+    pub entries: Vec<DirEntry>,
+    pub next_cursor: Option<DirectoryCursor>,
 }
 
 /// What Swift sends back to plan a batch: a finding plus (optionally) which
@@ -612,7 +783,7 @@ fn path_string(p: &Path) -> String {
 }
 
 /// One of a directory's largest own files (absolute path).
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, uniffi::Record)]
 pub struct TopFile {
     pub path: String,
     pub alloc: u64,
@@ -629,10 +800,11 @@ impl From<&BigFile> for TopFile {
 
 /// One directory in the Disk tree, flat (no nested children) — the UI
 /// queries one level at a time via `Engine::dir_children`/`dir_subtree`.
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, uniffi::Record)]
 pub struct DirEntry {
     pub path: String,
     pub name: String,
+    pub node_revision: u64,
     pub alloc: u64,
     pub apparent: u64,
     pub files: u64,
@@ -647,6 +819,7 @@ impl From<&DirNodeSummary> for DirEntry {
         DirEntry {
             path: path_string(&s.path),
             name: s.name.clone(),
+            node_revision: 0,
             alloc: s.alloc,
             apparent: s.apparent,
             files: s.files,
@@ -662,11 +835,47 @@ impl From<&DirNodeSummary> for DirEntry {
 pub struct DirTreeStats {
     pub root: String,
     pub files: u64,
+    pub directory_entries: Option<u64>,
+    pub externally_linked_bytes: Option<u64>,
     pub dirs: u64,
     pub bytes: u64,
     pub errors: u64,
     pub complete: bool,
     pub elapsed_ms: u64,
+    pub coverage: WalkCoverage,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
+pub struct WalkCoverage {
+    pub unreadable: u64,
+    pub excluded: u64,
+    pub dataless: u64,
+    pub aliases: u64,
+    pub mounts: u64,
+    pub cancelled: bool,
+    pub resource_limited: bool,
+    pub summaries_truncated: bool,
+    pub deadline: bool,
+    pub entry_limit: bool,
+    pub unsupported_paths: u64,
+}
+
+impl From<&macaudit::scan::walk::WalkCoverage> for WalkCoverage {
+    fn from(coverage: &macaudit::scan::walk::WalkCoverage) -> Self {
+        Self {
+            unreadable: coverage.unreadable,
+            excluded: coverage.excluded,
+            dataless: coverage.dataless,
+            aliases: coverage.aliases,
+            mounts: coverage.mounts,
+            cancelled: coverage.cancelled,
+            resource_limited: coverage.resource_limited,
+            summaries_truncated: coverage.summaries_truncated,
+            deadline: coverage.deadline,
+            entry_limit: coverage.entry_limit,
+            unsupported_paths: 0,
+        }
+    }
 }
 
 // ---- Attribution axes (Projects / App Storage) ----
@@ -724,7 +933,7 @@ impl From<attrib::OwnerKind> for OwnerKind {
 }
 
 /// What resource an entry represents — the breakdown axis within one owner.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, uniffi::Enum)]
 pub enum EntryKind {
     WorkingTree,
     Artifacts,
@@ -782,7 +991,7 @@ impl From<attrib::EntryKind> for EntryKind {
 }
 
 /// How confident a claim linking a path to an owner is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, uniffi::Enum)]
 pub enum EvidenceTier {
     Exact,
     NameMatch,
@@ -836,7 +1045,7 @@ impl From<&attrib::Owner> for Owner {
             key: o.key.clone(),
             kind: o.kind.into(),
             name: o.name.clone(),
-            path: o.path.as_deref().map(path_string),
+            path: o.path.as_deref().and_then(Path::to_str).map(str::to_owned),
         }
     }
 }
@@ -862,7 +1071,7 @@ impl From<&attrib::Proc> for Proc {
 }
 
 /// One accounted path under an owner (or under Baseline/Unattributed).
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, uniffi::Record)]
 pub struct FootprintEntry {
     pub path: String,
     pub kind: EntryKind,
@@ -891,7 +1100,7 @@ impl From<&attrib::FootprintEntry> for FootprintEntry {
             kind: e.kind.into(),
             bytes: e.bytes,
             raw_bytes: e.raw_bytes,
-            owners: e.owners.clone(),
+            owners: e.owners.iter().take(500).cloned().collect(),
             tier: e.tier.into(),
             evidence: e.evidence.clone(),
             label: e.label.clone(),
@@ -919,7 +1128,12 @@ impl From<&attrib::FootprintGroup> for FootprintGroup {
         FootprintGroup {
             kind: g.kind.into(),
             bytes: g.bytes,
-            entries: g.entries.iter().map(FootprintEntry::from).collect(),
+            entries: g
+                .entries
+                .iter()
+                .take(500)
+                .map(FootprintEntry::from)
+                .collect(),
         }
     }
 }
@@ -940,10 +1154,32 @@ pub struct Footprint {
     pub processes: Vec<Proc>,
     pub ports: Vec<u16>,
     pub clone_note: bool,
+    pub query_memory: Option<Arc<crate::QueryMemory>>,
 }
 
 impl From<&attrib::Footprint> for Footprint {
     fn from(f: &attrib::Footprint) -> Self {
+        let mut remaining = 500;
+        let groups = f
+            .groups
+            .iter()
+            .take(500)
+            .map(|group| {
+                let entries = group
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.path.to_str().is_some())
+                    .take(remaining)
+                    .map(FootprintEntry::from)
+                    .collect::<Vec<_>>();
+                remaining -= entries.len();
+                FootprintGroup {
+                    kind: group.kind.into(),
+                    bytes: group.bytes,
+                    entries,
+                }
+            })
+            .collect();
         Footprint {
             finding: f.finding.0,
             owner: Owner::from(&f.owner),
@@ -951,11 +1187,24 @@ impl From<&attrib::Footprint> for Footprint {
             shared: f.shared,
             reach: f.reach,
             baseline_share: f.baseline_share,
-            groups: f.groups.iter().map(FootprintGroup::from).collect(),
-            worktrees: f.worktrees.iter().map(|p| path_string(p)).collect(),
-            processes: f.processes.iter().map(Proc::from).collect(),
-            ports: f.ports.clone(),
+            groups,
+            worktrees: f
+                .worktrees
+                .iter()
+                .filter(|path| path.to_str().is_some())
+                .take(500)
+                .map(|p| path_string(p))
+                .collect(),
+            processes: f
+                .processes
+                .iter()
+                .filter(|process| process.cwd.to_str().is_some())
+                .take(500)
+                .map(Proc::from)
+                .collect(),
+            ports: f.ports.iter().take(500).copied().collect(),
             clone_note: f.clone_note,
+            query_memory: None,
         }
     }
 }
@@ -971,14 +1220,27 @@ pub struct FootprintBuckets {
     pub disk_total: u64,
     pub attributed_total: u64,
     pub missing_deps: Vec<SectionId>,
+    pub query_memory: Option<Arc<crate::QueryMemory>>,
 }
 
 impl From<&attrib::FootprintSet> for FootprintBuckets {
     fn from(set: &attrib::FootprintSet) -> Self {
         FootprintBuckets {
             axis: set.axis.into(),
-            baseline: set.baseline.iter().map(FootprintEntry::from).collect(),
-            unattributed: set.unattributed.iter().map(FootprintEntry::from).collect(),
+            baseline: set
+                .baseline
+                .iter()
+                .filter(|entry| entry.path.to_str().is_some())
+                .take(500)
+                .map(FootprintEntry::from)
+                .collect(),
+            unattributed: set
+                .unattributed
+                .iter()
+                .filter(|entry| entry.path.to_str().is_some())
+                .take(500)
+                .map(FootprintEntry::from)
+                .collect(),
             disk_total: set.disk_total,
             attributed_total: set.attributed_total,
             missing_deps: set
@@ -986,6 +1248,7 @@ impl From<&attrib::FootprintSet> for FootprintBuckets {
                 .iter()
                 .map(|d| SectionId::from(*d))
                 .collect(),
+            query_memory: None,
         }
     }
 }
@@ -1126,6 +1389,35 @@ mod tests {
                 other => panic!("variant changed shape: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn unsupported_finding_paths_refuse_reveal_and_cleanup_without_lossy_identity() {
+        use std::os::unix::ffi::OsStrExt;
+        let mut finding = macaudit::fake::fixtures(ScannerId::Fs).remove(0);
+        let path = Path::new("/fixture").join(std::ffi::OsStr::from_bytes(b"entry\xff"));
+        finding.path = Some(path.clone());
+        finding.remedies = vec![model::Remedy::new(
+            "Reveal",
+            model::RemedyCommand::RevealInFinder { path },
+        )];
+        let mapped = Finding::from(&finding);
+        assert!(mapped.path.is_none());
+        assert!(mapped.remedies.is_empty());
+        assert_eq!(mapped.coverage.as_deref(), Some("unsupported_paths"));
+        let valid = Path::new("/fixture/entry\u{fffd}");
+        finding.path = Some(valid.to_path_buf());
+        finding.remedies = vec![model::Remedy::new(
+            "Reveal",
+            model::RemedyCommand::RevealInFinder {
+                path: valid.to_path_buf(),
+            },
+        )];
+        finding.coverage = None;
+        let mapped = Finding::from(&finding);
+        assert_eq!(mapped.path.as_deref(), valid.to_str());
+        assert_eq!(mapped.remedies.len(), 1);
+        assert!(mapped.coverage.is_none());
     }
 
     #[test]

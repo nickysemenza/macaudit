@@ -15,14 +15,15 @@
 //!   stale, ambiguous or now-foreign is refused and reported, never run.
 //!
 //! Execution order is dependents-before-dependencies for Homebrew, then
-//! manager-native uninstalls, then launcher-only removals, with
-//! `brew autoremove` last. Cancellation stops *between* actions — an
-//! in-flight `brew uninstall` is never killed halfway. Afterwards the
+//! manager-native uninstalls, then launcher-only removals. Broad
+//! `brew autoremove` is refused because its targets are dynamic. Cancellation
+//! stops *between* actions — an in-flight `brew uninstall` is never killed
+//! halfway. Afterwards the
 //! inventory is captured again, `brew autoremove --dry-run` is re-run when
 //! Homebrew changed, retained tools related to the batch get bounded
 //! `--version` probes (run before and after, so a failure that already
-//! existed is reported as pre-existing, not as a regression), and a JSON
-//! report is written under `<state_dir>/cleanup-reports/`. Versions are
+//! existed is reported as pre-existing, not as a regression). Reports stay
+//! in memory, and existing report files are never touched. Versions are
 //! recorded for reinstall guidance; no rollback is claimed.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -43,6 +44,15 @@ use crate::runner::CommandRunner;
 use crate::scan::global_tools::{self, launchers, pymeta, shellpath::ShellPath, ProbeCtx};
 
 const BREW_TIMEOUT: Duration = Duration::from_secs(90);
+const AUTOREMOVE_REFUSAL: &str = "brew autoremove has dynamic targets that cannot be bound to the confirmed findings; select individual package removals instead";
+
+fn protected_metadata<T>(operation: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let _materialization =
+        crate::scan::walk::listing::MaterializationGuard::enter().map_err(|error| {
+            format!("cannot protect cleanup metadata from materialization: {error}")
+        })?;
+    operation()
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Refused {
@@ -62,6 +72,238 @@ pub struct PreflightReport {
     pub follow_up: Vec<String>,
     #[serde(skip)]
     pub brew_preview: Option<RemovalPreview>,
+    #[serde(skip)]
+    pub identities: TargetIdentities,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TargetIdentities(BTreeMap<String, Vec<PhysicalTarget>>);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PhysicalTarget {
+    path: PathBuf,
+    resolved: PathBuf,
+    device: u64,
+    inode: u64,
+    file_type: u32,
+    link: Option<PathBuf>,
+    created: Option<SystemTime>,
+}
+
+impl PhysicalTarget {
+    fn capture(path: &Path) -> Result<Self, String> {
+        protected_metadata(|| Self::capture_protected(path))
+    }
+
+    fn capture_protected(path: &Path) -> Result<Self, String> {
+        use std::os::unix::fs::MetadataExt;
+
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(format!(
+                "cleanup target must be an absolute path: {}",
+                path.display()
+            ));
+        }
+        let name = path
+            .file_name()
+            .ok_or_else(|| "refusing filesystem root cleanup".to_string())?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| "cleanup target has no parent".to_string())?;
+        let resolved = std::fs::canonicalize(parent)
+            .map_err(|error| format!("cannot resolve target parent {}: {error}", parent.display()))?
+            .join(name);
+        let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+            format!("cannot identify cleanup target {}: {error}", path.display())
+        })?;
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::macos::fs::MetadataExt;
+            if metadata.st_flags() & 0x4000_0000 != 0 {
+                return Err(format!(
+                    "dataless cleanup target is unavailable: {}",
+                    path.display()
+                ));
+            }
+        }
+        let link = if metadata.file_type().is_symlink() {
+            Some(std::fs::read_link(path).map_err(|error| error.to_string())?)
+        } else {
+            None
+        };
+        Ok(Self {
+            path: path.to_path_buf(),
+            resolved,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            file_type: metadata.mode() & 0o170_000_u32,
+            link,
+            created: metadata.created().ok(),
+        })
+    }
+
+    fn verify(&self) -> Result<(), String> {
+        if Self::capture(&self.path)? != *self {
+            return Err(format!(
+                "physical cleanup target replaced since confirmation: {}",
+                self.path.display()
+            ));
+        }
+        Ok(())
+    }
+
+    fn overlaps(&self, other: &Self) -> bool {
+        (self.device == other.device && self.inode == other.inode)
+            || self.resolved.starts_with(&other.resolved)
+            || other.resolved.starts_with(&self.resolved)
+    }
+}
+
+fn physical_targets(
+    action: &PlannedAction,
+    finding: &Finding,
+) -> Result<Vec<PhysicalTarget>, String> {
+    if !action.destructive {
+        return Ok(Vec::new());
+    }
+    let _materialization = crate::scan::walk::listing::MaterializationGuard::enter()
+        .map_err(|error| format!("cannot protect cleanup target metadata: {error}"))?;
+    let mut paths = BTreeSet::new();
+    match &action.command {
+        RemedyCommand::Trash { path } => {
+            paths.insert(path.clone());
+        }
+        RemedyCommand::Shell { program, args }
+            if Path::new(program)
+                .file_name()
+                .is_some_and(|name| name == "rm") =>
+        {
+            for argument in args.iter().filter(|argument| !argument.starts_with('-')) {
+                paths.insert(PathBuf::from(argument));
+            }
+            if paths.is_empty() {
+                return Err("permanent deletion has no identifiable target".into());
+            }
+        }
+        _ => {}
+    }
+    if let Some(path) = &finding.path {
+        paths.insert(path.clone());
+        if !deletes_path(action) {
+            paths.insert(std::fs::canonicalize(path).map_err(|error| {
+                format!(
+                    "cannot identify cleanup target referent {}: {error}",
+                    path.display()
+                )
+            })?);
+        }
+    }
+    match &action.guard {
+        Some(Guard::BrewFormula { .. }) if finding.path.is_none() => {
+            return Err("cannot identify the physical Homebrew installation".into());
+        }
+        Some(Guard::BrewCask { .. }) => {
+            paths.extend(
+                str_list(&finding.meta, "app_paths")
+                    .into_iter()
+                    .map(PathBuf::from),
+            );
+            if let Some(binaries) = finding.meta.get("binaries").and_then(Value::as_array) {
+                paths.extend(binaries.iter().filter_map(|binary| {
+                    binary
+                        .get("target")
+                        .and_then(Value::as_str)
+                        .map(PathBuf::from)
+                }));
+            }
+            if paths.is_empty() {
+                return Err("cannot identify the physical Homebrew cask artifacts".into());
+            }
+        }
+        Some(Guard::ToolInstall { root, .. }) => {
+            paths.insert(root.clone());
+            paths.insert(std::fs::canonicalize(root).map_err(|error| {
+                format!(
+                    "cannot identify installation root {}: {error}",
+                    root.display()
+                )
+            })?);
+        }
+        Some(Guard::Launcher { path, .. }) => {
+            paths.insert(path.clone());
+        }
+        Some(Guard::PipPackage { site, name, .. }) => {
+            let expected = pymeta::normalize_name(name);
+            let metadata = pymeta::site_dist_infos(site)
+                .into_iter()
+                .find(|metadata| metadata.normalized == expected)
+                .ok_or_else(|| format!("cannot identify package {name} in {}", site.display()))?;
+            paths.insert(metadata.dir);
+        }
+        _ => {}
+    }
+    paths
+        .iter()
+        .map(|path| PhysicalTarget::capture(path))
+        .collect()
+}
+
+fn deletes_path(action: &PlannedAction) -> bool {
+    matches!(&action.command, RemedyCommand::Trash { .. })
+        || matches!(&action.command, RemedyCommand::Shell { program, .. } if Path::new(program).file_name().is_some_and(|name| name == "rm"))
+}
+
+fn action_is_current(action: &PlannedAction, finding: &Finding) -> bool {
+    finding.remedies.iter().any(|remedy| {
+        [DeleteMode::Trash, DeleteMode::Rm].into_iter().any(|mode| {
+            let expected = RemedyEngine::new(mode).plan_one(finding.id, remedy);
+            expected == *action
+        })
+    })
+}
+
+fn filter_brew_dependencies(report: &mut PreflightReport, graph: &BrewGraph) {
+    loop {
+        let selected = report.ok.iter().filter_map(brew_target).collect();
+        let preview = graph.removal_preview(&selected);
+        let mut changed = false;
+        report.ok.retain(|action| {
+            let Some(target) = brew_target(action) else {
+                return true;
+            };
+            let key = graph.resolve(&target).unwrap_or(target.clone());
+            let reason = if let Some((_, dependents)) =
+                preview.blocked.iter().find(|(name, _)| name == &key)
+            {
+                Some(format!(
+                    "blocked: still needed by {}",
+                    dependents.join(", ")
+                ))
+            } else if preview.unknown.contains(&target) {
+                Some(format!("ambiguous or unknown package name {target}"))
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                report.refused.push(Refused {
+                    action: action.clone(),
+                    reason,
+                });
+                changed = true;
+                false
+            } else {
+                true
+            }
+        });
+        if !changed {
+            report.brew_preview = Some(preview);
+            return;
+        }
+    }
 }
 
 fn is_brew_autoremove(a: &PlannedAction) -> bool {
@@ -154,6 +396,7 @@ pub fn preflight_static(
     let mut report = PreflightReport::default();
     let mut ok: Vec<PlannedAction> = Vec::new();
     let mut seen_commands: BTreeSet<String> = BTreeSet::new();
+    let mut selected_targets: Vec<(FindingId, bool, PhysicalTarget)> = Vec::new();
     let brew_findings = current
         .values()
         .filter(|f| matches!(f.kind, FindingKind::BrewFormula | FindingKind::BrewCask));
@@ -173,6 +416,44 @@ pub fn preflight_static(
             report.refused.push(Refused {
                 action: a.clone(),
                 reason: "duplicate target in this batch".into(),
+            });
+            continue;
+        }
+        if !action_is_current(a, f) {
+            report.refused.push(Refused {
+                action: a.clone(),
+                reason: "remedy changed or is not authorized by the current finding".into(),
+            });
+            continue;
+        }
+        if a.destructive && is_brew_autoremove(a) {
+            report.refused.push(Refused {
+                action: a.clone(),
+                reason: AUTOREMOVE_REFUSAL.into(),
+            });
+            continue;
+        }
+        let targets = match physical_targets(a, f) {
+            Ok(targets) => targets,
+            Err(reason) => {
+                report.refused.push(Refused {
+                    action: a.clone(),
+                    reason,
+                });
+                continue;
+            }
+        };
+        if targets.iter().any(|target| {
+            selected_targets
+                .iter()
+                .any(|(finding_id, deletes, existing)| {
+                    (*finding_id != a.finding_id || (*deletes && deletes_path(a)))
+                        && target.overlaps(existing)
+                })
+        }) {
+            report.refused.push(Refused {
+                action: a.clone(),
+                reason: "overlapping physical targets in this batch".into(),
             });
             continue;
         }
@@ -215,6 +496,13 @@ pub fn preflight_static(
                 }
             }
         }
+        selected_targets.extend(
+            targets
+                .iter()
+                .cloned()
+                .map(|target| (a.finding_id, deletes_path(a), target)),
+        );
+        report.identities.0.insert(a.rendered.clone(), targets);
         ok.push(a.clone());
     }
     if let Some(p) = &preview {
@@ -236,6 +524,9 @@ pub fn preflight_static(
     }
     report.ok = order_actions(ok, preview.as_ref());
     report.brew_preview = preview;
+    if report.ok.iter().any(|action| brew_target(action).is_some()) {
+        filter_brew_dependencies(&mut report, &graph);
+    }
     report
 }
 
@@ -298,6 +589,9 @@ pub struct InventoryItem {
 }
 
 pub fn capture_inventory(paths: &Paths, config: &Config, brew: Option<&BrewGraph>) -> Inventory {
+    let Ok(_materialization) = crate::scan::walk::listing::MaterializationGuard::enter() else {
+        return Inventory::default();
+    };
     let shell = ShellPath::default();
     let cx = probe_ctx_for(paths, config, &shell);
     let mut inv = Inventory::default();
@@ -405,7 +699,14 @@ pub async fn preflight_refresh(
     let mut report = PreflightReport::default();
     let mut ok = Vec::new();
     for a in actions {
-        let verdict: Result<(), String> = match &a.guard {
+        if a.destructive && is_brew_autoremove(a) {
+            report.refused.push(Refused {
+                action: a.clone(),
+                reason: AUTOREMOVE_REFUSAL.into(),
+            });
+            continue;
+        }
+        let verdict: Result<(), String> = protected_metadata(|| match &a.guard {
             None => Ok(()),
             Some(Guard::BrewFormula {
                 full_name,
@@ -521,7 +822,7 @@ pub async fn preflight_refresh(
                     }
                 }
             }
-        };
+        });
         match verdict {
             Ok(()) => ok.push(a.clone()),
             Err(reason) => report.refused.push(Refused {
@@ -532,6 +833,10 @@ pub async fn preflight_refresh(
     }
     report.ok = order_actions(ok, preview.as_ref());
     report.brew_preview = preview;
+    if let Some(graph) = &graph {
+        filter_brew_dependencies(&mut report, graph);
+        report.ok = order_actions(std::mem::take(&mut report.ok), report.brew_preview.as_ref());
+    }
     (report, graph)
 }
 
@@ -699,14 +1004,6 @@ impl CleanupReport {
     }
 }
 
-pub fn write_report(paths: &Paths, report: &CleanupReport) -> anyhow::Result<PathBuf> {
-    let dir = paths.state_dir.join("cleanup-reports");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{}.json", report.started_at));
-    std::fs::write(&path, serde_json::to_vec_pretty(report)?)?;
-    Ok(path)
-}
-
 /// Progress events for the TUI.
 #[derive(Debug)]
 pub enum ExecEvent {
@@ -832,8 +1129,6 @@ async fn run_probes(
     out
 }
 
-/// Run a confirmed batch end to end, reporting progress on `tx`. `stop` is
-/// checked between actions only.
 pub async fn run_batch(
     actions: Vec<PlannedAction>,
     current: BTreeMap<FindingId, Finding>,
@@ -841,9 +1136,53 @@ pub async fn run_batch(
     tx: mpsc::Sender<ExecEvent>,
     stop: CancellationToken,
 ) -> CleanupReport {
+    let confirmed = PreflightReport {
+        refused: actions
+            .into_iter()
+            .map(|action| Refused {
+                action,
+                reason: "cleanup requires the original confirmation-time target snapshot; use run_confirmed_batch".into(),
+            })
+            .collect(),
+        ..PreflightReport::default()
+    };
+    run_confirmed_batch(confirmed, current, deps, tx, stop).await
+}
+
+pub async fn run_confirmed_batch(
+    confirmed: PreflightReport,
+    current: BTreeMap<FindingId, Finding>,
+    deps: ExecDeps,
+    tx: mpsc::Sender<ExecEvent>,
+    stop: CancellationToken,
+) -> CleanupReport {
     let started_at = now_secs();
     let token = CancellationToken::new();
-    let (mut report, graph_before) = preflight_refresh(&actions, &deps, &token).await;
+    let mut refused = confirmed.refused;
+    let mut eligible = Vec::new();
+    for action in &confirmed.ok {
+        let verdict = current
+            .get(&action.finding_id)
+            .filter(|finding| action_is_current(action, finding))
+            .ok_or_else(|| "remedy is no longer authorized by the current finding".to_string())
+            .and_then(|_| {
+                confirmed
+                    .identities
+                    .0
+                    .get(&action.rendered)
+                    .ok_or_else(|| "cleanup plan has no physical target snapshot".to_string())
+            })
+            .and_then(|targets| targets.iter().try_for_each(PhysicalTarget::verify));
+        match verdict {
+            Ok(()) => eligible.push(action.clone()),
+            Err(reason) => refused.push(Refused {
+                action: action.clone(),
+                reason,
+            }),
+        }
+    }
+    let (mut report, graph_before) = preflight_refresh(&eligible, &deps, &token).await;
+    report.refused.extend(refused);
     let _ = tx
         .send(ExecEvent::PreflightDone(Box::new(report.clone())))
         .await;
@@ -870,6 +1209,7 @@ pub async fn run_batch(
     let mut cancelled = Vec::new();
     let mut failed_keys: BTreeSet<String> = BTreeSet::new();
     let mut brew_touched = false;
+    let mut removed_brew = BTreeSet::new();
     let ordered = std::mem::take(&mut report.ok);
     for (i, a) in ordered.iter().enumerate() {
         if stop.is_cancelled() {
@@ -884,7 +1224,40 @@ pub async fn run_batch(
             });
             continue;
         }
+        if let (Some(target), Some(graph)) = (brew_target(a), &graph_before) {
+            let name = graph.resolve(&target).unwrap_or(target);
+            let retained: Vec<_> = graph
+                .dependents(&name)
+                .into_iter()
+                .filter(|dependent| !removed_brew.contains(dependent))
+                .collect();
+            if !retained.is_empty() {
+                report.refused.push(Refused {
+                    action: a.clone(),
+                    reason: format!(
+                        "blocked: dependent removal did not complete: {}",
+                        retained.join(", ")
+                    ),
+                });
+                failed_keys.insert(key);
+                continue;
+            }
+        }
         let _ = tx.send(ExecEvent::ActionStarted(i)).await;
+        if stop.is_cancelled() {
+            cancelled.push(a.clone());
+            continue;
+        }
+        let identities = confirmed.identities.0.get(&a.rendered).unwrap();
+        if let Err(reason) = identities.iter().try_for_each(PhysicalTarget::verify) {
+            let _ = tx.send(ExecEvent::ActionDone(i, Err(reason.clone()))).await;
+            report.refused.push(Refused {
+                action: a.clone(),
+                reason,
+            });
+            failed_keys.insert(key);
+            continue;
+        }
         // Fresh token: an in-flight command is never killed by Esc.
         let result = engine
             .execute(
@@ -897,6 +1270,9 @@ pub async fn run_batch(
             .await;
         match result {
             Ok(msg) => {
+                if let (Some(target), Some(graph)) = (brew_target(a), &graph_before) {
+                    removed_brew.insert(graph.resolve(&target).unwrap_or(target));
+                }
                 if brew_target(a).is_some() || is_brew_autoremove(a) {
                     brew_touched = true;
                 }
@@ -985,7 +1361,7 @@ pub async fn run_batch(
         }
     }
 
-    let mut out = CleanupReport {
+    let out = CleanupReport {
         started_at,
         finished_at: now_secs(),
         delete_mode: match deps.delete_mode {
@@ -1005,9 +1381,6 @@ pub async fn run_batch(
                 .into(),
         audit_path: None,
     };
-    if deps.config.tools.write_cleanup_reports {
-        out.audit_path = write_report(&deps.paths, &out).ok();
-    }
     let _ = tx.send(ExecEvent::Finished(Box::new(out.clone()))).await;
     out
 }
@@ -1069,8 +1442,16 @@ mod tests {
         }
     }
 
-    fn brew_finding(name: &str, on_request: bool, deps: &[&str], dependents: &[&str]) -> Finding {
-        let mut f = Finding::new(FindingKind::BrewFormula, name, name).meta(serde_json::json!({
+    fn brew_finding(
+        home: &Path,
+        name: &str,
+        on_request: bool,
+        deps: &[&str],
+        dependents: &[&str],
+    ) -> Finding {
+        let cellar = home.join("Cellar").join(name);
+        std::fs::create_dir_all(&cellar).unwrap();
+        let mut f = Finding::new(FindingKind::BrewFormula, name, name).path(cellar).meta(serde_json::json!({
             "name": name, "full_name": name, "version": "1.0", "installed_on_request": on_request,
             "dependencies": deps, "dependents": dependents, "autoremove_candidate": false,
         }));
@@ -1100,10 +1481,11 @@ mod tests {
 
     #[test]
     fn static_preflight_refuses_stale_duplicate_and_blocked() {
+        let home = tempfile::tempdir().unwrap();
         // app (requested) → lib (dependency); app2 (requested) → lib.
-        let app = brew_finding("app", true, &["lib"], &[]);
-        let app2 = brew_finding("app2", true, &["lib"], &[]);
-        let mut lib = brew_finding("lib", false, &[], &["app", "app2"]);
+        let app = brew_finding(home.path(), "app", true, &["lib"], &[]);
+        let app2 = brew_finding(home.path(), "app2", true, &["lib"], &[]);
+        let mut lib = brew_finding(home.path(), "lib", false, &[], &["app", "app2"]);
         // Give lib an (unsafe) uninstall remedy to prove preflight blocks it.
         lib = lib.remedy(
             Remedy::new(
@@ -1310,8 +1692,8 @@ mod tests {
         std::os::unix::fs::symlink("../lib/x/cli.js", bin.join("x")).unwrap();
         // Two brew targets: `wget` fine, `broken` exits non-zero; one launcher.
         let mut current = BTreeMap::new();
-        let wget = brew_finding("wget", true, &[], &[]);
-        let broken = brew_finding("broken", true, &[], &[]);
+        let wget = brew_finding(home, "wget", true, &[], &[]);
+        let broken = brew_finding(home, "broken", true, &[], &[]);
         let tool = Finding::new(FindingKind::GlobalTool, "npm:/r:x", "x")
             .meta(serde_json::json!({ "identity_key": "npm:/r:x", "commands": [{"name": "x"}], "launchers": [], "classifications": [] }))
             .remedy(
@@ -1339,7 +1721,9 @@ mod tests {
         let trash = Arc::new(FakeTrash(Mutex::new(vec![])));
         let deps = deps_with(mock, home, trash.clone());
         let (tx, mut rx) = mpsc::channel(64);
-        let report = run_batch(actions, current, deps, tx, CancellationToken::new()).await;
+        let confirmed = preflight_static(&actions, &current);
+        let report =
+            run_confirmed_batch(confirmed, current, deps, tx, CancellationToken::new()).await;
         assert_eq!(report.executed.len(), 2, "{report:?}");
         assert_eq!(report.failed.len(), 1);
         assert!(report.failed[0].message.contains("refusing"));
@@ -1352,10 +1736,9 @@ mod tests {
             .rendered
             .starts_with("brew uninstall"));
         assert!(report.executed[1].action.rendered.starts_with("trash"));
-        assert!(report.audit_path.as_ref().unwrap().exists());
-        let json: Value =
-            serde_json::from_slice(&std::fs::read(report.audit_path.as_ref().unwrap()).unwrap())
-                .unwrap();
+        assert!(report.audit_path.is_none());
+        assert!(!Paths::from_home(home).state_dir.exists());
+        let json: Value = serde_json::to_value(&report).unwrap();
         assert_eq!(
             json["failed"][0]["action"]["rendered"],
             "brew uninstall broken"
@@ -1375,10 +1758,98 @@ mod tests {
         let trash2 = Arc::new(FakeTrash(Mutex::new(vec![])));
         let deps = deps_with(mock, home, trash2.clone());
         let (tx, _rx) = mpsc::channel(64);
-        let report = run_batch(vec![plan(&wget, 0)], BTreeMap::new(), deps, tx, stop).await;
+        let current = BTreeMap::from([(wget.id, wget.clone())]);
+        let confirmed = preflight_static(&[plan(&wget, 0)], &current);
+        let report = run_confirmed_batch(confirmed, current, deps, tx, stop).await;
         assert_eq!(report.cancelled.len(), 1);
         assert!(report.executed.is_empty());
         assert!(trash2.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_finishes_active_command_and_skips_next_action() {
+        struct CancelDuringUninstall {
+            inner: MockCommandRunner,
+            stop: CancellationToken,
+            uninstalls: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl CommandRunner for CancelDuringUninstall {
+            async fn run(
+                &self,
+                program: &str,
+                args: &[&str],
+                token: &CancellationToken,
+            ) -> anyhow::Result<crate::runner::CmdOutput> {
+                if program == "brew" && args.first() == Some(&"uninstall") {
+                    self.uninstalls
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    self.stop.cancel();
+                    tokio::task::yield_now().await;
+                    if token.is_cancelled() {
+                        anyhow::bail!("active destructive command was cancelled");
+                    }
+                }
+                self.inner.run(program, args, token).await
+            }
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let first = brew_finding(home.path(), "alpha", true, &[], &[]);
+        let second = brew_finding(home.path(), "beta", true, &[], &[]);
+        let current = [first.clone(), second.clone()]
+            .into_iter()
+            .map(|finding| (finding.id, finding))
+            .collect();
+        let info = r#"{"formulae":[
+            {"name":"alpha","full_name":"alpha","installed":[{"version":"1.0","installed_on_request":true,"runtime_dependencies":[]}],"linked_keg":"1.0"},
+            {"name":"beta","full_name":"beta","installed":[{"version":"1.0","installed_on_request":true,"runtime_dependencies":[]}],"linked_keg":"1.0"}
+        ],"casks":[]}"#;
+        let stop = CancellationToken::new();
+        let runner = Arc::new(CancelDuringUninstall {
+            inner: MockCommandRunner::new()
+                .on("brew", &["info", "--json=v2", "--installed"], info)
+                .on("brew", &["uninstall", "alpha"], "removed alpha")
+                .on("brew", &["uninstall", "beta"], "removed beta")
+                .on("brew", &["autoremove", "--dry-run"], ""),
+            stop: stop.clone(),
+            uninstalls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let trash = Arc::new(FakeTrash(Mutex::new(vec![])));
+        let mut deps = deps_with(MockCommandRunner::new(), home.path(), trash);
+        deps.runner = runner.clone();
+        let (tx, _rx) = mpsc::channel(64);
+        let confirmed = preflight_static(&[plan(&first, 0), plan(&second, 0)], &current);
+        let report = run_confirmed_batch(confirmed, current, deps, tx, stop).await;
+        assert_eq!(
+            runner.uninstalls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(report.executed.len(), 1, "{report:?}");
+        assert_eq!(report.executed[0].action.rendered, "brew uninstall alpha");
+        assert!(report.failed.is_empty());
+        assert_eq!(report.cancelled.len(), 1);
+        assert_eq!(report.cancelled[0].rendered, "brew uninstall beta");
+        assert!(report.audit_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_report_option_never_writes_or_modifies_reports() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(home.path());
+        let reports = paths.state_dir.join("cleanup-reports");
+        std::fs::create_dir_all(&reports).unwrap();
+        let legacy = reports.join("previous.json");
+        std::fs::write(&legacy, b"existing report").unwrap();
+        let trash = Arc::new(FakeTrash(Mutex::new(vec![])));
+        let mut deps = deps_with(MockCommandRunner::new(), home.path(), trash);
+        deps.config = Arc::new(toml::from_str("[tools]\nwrite_cleanup_reports = true\n").unwrap());
+        let (tx, _rx) = mpsc::channel(64);
+        let report = run_batch(vec![], BTreeMap::new(), deps, tx, CancellationToken::new()).await;
+        assert!(report.audit_path.is_none());
+        assert_eq!(std::fs::read(&legacy).unwrap(), b"existing report");
+        assert_eq!(std::fs::read_dir(reports).unwrap().count(), 1);
     }
 
     #[test]
@@ -1420,6 +1891,492 @@ mod tests {
             Verdict::Regression
         );
         assert_eq!(by("pip:/s:good", "--version probe"), Verdict::Regression);
+    }
+
+    fn path_finding(key: &str, path: &Path) -> Finding {
+        Finding::new(FindingKind::BuildArtifact, key, key)
+            .path(path.to_path_buf())
+            .remedy(
+                Remedy::new(
+                    "Trash",
+                    RemedyCommand::Trash {
+                        path: path.to_path_buf(),
+                    },
+                )
+                .destructive(),
+            )
+    }
+
+    #[test]
+    fn cleanup_refuses_nested_alias_and_hardlink_targets() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("parent");
+        std::fs::create_dir(&directory).unwrap();
+        let child = directory.join("child");
+        std::fs::write(&child, "fixture").unwrap();
+        let parent = path_finding("parent", &directory);
+        let nested = path_finding("child", &child);
+        let current = [parent.clone(), nested.clone()]
+            .into_iter()
+            .map(|finding| (finding.id, finding))
+            .collect();
+        for actions in [
+            vec![plan(&parent, 0), plan(&nested, 0)],
+            vec![plan(&nested, 0), plan(&parent, 0)],
+        ] {
+            let report = preflight_static(&actions, &current);
+            assert_eq!(report.ok.len(), 1);
+            assert!(report.refused[0].reason.contains("overlapping physical"));
+        }
+        let alias = temporary.path().join("alias");
+        std::os::unix::fs::symlink(&directory, &alias).unwrap();
+        let alternate = path_finding("alias", &alias.join("child"));
+        let hardlink = temporary.path().join("hardlink");
+        std::fs::hard_link(&child, &hardlink).unwrap();
+        let linked = path_finding("hardlink", &hardlink);
+        for other in [alternate, linked] {
+            let current = [nested.clone(), other.clone()]
+                .into_iter()
+                .map(|finding| (finding.id, finding))
+                .collect();
+            let report = preflight_static(&[plan(&nested, 0), plan(&other, 0)], &current);
+            assert_eq!(report.ok.len(), 1);
+            assert_eq!(report.refused.len(), 1);
+        }
+    }
+
+    #[test]
+    fn cleanup_refuses_mixed_trash_and_rm_but_preserves_unload_then_trash() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("fixture.plist");
+        std::fs::write(&path, "fixture").unwrap();
+        let finding = path_finding("fixture", &path).remedy(
+            Remedy::new(
+                "Unload",
+                RemedyCommand::Shell {
+                    program: "launchctl".into(),
+                    args: vec!["bootout".into(), "gui/100/fixture".into()],
+                },
+            )
+            .destructive(),
+        );
+        let current = [(finding.id, finding.clone())].into_iter().collect();
+        let permanent =
+            RemedyEngine::new(DeleteMode::Rm).plan_one(finding.id, &finding.remedies[0]);
+        let report = preflight_static(&[plan(&finding, 0), permanent], &current);
+        assert_eq!(report.ok.len(), 1);
+        assert!(report.refused[0].reason.contains("overlapping physical"));
+        let report = preflight_static(&[plan(&finding, 1), plan(&finding, 0)], &current);
+        assert_eq!(report.ok.len(), 2);
+        assert!(report.refused.is_empty());
+    }
+
+    #[test]
+    fn cleanup_refuses_changed_or_unseen_remedies() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("fixture");
+        std::fs::write(&path, "fixture").unwrap();
+        let finding = path_finding("fixture", &path);
+        let mut action = plan(&finding, 0);
+        action.command = RemedyCommand::Trash {
+            path: temporary.path().join("unseen"),
+        };
+        action.rendered = action.command.rendered();
+        let current = [(finding.id, finding)].into_iter().collect();
+        let report = preflight_static(&[action], &current);
+        assert!(report.ok.is_empty());
+        assert!(report.refused[0].reason.contains("not authorized"));
+    }
+
+    #[test]
+    fn homebrew_cleanup_refuses_missing_physical_targets() {
+        let home = tempfile::tempdir().unwrap();
+        let mut formula = brew_finding(home.path(), "formula", true, &[], &[]);
+        formula.path = None;
+        let cask = Finding::new(FindingKind::BrewCask, "cask", "cask").remedy(
+            Remedy::new(
+                "Uninstall cask",
+                RemedyCommand::Shell {
+                    program: "brew".into(),
+                    args: vec!["uninstall".into(), "--cask".into(), "cask".into()],
+                },
+            )
+            .destructive()
+            .guard(Guard::BrewCask {
+                token: "cask".into(),
+                expected_version: Some("1.0".into()),
+            }),
+        );
+        let actions = vec![plan(&formula, 0), plan(&cask, 0)];
+        let current = BTreeMap::from([(formula.id, formula), (cask.id, cask)]);
+        let report = preflight_static(&actions, &current);
+        assert!(report.ok.is_empty(), "{report:?}");
+        assert_eq!(report.refused.len(), 2);
+        assert!(report
+            .refused
+            .iter()
+            .all(|refused| refused.reason.contains("physical Homebrew")));
+    }
+
+    #[tokio::test]
+    async fn cask_artifacts_are_overlap_and_replacement_guarded() {
+        let home = tempfile::tempdir().unwrap();
+        let application = home.path().join("App.app");
+        let cache = application.join("cache");
+        let binary = home.path().join("bin");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(&binary, "original binary").unwrap();
+        let cask = Finding::new(FindingKind::BrewCask, "app", "app")
+            .meta(serde_json::json!({
+                "app_paths": [application],
+                "binaries": [{ "source": "app", "target": binary }],
+            }))
+            .remedy(
+                Remedy::new(
+                    "Uninstall cask",
+                    RemedyCommand::Shell {
+                        program: "brew".into(),
+                        args: vec!["uninstall".into(), "--cask".into(), "app".into()],
+                    },
+                )
+                .destructive()
+                .guard(Guard::BrewCask {
+                    token: "app".into(),
+                    expected_version: Some("1.0".into()),
+                }),
+            );
+        let nested = path_finding("cache", &cache);
+        let current = BTreeMap::from([(cask.id, cask.clone()), (nested.id, nested.clone())]);
+        let overlap = preflight_static(&[plan(&cask, 0), plan(&nested, 0)], &current);
+        assert_eq!(overlap.ok.len(), 1, "{overlap:?}");
+        assert_eq!(overlap.refused.len(), 1);
+        assert!(overlap.refused[0].reason.contains("overlapping physical"));
+        let confirmed = preflight_static(&[plan(&cask, 0)], &current);
+        std::fs::rename(&binary, home.path().join("original-bin")).unwrap();
+        std::fs::write(&binary, "replaced binary").unwrap();
+        let runner = Arc::new(MockCommandRunner::new());
+        let mut deps = deps_with(
+            MockCommandRunner::new(),
+            home.path(),
+            Arc::new(FakeTrash(Mutex::new(Vec::new()))),
+        );
+        deps.runner = runner.clone();
+        let (sender, _receiver) = mpsc::channel(64);
+        let report =
+            run_confirmed_batch(confirmed, current, deps, sender, CancellationToken::new()).await;
+        assert!(report.executed.is_empty());
+        assert_eq!(report.refused.len(), 1);
+        assert!(report.refused[0].reason.contains("replaced"));
+        assert!(runner.calls().is_empty());
+        assert_eq!(std::fs::read_to_string(binary).unwrap(), "replaced binary");
+    }
+
+    #[tokio::test]
+    async fn confirmed_cleanup_refuses_replaced_inode_and_preserves_both_files() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("fixture");
+        let original = temporary.path().join("original");
+        std::fs::write(&path, "original").unwrap();
+        let finding = path_finding("fixture", &path);
+        let current = [(finding.id, finding.clone())].into_iter().collect();
+        let confirmed = preflight_static(&[plan(&finding, 0)], &current);
+        assert_eq!(confirmed.ok.len(), 1);
+        std::fs::rename(&path, &original).unwrap();
+        std::fs::write(&path, "replacement").unwrap();
+        let trash = Arc::new(FakeTrash(Mutex::new(Vec::new())));
+        let deps = deps_with(MockCommandRunner::new(), temporary.path(), trash.clone());
+        let (sender, _receiver) = mpsc::channel(64);
+        let report =
+            run_confirmed_batch(confirmed, current, deps, sender, CancellationToken::new()).await;
+        assert!(report.executed.is_empty());
+        assert!(report.refused[0]
+            .reason
+            .contains("physical cleanup target replaced"));
+        assert!(trash.0.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "replacement");
+        assert_eq!(std::fs::read_to_string(&original).unwrap(), "original");
+    }
+
+    #[test]
+    fn confirmation_refuses_redirected_parent_even_for_the_same_inode() {
+        let temporary = tempfile::tempdir().unwrap();
+        let first = temporary.path().join("first");
+        let second = temporary.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        std::fs::write(first.join("fixture"), "fixture").unwrap();
+        std::fs::hard_link(first.join("fixture"), second.join("fixture")).unwrap();
+        let alias = temporary.path().join("alias");
+        std::os::unix::fs::symlink(&first, &alias).unwrap();
+        let target = PhysicalTarget::capture(&alias.join("fixture")).unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&second, &alias).unwrap();
+        assert!(target.verify().unwrap_err().contains("replaced"));
+    }
+
+    #[test]
+    fn cleanup_tracks_installation_referent_behind_a_stable_symlink() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("installation");
+        std::fs::create_dir(&directory).unwrap();
+        let alias = temporary.path().join("alias");
+        std::os::unix::fs::symlink(&directory, &alias).unwrap();
+        let finding = Finding::new(FindingKind::GlobalTool, "fixture", "fixture")
+            .path(alias.clone())
+            .remedy(
+                Remedy::new(
+                    "Uninstall",
+                    RemedyCommand::Shell {
+                        program: "fixture-manager".into(),
+                        args: vec!["uninstall".into(), "fixture".into()],
+                    },
+                )
+                .destructive()
+                .guard(Guard::ToolInstall {
+                    manager: "fixture".into(),
+                    identity_key: "fixture".into(),
+                    root: alias.clone(),
+                    expected_version: None,
+                    program_must_exist: None,
+                }),
+            );
+        let targets = physical_targets(&plan(&finding, 0), &finding).unwrap();
+        std::fs::rename(&directory, temporary.path().join("original")).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        assert!(PhysicalTarget::capture(&alias).unwrap().verify().is_ok());
+        assert!(targets.iter().any(|target| target.verify().is_err()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cleanup_metadata_disables_materialization_and_restores_thread_policy() {
+        extern "C" {
+            fn getiopolicy_np(policy_type: libc::c_int, scope: libc::c_int) -> libc::c_int;
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("fixture");
+        std::fs::write(&path, "fixture").unwrap();
+        let previous = unsafe { getiopolicy_np(3, 1) };
+        assert!(previous >= 0);
+        let target = protected_metadata(|| {
+            assert_eq!(unsafe { getiopolicy_np(3, 1) }, 1);
+            let target = PhysicalTarget::capture(&path)?;
+            assert_eq!(unsafe { getiopolicy_np(3, 1) }, 1);
+            Ok(target)
+        })
+        .unwrap();
+        assert_eq!(unsafe { getiopolicy_np(3, 1) }, previous);
+        target.verify().unwrap();
+        assert_eq!(unsafe { getiopolicy_np(3, 1) }, previous);
+        assert!(
+            protected_metadata(|| PhysicalTarget::capture(&temporary.path().join("missing")))
+                .is_err()
+        );
+        assert_eq!(unsafe { getiopolicy_np(3, 1) }, previous);
+    }
+
+    #[tokio::test]
+    async fn cleanup_rechecks_the_next_target_after_an_active_action() {
+        struct ReplacingTrash {
+            next: PathBuf,
+            calls: Mutex<Vec<PathBuf>>,
+        }
+        impl TrashOps for ReplacingTrash {
+            fn trash(&self, path: &Path) -> anyhow::Result<()> {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(path.to_path_buf());
+                if calls.len() == 1 {
+                    std::fs::rename(&self.next, self.next.with_extension("original"))?;
+                    std::fs::write(&self.next, "replacement")?;
+                }
+                Ok(())
+            }
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let first_path = temporary.path().join("aaa");
+        let second_path = temporary.path().join("bbb");
+        std::fs::write(&first_path, "first").unwrap();
+        std::fs::write(&second_path, "second").unwrap();
+        let first = path_finding("first", &first_path);
+        let second = path_finding("second", &second_path);
+        let current = [first.clone(), second.clone()]
+            .into_iter()
+            .map(|finding| (finding.id, finding))
+            .collect();
+        let confirmed = preflight_static(&[plan(&first, 0), plan(&second, 0)], &current);
+        let trash = Arc::new(ReplacingTrash {
+            next: second_path,
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut deps = deps_with(
+            MockCommandRunner::new(),
+            temporary.path(),
+            Arc::new(FakeTrash(Mutex::new(Vec::new()))),
+        );
+        deps.trash = trash.clone();
+        let (sender, _receiver) = mpsc::channel(64);
+        let report =
+            run_confirmed_batch(confirmed, current, deps, sender, CancellationToken::new()).await;
+        assert_eq!(report.executed.len(), 1);
+        assert_eq!(report.refused.len(), 1);
+        assert_eq!(trash.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn global_cleanup_outside_home_uses_confirmed_finding_targets() {
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = outside.path().join("global-fixture");
+        std::fs::write(&path, "fixture").unwrap();
+        let finding = path_finding("global-fixture", &path)
+            .meta(serde_json::json!({"context": "audit_host"}));
+        let current = [(finding.id, finding.clone())].into_iter().collect();
+        let confirmed = preflight_static(&[plan(&finding, 0)], &current);
+        let trash = Arc::new(FakeTrash(Mutex::new(Vec::new())));
+        let deps = deps_with(MockCommandRunner::new(), home.path(), trash.clone());
+        let (sender, _receiver) = mpsc::channel(64);
+        let report =
+            run_confirmed_batch(confirmed, current, deps, sender, CancellationToken::new()).await;
+        assert_eq!(report.executed.len(), 1, "{report:?}");
+        assert!(report.refused.is_empty());
+        assert_eq!(*trash.0.lock().unwrap(), vec![path.clone()]);
+        assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn refused_dependent_removal_blocks_its_dependency() {
+        let home = tempfile::tempdir().unwrap();
+        let app = brew_finding(home.path(), "app", true, &["lib"], &[]);
+        let lib = brew_finding(home.path(), "lib", false, &[], &[]);
+        let info = r#"{"formulae":[
+            {"name":"app","full_name":"app","installed":[{"version":"2.0","runtime_dependencies":[{"full_name":"lib","declared_directly":true}]}],"linked_keg":"2.0"},
+            {"name":"lib","full_name":"lib","installed":[{"version":"1.0","runtime_dependencies":[]}],"linked_keg":"1.0"}
+        ],"casks":[]}"#;
+        let deps = deps_with(
+            MockCommandRunner::new().on("brew", &["info", "--json=v2", "--installed"], info),
+            home.path(),
+            Arc::new(FakeTrash(Mutex::new(Vec::new()))),
+        );
+        let (report, _) = preflight_refresh(
+            &[plan(&app, 0), plan(&lib, 0)],
+            &deps,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(report.ok.is_empty(), "{report:?}");
+        assert_eq!(report.refused.len(), 2);
+        assert!(report
+            .refused
+            .iter()
+            .any(|refused| refused.reason.contains("still needed by app")));
+    }
+
+    #[tokio::test]
+    async fn failed_dependent_uninstall_never_executes_dependency_uninstall() {
+        let home = tempfile::tempdir().unwrap();
+        let app = brew_finding(home.path(), "app", true, &["lib"], &[]);
+        let lib = brew_finding(home.path(), "lib", false, &[], &[]);
+        let current = [app.clone(), lib.clone()]
+            .into_iter()
+            .map(|finding| (finding.id, finding))
+            .collect();
+        let info = r#"{"formulae":[
+            {"name":"app","full_name":"app","installed":[{"version":"1.0","runtime_dependencies":[{"full_name":"lib","declared_directly":true}]}],"linked_keg":"1.0"},
+            {"name":"lib","full_name":"lib","installed":[{"version":"1.0","runtime_dependencies":[]}],"linked_keg":"1.0"}
+        ],"casks":[]}"#;
+        let runner = Arc::new(
+            MockCommandRunner::new()
+                .on("brew", &["info", "--json=v2", "--installed"], info)
+                .on_fail("brew", &["uninstall", "app"], 1, "fixture refusal"),
+        );
+        let mut deps = deps_with(
+            MockCommandRunner::new(),
+            home.path(),
+            Arc::new(FakeTrash(Mutex::new(Vec::new()))),
+        );
+        deps.runner = runner.clone();
+        let (sender, _receiver) = mpsc::channel(64);
+        let confirmed = preflight_static(&[plan(&lib, 0), plan(&app, 0)], &current);
+        let report =
+            run_confirmed_batch(confirmed, current, deps, sender, CancellationToken::new()).await;
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert!(report.executed.is_empty());
+        assert_eq!(report.refused.len(), 1);
+        assert!(report.refused[0]
+            .reason
+            .contains("dependent removal did not complete"));
+        assert!(!runner
+            .calls()
+            .iter()
+            .any(|call| call == &["brew", "uninstall", "lib"]));
+    }
+
+    #[tokio::test]
+    async fn dynamic_autoremove_is_refused_before_any_command_executes() {
+        let home = tempfile::tempdir().unwrap();
+        let finding = Finding::new(
+            FindingKind::BrewFormula,
+            "__autoremove__",
+            "Homebrew autoremove candidates",
+        )
+        .meta(serde_json::json!({ "candidates": ["confirmed-library"] }))
+        .remedy(
+            Remedy::new(
+                "Remove all unneeded dependencies",
+                RemedyCommand::Shell {
+                    program: "brew".into(),
+                    args: vec!["autoremove".into()],
+                },
+            )
+            .destructive(),
+        );
+        let actions = vec![plan(&finding, 0)];
+        let current = BTreeMap::from([(finding.id, finding)]);
+        let mut deps = deps_with(
+            MockCommandRunner::new(),
+            home.path(),
+            Arc::new(FakeTrash(Mutex::new(Vec::new()))),
+        );
+        let runner = Arc::new(MockCommandRunner::new().on("brew", &["autoremove"], "removed"));
+        deps.runner = runner.clone();
+        let confirmed = preflight_static(&actions, &current);
+        assert!(confirmed.ok.is_empty(), "{confirmed:?}");
+        assert_eq!(confirmed.refused.len(), 1);
+        assert!(confirmed.refused[0].reason.contains("dynamic targets"));
+        let (fresh, _) = preflight_refresh(&actions, &deps, &CancellationToken::new()).await;
+        assert!(fresh.ok.is_empty(), "{fresh:?}");
+        assert_eq!(fresh.refused.len(), 1);
+        let (sender, _receiver) = mpsc::channel(64);
+        let report =
+            run_confirmed_batch(confirmed, current, deps, sender, CancellationToken::new()).await;
+        assert!(report.executed.is_empty());
+        assert!(report.failed.is_empty());
+        assert_eq!(report.refused.len(), 1);
+        assert!(runner.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn actions_only_execution_never_recaptures_confirmation_or_runs_commands() {
+        let home = tempfile::tempdir().unwrap();
+        let finding = brew_finding(home.path(), "formula", true, &[], &[]);
+        let actions = vec![plan(&finding, 0)];
+        let current = BTreeMap::from([(finding.id, finding)]);
+        assert_eq!(preflight_static(&actions, &current).ok.len(), 1);
+        let runner =
+            Arc::new(MockCommandRunner::new().on("brew", &["uninstall", "formula"], "removed"));
+        let trash = Arc::new(FakeTrash(Mutex::new(Vec::new())));
+        let mut deps = deps_with(MockCommandRunner::new(), home.path(), trash.clone());
+        deps.runner = runner.clone();
+        let (sender, _receiver) = mpsc::channel(64);
+        let report = run_batch(actions, current, deps, sender, CancellationToken::new()).await;
+        assert!(report.executed.is_empty());
+        assert!(report.failed.is_empty());
+        assert_eq!(report.refused.len(), 1);
+        assert!(report.refused[0]
+            .reason
+            .contains("confirmation-time target snapshot"));
+        assert!(runner.calls().is_empty());
+        assert!(trash.0.lock().unwrap().is_empty());
     }
 
     #[test]

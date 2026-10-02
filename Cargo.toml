@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/macaudit-ffi", "crates/uniffi-bindgen"]
+members = ["crates/macaudit-ffi", "crates/uniffi-bindgen", "crates/macaudit-devtools"]
 
 [package]
 name = "macaudit"
@@ -45,8 +45,12 @@ anyhow = "1.0.103"
 humansize = "2.1.3"
 unicode-width = { version = "0.2", optional = true }
 toml = "1.1.3"
-rusqlite = { version = "0.40", features = ["bundled"] }
 async-trait = "0.1.89"
+slotmap = "=1.1.1"
+crossbeam-channel = "=0.5.17"
+tracing = "=0.1.44"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
 
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "gzip", "http2"] }
 regex = "1.13.1"
@@ -57,7 +61,16 @@ semver = "1.0.28"
 [dev-dependencies]
 insta = "1"
 tempfile = "3.27"
+proptest = "=1.11.0"
+criterion = "=0.8.2"
+
+[[bench]]
+name = "inventory"
+harness = false
 
 [profile.release]
 lto = "thin"
 strip = true
+
+[profile.release.build-override]
+strip = false

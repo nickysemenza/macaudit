@@ -1,0 +1,2 @@
+[alias]
+devtools = "run --quiet --locked -p macaudit-devtools --"

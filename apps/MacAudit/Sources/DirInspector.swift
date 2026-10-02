@@ -7,28 +7,45 @@ import SwiftUI
 /// Mirrors `FindingInspector`'s structure and `facts` grid style.
 struct DirInspector: View {
     @Environment(AuditStore.self) private var store
+    @Environment(\.locale) private var locale
+    @Environment(\.timeZone) private var timeZone
     let entry: DirEntry?
 
     /// The selected directory's own largest loose files, fetched live
     /// (directories no longer carry a per-node file list).
-    @State private var topFiles: [TopFile] = []
+    @State private var liveFiles: LiveFilesPage?
+    @State private var liveError: String?
+    private var topFiles: [TopFile] {
+        liveFiles?.files ?? []
+    }
+
+    private var observedAt: Date? {
+        guard let milliseconds = liveFiles?.observedAtMs, milliseconds > 0 else { return nil }
+        return Date(timeIntervalSince1970: Double(milliseconds) / 1000)
+    }
 
     var body: some View {
         if let e = entry {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    if !store.hasFullDiskAccess && e.errors > 0 {
+                    if !store.hasFullDiskAccess, e.errors > 0 {
                         FullDiskAccessBanner(store: store, compact: true)
                     }
                     header(e)
                     facts(e)
+                    if e.path == store.browser.root?.path {
+                        RootAccountingFacts(stats: store.browser.rootStats)
+                    } else {
+                        Text("Scan allocation is not reclaimable space. Hard links are charged once; external links and shared extents can keep storage allocated after deletion.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     largestFiles(e)
                     findings(e)
                 }
                 .padding()
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .task(id: entry?.path) {
+            .task(id: "\(store.browser.metadata?.runId ?? 0):\(entry?.path ?? "")") {
                 await loadTopFiles(for: e.path)
             }
         } else {
@@ -37,12 +54,23 @@ struct DirInspector: View {
     }
 
     private func loadTopFiles(for path: String) async {
-        let engine = store.engine
-        let files = await Task.detached { engine.dirTopFiles(path: path, n: 5) }.value
-        // The selection may have changed while this awaited; drop a stale
-        // result rather than showing files for the wrong directory.
-        guard path == entry?.path else { return }
-        topFiles = files
+        liveFiles = nil
+        liveError = nil
+        do {
+            let expected = await store.browser.queries.metadata()
+            let page = try await store.browser.queries.liveFiles(path: path, limit: 5)
+            let latest = await store.browser.queries.metadata()
+            guard !Task.isCancelled, path == entry?.path else { return }
+            guard page.subjectPath == path, page.metadata.runId == expected.runId, latest.runId == expected.runId,
+                  page.metadata.selectedRoot == expected.selectedRoot, latest.selectedRoot == expected.selectedRoot
+            else {
+                throw MacAuditError.Invalid(message: "The live observation belongs to a changed run or another folder.")
+            }
+            liveFiles = page
+        } catch {
+            guard !Task.isCancelled, path == entry?.path else { return }
+            liveError = "\(error)"
+        }
     }
 
     private func header(_ e: DirEntry) -> some View {
@@ -69,7 +97,7 @@ struct DirInspector: View {
     private func facts(_ e: DirEntry) -> some View {
         Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 10, verticalSpacing: 4) {
             GridRow {
-                Text("Allocated").foregroundStyle(.secondary)
+                Text("Scan allocation").foregroundStyle(.secondary)
                 Text(Formatting.bytes(e.alloc)).monospacedDigit()
             }
             GridRow {
@@ -77,7 +105,7 @@ struct DirInspector: View {
                 Text(Formatting.bytes(e.apparent)).monospacedDigit()
             }
             GridRow {
-                Text("Files").foregroundStyle(.secondary)
+                Text("Unique files").foregroundStyle(.secondary)
                 Text(Formatting.count(e.files))
             }
             GridRow {
@@ -96,9 +124,24 @@ struct DirInspector: View {
 
     private func largestFiles(_: DirEntry) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Largest files here").font(.headline)
+            Text("Live largest files here").font(.headline)
+            Text("Live metadata; not scan allocation.").font(.caption).foregroundStyle(.secondary)
+            if let observedAt {
+                Text("Observed \(observedAt.formatted(Date.FormatStyle(date: .abbreviated, time: .standard, locale: locale, timeZone: timeZone)))")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if let liveFiles {
+                Text("Live coverage: \(liveFiles.coverage) · \(liveFiles.dataless) dataless skipped · \(liveFiles.errors) errors")
+                    .font(.caption).foregroundStyle(.secondary)
+                if !liveFiles.stopReasons.isEmpty {
+                    Text(liveFiles.stopReasons.joined(separator: ", ")).font(.caption).foregroundStyle(.orange)
+                }
+            }
+            if let liveError {
+                Text(liveError).font(.caption).foregroundStyle(.orange)
+            }
             if topFiles.isEmpty {
-                Text("none").font(.callout).foregroundStyle(.secondary)
+                Text("No live file observations available").font(.callout).foregroundStyle(.secondary)
             } else {
                 ForEach(topFiles) { f in
                     HStack(spacing: 6) {

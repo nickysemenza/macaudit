@@ -31,18 +31,39 @@ GEN="$KIT/Sources/MacAuditKit/Generated"
 XCF="$KIT/MacAuditFFI.xcframework"
 LIB_NAME=libmacaudit_ffi.a
 
-rm -rf "$OUT"
-mkdir -p "$OUT/Headers" "$OUT/swift" "$GEN"
-
 # Match the app's deployment target so C objects (aws-lc via reqwest/rustls)
 # don't link with "built for newer macOS" warnings.
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
+TARGET_DIR=$(cargo devtools target-directory)
+for target in "${TARGETS[@]}"; do
+  target_lib=$(rustc --print target-libdir --target "$target")
+  for stdlib in "$target_lib"/libstd-*.rlib; do
+    if [ ! -f "$stdlib" ]; then
+      echo "Rust standard library unavailable for $target" >&2
+      exit 1
+    fi
+    if ! otool -l "$stdlib" | awk -v target="$MACOSX_DEPLOYMENT_TARGET" '
+      BEGIN { split(target, minimum, ".") }
+      $1 == "minos" {
+        split($2, actual, ".")
+        if (actual[1] > minimum[1] || (actual[1] == minimum[1] && actual[2] > minimum[2])) incompatible = 1
+      }
+      END { exit incompatible }
+    '; then
+      echo "Rust standard library for $target requires newer macOS than $MACOSX_DEPLOYMENT_TARGET; use an official Rust toolchain with compatible deployment support." >&2
+      exit 1
+    fi
+  done
+done
+
+rm -rf "$OUT"
+mkdir -p "$OUT/Headers" "$OUT/swift" "$GEN"
 
 LIBS=()
 for target in "${TARGETS[@]}"; do
   echo "== cargo build ($PROFILE, $target)"
-  cargo build -p macaudit-ffi --target "$target" ${CARGO_PROFILE_FLAG[@]+"${CARGO_PROFILE_FLAG[@]}"}
-  LIBS+=("$ROOT/target/$target/$PROFILE/$LIB_NAME")
+  cargo build --locked -p macaudit-ffi --target "$target" ${CARGO_PROFILE_FLAG[@]+"${CARGO_PROFILE_FLAG[@]}"}
+  LIBS+=("$TARGET_DIR/$target/$PROFILE/$LIB_NAME")
 done
 
 if [ "${#LIBS[@]}" -gt 1 ]; then

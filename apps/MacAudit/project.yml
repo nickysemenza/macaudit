@@ -8,9 +8,13 @@ options:
     macOS: "14.0"
   xcodeVersion: "16.0"
   createIntermediateGroups: true
+  postGenCommand: 'mkdir -p MacAudit.xcodeproj/project.xcworkspace/xcshareddata/swiftpm && cp Package.resolved MacAudit.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved'
 packages:
   MacAuditKit:
     path: ../../swift/MacAuditKit
+  SnapshotTesting:
+    url: https://github.com/pointfreeco/swift-snapshot-testing
+    exactVersion: 1.19.6
 settings:
   base:
     SWIFT_VERSION: "6.0"
@@ -55,6 +59,10 @@ targets:
         buildPhase: resources
     dependencies:
       - package: MacAuditKit
+      - package: MacAuditKit
+        product: MacAuditNavigation
+      - package: MacAuditKit
+        product: MacAuditCollections
     postBuildScripts:
       - name: Embed git version
         script: '"${SRCROOT}/../../scripts/embed-git-version.sh"'
@@ -83,6 +91,21 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         OTHER_LDFLAGS: ["-liconv", "-lobjc"]
+  MacAuditAppTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: apptests
+    dependencies:
+      - target: MacAudit
+      - package: SnapshotTesting
+        product: SnapshotTesting
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/MacAudit.app/Contents/MacOS/MacAudit"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        PRODUCT_BUNDLE_IDENTIFIER: dev.nickysemenza.macaudit.apptests
 schemes:
   MacAudit:
     build:
@@ -94,3 +117,34 @@ schemes:
         - variable: MACAUDIT_FAKE
           value: "1"
           isEnabled: false
+    test:
+      config: Debug
+      targets:
+        - MacAuditAppTests
+      environmentVariables:
+        MACAUDIT_APP_TESTS: "1"
+        MACAUDIT_FAKE: "1"
+  MacAuditSnapshotReferences:
+    build:
+      targets:
+        MacAudit: all
+    test:
+      config: Debug
+      targets:
+        - MacAuditAppTests
+      environmentVariables:
+        MACAUDIT_APP_TESTS: "1"
+        MACAUDIT_FAKE: "1"
+        MACAUDIT_RECORD_SNAPSHOTS: "1"
+  MacAuditSnapshotValidation:
+    build:
+      targets:
+        MacAudit: all
+    test:
+      config: Debug
+      targets:
+        - MacAuditAppTests
+      environmentVariables:
+        MACAUDIT_APP_TESTS: "1"
+        MACAUDIT_FAKE: "1"
+        MACAUDIT_REQUIRE_SNAPSHOTS: "1"
