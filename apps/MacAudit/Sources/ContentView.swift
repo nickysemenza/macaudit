@@ -1,4 +1,5 @@
 import MacAuditKit
+import MacAuditNavigation
 import SwiftUI
 
 struct ContentView: View {
@@ -10,47 +11,52 @@ struct ContentView: View {
         NavigationSplitView {
             SectionSidebar()
         } detail: {
-            Group {
-                switch store.selectedItem {
-                case .storage:
-                    StorageOverview()
-                        .navigationTitle("Storage")
-                        .navigationSubtitle("\(Formatting.bytes(store.totalReclaimableBytes)) reclaimable across \(store.sections.count) sections")
-                case .projects, .apps:
-                    if let axis = store.selectedItem?.axis, let section = store.selectedItem?.section {
-                        if let owner = store.owners[axis]?.selectedOwner {
-                            OwnerDetailView(axis: axis)
-                                .navigationTitle(owner.title)
-                                .navigationSubtitle(axis.title)
-                        } else {
-                            LensView(axis: axis)
-                                .navigationTitle(axis.title)
-                                .navigationSubtitle(subtitle(for: section))
-                        }
-                    }
-                case .section(let section):
-                    if let meta = store.meta(for: section) {
-                        SectionDetail(meta: meta)
-                            .navigationTitle(meta.title)
-                            .navigationSubtitle(subtitle(for: section))
-                            .searchable(text: $store.searchText, placement: .toolbar, prompt: "Filter \(meta.title)")
-                    }
-                case .folders:
-                    FolderBrowserView()
-                        .navigationTitle("Folders")
-                        .navigationSubtitle(store.browser.current.map { PathDisplay.abbreviateHome($0.path) } ?? "")
-                case nil:
-                    ContentUnavailableView("Pick a section", systemImage: "sidebar.left")
+            VStack(spacing: 0) {
+                if let cancellation = store.scanCancellationStatus {
+                    Text(cancellation).font(.caption).foregroundStyle(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(8)
                 }
-            }
+                Group {
+                    switch store.selectedItem {
+                    case .storage:
+                        StorageOverview()
+                            .navigationTitle("Storage")
+                            .navigationSubtitle("Global Audit · bounded loaded-page sample, not whole-scan totals")
+                    case .projects, .apps:
+                        if let axis = store.selectedItem?.axis, let section = store.selectedItem?.section {
+                            if let owner = store.owners[axis]?.selectedOwner {
+                                OwnerDetailView(axis: axis)
+                                    .navigationTitle(owner.title)
+                                    .navigationSubtitle("\(axis.title) · Global scope, independent of Explore root")
+                            } else {
+                                LensView(axis: axis)
+                                    .navigationTitle(axis.title)
+                                    .navigationSubtitle("Global scope · \(subtitle(for: section))")
+                            }
+                        }
+                    case let .section(section):
+                        if let meta = store.meta(for: section) {
+                            SectionDetail(meta: meta)
+                                .navigationTitle(meta.title)
+                                .navigationSubtitle("\(section == .fs ? "Selected root + Global Audit targets" : "Global Audit") · \(subtitle(for: section))")
+                                .searchable(text: $store.searchText, placement: .toolbar, prompt: "Filter loaded page of \(meta.title)")
+                        }
+                    case .folders:
+                        ExploreView(store: store)
+                            .navigationTitle("Explore")
+                            .navigationSubtitle(store.browser.current.map { PathDisplay.abbreviateHome($0.path) } ?? "")
+                    case nil:
+                        ContentUnavailableView("Pick a section", systemImage: "sidebar.left")
+                    }
+                }
             .navigationSplitViewColumnWidth(min: 360, ideal: 640)
             .stableColumnSize()
+            }
         }
-        .onChange(of: store.selectedItem) { _, _ in store.searchText = "" }
         .inspector(isPresented: $showInspector) {
             Group {
                 if store.selectedItem == .folders {
-                    DirInspector(entry: store.browser.selectedEntry ?? store.browser.current)
+                    ExploreInspector(browser: store.browser)
                 } else if let axis = store.selectedItem?.axis, let browser = store.owners[axis] {
                     if let entry = browser.selectedEntry {
                         EntryInspector(entry: entry, axis: axis)
@@ -68,21 +74,26 @@ struct ContentView: View {
         }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                Menu {
+                    Button("Home") { store.changeRoot("~") }
+                    Button("Boot Volume") { store.changeRoot("/") }
+                    Button("Folder or Path…") { store.sheetRoute = .root }
+                } label: { Label("Explore Root", systemImage: "folder.badge.plus") }
+                    .disabled(!store.canRefresh)
+                Button { store.rescanAll() } label: { Label("Refresh All", systemImage: "arrow.clockwise.circle") }
+                    .disabled(!store.canRefresh)
+                Button { store.cancelScan() } label: { Label("Cancel Scan", systemImage: "stop.circle") }
+                    .disabled(!store.canCancelScan)
                 Button {
-                    if let s = store.selectedSection { store.rescan(s) }
-                } label: {
-                    Label("Rescan Section", systemImage: "arrow.clockwise")
-                }
-                .disabled(store.selectedSection == nil)
-                .help("Rescan this section (⇧⌘R)")
-
-                Button {
-                    if let id = store.selectedFinding { store.toggleMark(id) }
+                    if let id = store.selectedFinding {
+                        store.toggleMark(id)
+                    }
                 } label: {
                     Label(
                         store.selectedFinding.map { store.marked.contains($0) } == true ? "Unmark" : "Mark",
                         systemImage: store.selectedFinding.map { store.marked.contains($0) } == true
-                            ? "checkmark.circle.fill" : "checkmark.circle")
+                            ? "checkmark.circle.fill" : "checkmark.circle"
+                    )
                 }
                 .disabled(store.selectedFinding == nil)
                 .help("Mark the selected finding for cleanup (space)")
@@ -97,7 +108,7 @@ struct ContentView: View {
                     }
                 }
                 .animation(.default, value: store.marked.count)
-                .disabled(store.marked.isEmpty)
+                .disabled(store.marked.isEmpty || !store.canRefresh)
                 .help("Plan and confirm the marked cleanup (⌘X)")
 
                 Button {
@@ -107,13 +118,23 @@ struct ContentView: View {
                 }
             }
         }
-        .sheet(isPresented: Binding(get: { store.pendingSummary != nil }, set: { if !$0 { store.dismissConfirm() } })) {
-            if let summary = store.pendingSummary {
-                ConfirmSheet(summary: summary)
+        .sheet(item: Binding(get: { store.sheetRoute }, set: { route in
+            guard store.cleanup == nil || store.cleanup?.phase == .done || route == .cleanup else { return }
+            store.sheetRoute = route
+        }), id: \.rawValue, onDismiss: {
+            if store.pendingPlan != nil {
+                store.dismissConfirm()
             }
-        }
-        .sheet(isPresented: Binding(get: { store.cleanup != nil }, set: { if !$0 { store.dismissCleanup() } })) {
-            CleanupProgressView()
+            store.dismissCleanup()
+        }) { (route: SheetRoute) in
+            switch route {
+            case .root: RootSheet(store: store)
+            case .confirm:
+                if let summary = store.pendingSummary {
+                    ConfirmSheet(summary: summary)
+                }
+            case .cleanup: CleanupProgressView().interactiveDismissDisabled(store.cleanup?.phase != .done)
+            }
         }
         .alert("Could not plan cleanup", isPresented: Binding(get: { store.planError != nil }, set: { _ in store.clearPlanError() })) {
             Button("OK") {}
@@ -128,17 +149,28 @@ struct ContentView: View {
     private func subtitle(for section: SectionId) -> String {
         switch store.status(of: section) {
         case .idle: return "not scanned"
-        case .scanning(let msg, let done, let total):
+        case let .scanning(msg, done, total):
             var s = "scanning"
-            if let total, total > 0 { s += " \(done)/\(total)" } else if done > 0 { s += " \(done)" }
-            if !msg.isEmpty { s += " — \(msg)" }
+            if let total, total > 0 {
+                s += " \(done)/\(total)"
+            } else if done > 0 {
+                s += " \(done)"
+            }
+            if !msg.isEmpty {
+                s += " — \(msg)"
+            }
             return s
-        case .done(let ms):
+        case let .done(ms):
             let reclaimable = store.reclaimableBytes(in: section)
-            var s = "\(store.count(of: section)) findings in \(Double(ms) / 1000, specifier: "%.1f")s"
-            if reclaimable > 0 { s += " · \(Formatting.bytes(reclaimable)) reclaimable" }
+            var s = "\(store.count(of: section)) loaded findings"
+            if let ms {
+                s += " in \(Double(ms) / 1000, specifier: "%.1f")s"
+            }
+            if reclaimable > 0 {
+                s += " · \(Formatting.bytes(reclaimable)) reclaimable"
+            }
             return s
-        case .failed(let error): return "failed: \(error)"
+        case let .failed(error): return "failed: \(error)"
         }
     }
 }

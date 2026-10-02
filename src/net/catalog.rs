@@ -1,27 +1,20 @@
-//! The Homebrew cask catalog (`formulae.brew.sh/api/cask.json`), cached to disk
-//! and used to match Unmanaged apps to an available cask (spec M7).
-//!
-//! Every failure mode degrades to `None` — a missing/corrupt cache, a transport
-//! error, an unparseable body, or offline with no cache all just mean "no
-//! catalog", never an error that fails the scan. When online and the cache is
-//! stale we revalidate with `If-None-Match` so a 304 costs nothing but a bumped
-//! timestamp.
+//! The Homebrew cask catalog held only in the owning run's memory.
+//! Legacy cache files are never read, created, or modified.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{NetworkConfig, Paths};
+use crate::inventory::{MemoryBudget, Reservation};
 use crate::net::HttpFetcher;
 
 const CASK_URL: &str = "https://formulae.brew.sh/api/cask.json";
-const BODY_FILE: &str = "cask.json";
-const META_FILE: &str = "cask.json.meta";
 
 /// One cask distilled to just what matching needs.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CatalogCask {
     pub token: String,
     /// Human names (`name` array in the API).
@@ -42,6 +35,12 @@ pub struct CatalogCask {
 /// ships distinct casks sharing an `.app` filename: beta/variant families).
 #[derive(Clone, Debug)]
 pub struct CaskCatalog {
+    data: Arc<CatalogData>,
+    budget: Arc<MemoryBudget>,
+}
+
+#[derive(Debug)]
+struct CatalogData {
     casks: Vec<CatalogCask>,
     /// lowercased bundle id → cask index (`None` = ambiguous, poisoned)
     bundle_index: HashMap<String, Option<usize>>,
@@ -49,6 +48,7 @@ pub struct CaskCatalog {
     app_index: HashMap<String, Option<usize>>,
     /// normalized name/token → cask index (`None` = ambiguous, poisoned)
     name_index: HashMap<String, Option<usize>>,
+    _memory: Reservation,
 }
 
 /// Insert a key claiming `idx`, poisoning the slot if a different cask already
@@ -74,22 +74,29 @@ impl CaskCatalog {
         display_name: &str,
         bundle_id: Option<&str>,
     ) -> Option<(&CatalogCask, &'static str)> {
+        let bytes = app_file_name
+            .len()
+            .checked_add(display_name.len())?
+            .checked_add(bundle_id.map(str::len).unwrap_or(0))?
+            .checked_mul(12)?
+            .checked_add(128)?;
+        let _scratch = self.budget.reserve(bytes).ok()?;
         if let Some(bid) = bundle_id {
             let key = bid.to_lowercase();
-            if let Some(Some(idx)) = self.bundle_index.get(&key) {
-                return Some((&self.casks[*idx], "bundle_id"));
+            if let Some(Some(idx)) = self.data.bundle_index.get(&key) {
+                return Some((&self.data.casks[*idx], "bundle_id"));
             }
         }
         let app_key = app_file_name.to_lowercase();
         if !app_key.is_empty() {
-            if let Some(Some(idx)) = self.app_index.get(&app_key) {
-                return Some((&self.casks[*idx], "app_name"));
+            if let Some(Some(idx)) = self.data.app_index.get(&app_key) {
+                return Some((&self.data.casks[*idx], "app_name"));
             }
         }
         let name_key = normalize(display_name);
         if !name_key.is_empty() {
-            if let Some(Some(idx)) = self.name_index.get(&name_key) {
-                return Some((&self.casks[*idx], "name"));
+            if let Some(Some(idx)) = self.data.name_index.get(&name_key) {
+                return Some((&self.data.casks[*idx], "name"));
             }
         }
         None
@@ -97,14 +104,14 @@ impl CaskCatalog {
 
     /// Number of casks retained (post-filter). Used in tests.
     pub fn len(&self) -> usize {
-        self.casks.len()
+        self.data.casks.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.casks.is_empty()
+        self.data.casks.is_empty()
     }
 
-    fn from_casks(casks: Vec<CatalogCask>) -> Self {
+    fn from_casks(casks: Vec<CatalogCask>, memory: Reservation, budget: Arc<MemoryBudget>) -> Self {
         let mut bundle_index: HashMap<String, Option<usize>> = HashMap::new();
         let mut app_index: HashMap<String, Option<usize>> = HashMap::new();
         let mut name_index: HashMap<String, Option<usize>> = HashMap::new();
@@ -115,9 +122,8 @@ impl CaskCatalog {
             for app in &cask.app_names {
                 claim(&mut app_index, app.to_lowercase(), idx);
             }
-            let mut keys: Vec<String> = cask.names.iter().map(|n| normalize(n)).collect();
-            keys.push(normalize(&cask.token));
-            for key in keys {
+            for name in cask.names.iter().chain(std::iter::once(&cask.token)) {
+                let key = normalize(name);
                 if key.is_empty() {
                     continue;
                 }
@@ -125,10 +131,14 @@ impl CaskCatalog {
             }
         }
         CaskCatalog {
-            casks,
-            bundle_index,
-            app_index,
-            name_index,
+            data: Arc::new(CatalogData {
+                casks,
+                bundle_index,
+                app_index,
+                name_index,
+                _memory: memory,
+            }),
+            budget,
         }
     }
 }
@@ -142,91 +152,36 @@ fn normalize(s: &str) -> String {
     stripped.chars().filter(|c| c.is_alphanumeric()).collect()
 }
 
-/// Load the catalog: fresh cache served with zero network; stale cache
-/// revalidated online; offline serves any cache (even stale) or `None`.
+/// Fetch the catalog at most once per run, sharing the parsed result in memory.
+/// Offline, cancellation and failures never consult a persistent cache.
 pub async fn load(
     fetcher: Option<&dyn HttpFetcher>,
     paths: &Paths,
     cfg: &NetworkConfig,
     token: &CancellationToken,
 ) -> Option<CaskCatalog> {
-    let body_path = paths.cache_dir.join(BODY_FILE);
-    let meta_path = paths.cache_dir.join(META_FILE);
-    let now = now_secs();
-    let max_age = cfg.catalog_max_age_days.saturating_mul(86_400);
-
-    // Any read/parse failure is a cache miss.
-    let cached = read_cache(&body_path, &meta_path);
-
-    // Fresh enough → serve without touching the network.
-    if let Some((catalog, meta)) = &cached {
-        if now.saturating_sub(meta.fetched_at) < max_age {
-            return Some(catalog.clone());
-        }
+    if cfg.offline || token.is_cancelled() {
+        return None;
     }
-
-    // Offline: whatever we have (even stale), or nothing.
-    let Some(fetcher) = fetcher else {
-        return cached.map(|(c, _)| c);
+    let mut cached = tokio::select! {
+        biased;
+        _ = token.cancelled() => return None,
+        cached = paths.catalog_cache.as_ref()?.value.lock() => cached,
     };
-    if token.is_cancelled() {
-        return cached.map(|(c, _)| c);
-    }
-
-    let etag = cached.as_ref().and_then(|(_, m)| m.etag.clone());
-    match fetcher.get(CASK_URL, etag.as_deref(), token).await {
-        Ok(resp) if resp.not_modified() => {
-            // Cache is still current: bump fetched_at, serve it.
-            match cached {
-                Some((catalog, meta)) => {
-                    write_meta(
-                        &meta_path,
-                        &CacheMeta {
-                            etag: meta.etag,
-                            fetched_at: now,
-                        },
-                    );
-                    Some(catalog)
-                }
-                None => None,
-            }
+    if let Some(catalog) = cached.as_ref() {
+        let catalog = catalog.clone();
+        if paths.size_cache.memory_budget().reserve(4096).is_err() {
+            cached.take();
         }
-        Ok(resp) if resp.ok() => match parse_catalog(&resp.body) {
-            Some(catalog) => {
-                // Body first, then meta, so a crash never leaves meta pointing
-                // at a body that isn't there yet.
-                write_body(&body_path, &resp.body);
-                write_meta(
-                    &meta_path,
-                    &CacheMeta {
-                        etag: resp.etag.clone(),
-                        fetched_at: now,
-                    },
-                );
-                Some(catalog)
-            }
-            None => cached.map(|(c, _)| c),
-        },
-        // Transport error or any other status: serve stale cache if we have one.
-        _ => cached.map(|(c, _)| c),
+        return Some(catalog);
     }
-}
-
-/// On-disk sidecar next to the cached body.
-#[derive(Serialize, Deserialize, Default)]
-struct CacheMeta {
-    #[serde(default)]
-    etag: Option<String>,
-    #[serde(default)]
-    fetched_at: u64,
-}
-
-fn read_cache(body_path: &Path, meta_path: &Path) -> Option<(CaskCatalog, CacheMeta)> {
-    let body = std::fs::read(body_path).ok()?;
-    let meta_str = std::fs::read_to_string(meta_path).ok()?;
-    let meta: CacheMeta = serde_json::from_str(&meta_str).ok()?;
-    let catalog = parse_catalog(&body)?;
-    Some((catalog, meta))
+    let response = fetcher?.get(CASK_URL, None, token).await.ok()?;
+    if !response.ok() || token.is_cancelled() {
+        return None;
+    }
+    let catalog = parse_catalog_with_budget(&response.body, paths.size_cache.memory_budget())?;
+    *cached = Some(catalog.clone());
+    Some(catalog)
 }
 
 /// Raw cask shape, lenient: unknown fields ignored, everything defaulted.
@@ -241,7 +196,13 @@ struct RawCask {
     artifacts: Vec<serde_json::Value>,
 }
 
+#[cfg(test)]
 fn parse_catalog(body: &[u8]) -> Option<CaskCatalog> {
+    parse_catalog_with_budget(body, MemoryBudget::shared())
+}
+
+fn parse_catalog_with_budget(body: &[u8], budget: Arc<MemoryBudget>) -> Option<CaskCatalog> {
+    let memory = super::reserve_json(&budget, body)?;
     let raws: Vec<RawCask> = serde_json::from_slice(body).ok()?;
     let mut casks = Vec::with_capacity(raws.len());
     for raw in raws {
@@ -257,7 +218,7 @@ fn parse_catalog(body: &[u8]) -> Option<CaskCatalog> {
             bundle_ids,
         });
     }
-    Some(CaskCatalog::from_casks(casks))
+    Some(CaskCatalog::from_casks(casks, memory, budget))
 }
 
 /// Walk the `artifacts` array defensively: `app:` arrays yield app file names;
@@ -310,38 +271,6 @@ fn collect_quit(v: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
-fn write_body(path: &Path, bytes: &[u8]) {
-    write_atomic(path, bytes);
-}
-
-fn write_meta(path: &Path, meta: &CacheMeta) {
-    if let Ok(bytes) = serde_json::to_vec(meta) {
-        write_atomic(path, &bytes);
-    }
-}
-
-/// Write via a process-unique sibling `.tmp` then rename, so readers never see
-/// a partial file and two concurrent enrichment tasks can't tear each other's
-/// tmp file. Best-effort: any error is swallowed (caching is a nicety).
-fn write_atomic(path: &Path, bytes: &[u8]) {
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(format!(".tmp.{}", std::process::id()));
-    let tmp = PathBuf::from(tmp);
-    if std::fs::write(&tmp, bytes).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    }
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +315,59 @@ mod tests {
 
     fn catalog() -> CaskCatalog {
         parse_catalog(FIXTURE.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn catalog_clones_share_budgeted_data_and_release_on_last_drop() {
+        let budget = MemoryBudget::new(1024 * 1024);
+        let catalog = parse_catalog_with_budget(FIXTURE.as_bytes(), budget.clone()).unwrap();
+        let used = budget.used();
+        assert!(used > 0);
+        let cloned = catalog.clone();
+        assert!(Arc::ptr_eq(&catalog.data, &cloned.data));
+        assert_eq!(budget.used(), used);
+        drop(catalog);
+        assert_eq!(budget.used(), used);
+        drop(cloned);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn catalog_budget_denial_and_malformed_json_release_all_charges() {
+        let tiny = MemoryBudget::new(32);
+        assert!(parse_catalog_with_budget(FIXTURE.as_bytes(), tiny.clone()).is_none());
+        assert_eq!(tiny.used(), 0);
+        let budget = MemoryBudget::new(1024 * 1024);
+        assert!(parse_catalog_with_budget(br#"[{"token":"bad""#, budget.clone()).is_none());
+        assert_eq!(budget.used(), 0);
+        assert!(budget.peak() <= budget.limit());
+    }
+
+    #[tokio::test]
+    async fn catalog_retention_is_evicted_under_shared_pressure() {
+        let budget = MemoryBudget::new(1024 * 1024);
+        let paths = Paths::with_memory_budget("/unused", budget.clone());
+        let fetcher = MockHttpFetcher::new().on(CASK_URL, 200, None, CACHE_BODY);
+        let token = CancellationToken::new();
+        let cfg = NetworkConfig::default();
+        let first = load(Some(&fetcher), &paths, &cfg, &token).await.unwrap();
+        let pressure = budget.reserve(budget.limit() - budget.used()).unwrap();
+        let second = load(Some(&fetcher), &paths, &cfg, &token).await.unwrap();
+        assert!(Arc::ptr_eq(&first.data, &second.data));
+        assert!(paths
+            .catalog_cache
+            .as_ref()
+            .unwrap()
+            .value
+            .lock()
+            .await
+            .is_none());
+        drop(first);
+        assert!(budget.used() > pressure.bytes());
+        drop(second);
+        drop(pressure);
+        drop(paths);
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]
@@ -496,136 +478,118 @@ mod tests {
         );
     }
 
-    // ---- cache behavior ----
-
     const CACHE_BODY: &str = r#"[{"token":"slack","name":["Slack"],
         "artifacts":[{"app":["Slack.app"]}]}]"#;
 
-    fn paths(home: &Path) -> Paths {
-        Paths::from_home(home)
-    }
-
-    fn seed_cache(p: &Paths, body: &str, etag: Option<&str>, fetched_at: u64) {
-        let dir = &p.cache_dir;
-        std::fs::create_dir_all(dir).unwrap();
-        std::fs::write(dir.join(BODY_FILE), body).unwrap();
-        let meta = serde_json::json!({ "etag": etag, "fetched_at": fetched_at });
-        std::fs::write(dir.join(META_FILE), meta.to_string()).unwrap();
-    }
-
-    fn read_meta(p: &Paths) -> CacheMeta {
-        let s = std::fs::read_to_string(p.cache_dir.join(META_FILE)).unwrap();
-        serde_json::from_str(&s).unwrap()
-    }
-
-    #[tokio::test]
-    async fn fresh_cache_serves_without_network() {
-        let tmp = tempfile::tempdir().unwrap();
-        let p = paths(tmp.path());
-        seed_cache(&p, CACHE_BODY, Some("v1"), now_secs());
-        let fetcher = MockHttpFetcher::new(); // no responses registered
-        let cfg = NetworkConfig::default();
-        let cat = load(Some(&fetcher), &p, &cfg, &CancellationToken::new())
-            .await
-            .unwrap();
-        assert_eq!(cat.len(), 1);
-        assert!(fetcher.calls().is_empty());
+    fn seed_legacy_files(paths: &Paths) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        std::fs::create_dir_all(&paths.cache_dir).unwrap();
+        [
+            ("cask.json", CACHE_BODY),
+            (
+                "cask.json.meta",
+                r#"{"etag":"legacy","fetched_at":18446744073709551615}"#,
+            ),
+            ("cask.json.tmp", "existing temporary artifact"),
+        ]
+        .into_iter()
+        .map(|(name, contents)| {
+            let file = paths.cache_dir.join(name);
+            std::fs::write(&file, contents).unwrap();
+            (file, contents.as_bytes().to_vec())
+        })
+        .collect()
     }
 
     #[tokio::test]
-    async fn stale_cache_revalidates_and_304_refreshes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let p = paths(tmp.path());
-        let old = now_secs() - 30 * 86_400;
-        seed_cache(&p, CACHE_BODY, Some("etag-abc"), old);
-        let fetcher = MockHttpFetcher::new().on(CASK_URL, 304, None, "");
-        let cfg = NetworkConfig::default();
-        let cat = load(Some(&fetcher), &p, &cfg, &CancellationToken::new())
-            .await
-            .unwrap();
-        assert_eq!(cat.len(), 1);
-        // GET carried If-None-Match with the stored etag.
-        assert_eq!(
-            fetcher.calls(),
-            vec![(CASK_URL.to_string(), Some("etag-abc".to_string()))]
-        );
-        // fetched_at bumped; etag preserved.
-        let meta = read_meta(&p);
-        assert!(meta.fetched_at > old);
-        assert_eq!(meta.etag.as_deref(), Some("etag-abc"));
-    }
-
-    #[tokio::test]
-    async fn stale_cache_200_rewrites_body_and_meta() {
-        let tmp = tempfile::tempdir().unwrap();
-        let p = paths(tmp.path());
-        seed_cache(&p, CACHE_BODY, Some("old"), now_secs() - 30 * 86_400);
-        let new_body = r#"[{"token":"newcask","name":["NewCask"],
-            "artifacts":[{"app":["NewCask.app"]}]}]"#;
-        let fetcher = MockHttpFetcher::new().on(CASK_URL, 200, Some("new-etag"), new_body);
-        let cfg = NetworkConfig::default();
-        let cat = load(Some(&fetcher), &p, &cfg, &CancellationToken::new())
-            .await
-            .unwrap();
-        // Served the NEW body.
-        let (m, _) = cat.match_app("NewCask.app", "NewCask", None).unwrap();
-        assert_eq!(m.token, "newcask");
-        // Body + meta rewritten on disk.
-        let on_disk = std::fs::read_to_string(p.cache_dir.join(BODY_FILE)).unwrap();
-        assert!(on_disk.contains("newcask"));
-        assert_eq!(read_meta(&p).etag.as_deref(), Some("new-etag"));
-    }
-
-    #[tokio::test]
-    async fn corrupt_meta_forces_refetch_without_etag() {
-        let tmp = tempfile::tempdir().unwrap();
-        let p = paths(tmp.path());
-        std::fs::create_dir_all(&p.cache_dir).unwrap();
-        std::fs::write(p.cache_dir.join(BODY_FILE), CACHE_BODY).unwrap();
-        std::fs::write(p.cache_dir.join(META_FILE), "}{ not json").unwrap();
-        let fetcher = MockHttpFetcher::new().on(CASK_URL, 200, Some("e"), CACHE_BODY);
-        let cfg = NetworkConfig::default();
-        let cat = load(Some(&fetcher), &p, &cfg, &CancellationToken::new())
-            .await
-            .unwrap();
-        assert_eq!(cat.len(), 1);
-        // No usable cache ⇒ no If-None-Match.
+    async fn legacy_files_are_ignored_and_untouched() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(home.path());
+        let legacy = seed_legacy_files(&paths);
+        let body = CACHE_BODY.replace("slack", "new");
+        let fetcher = MockHttpFetcher::new().on(CASK_URL, 200, Some("new-etag"), &body);
+        let catalog = load(
+            Some(&fetcher),
+            &paths,
+            &NetworkConfig::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(catalog.data.casks[0].token, "new");
         assert_eq!(fetcher.calls(), vec![(CASK_URL.to_string(), None)]);
+        for (file, contents) in legacy {
+            assert_eq!(std::fs::read(file).unwrap(), contents);
+        }
+        assert_eq!(std::fs::read_dir(&paths.cache_dir).unwrap().count(), 3);
     }
 
     #[tokio::test]
-    async fn offline_serves_stale_cache() {
-        let tmp = tempfile::tempdir().unwrap();
-        let p = paths(tmp.path());
-        seed_cache(&p, CACHE_BODY, Some("v1"), now_secs() - 90 * 86_400);
+    async fn catalog_is_shared_in_memory_and_isolated_between_runs() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(home.path());
+        let fetcher = MockHttpFetcher::new().on(CASK_URL, 200, None, CACHE_BODY);
         let cfg = NetworkConfig::default();
-        let cat = load(None, &p, &cfg, &CancellationToken::new())
-            .await
-            .unwrap();
-        assert_eq!(cat.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn offline_no_cache_is_none() {
-        let tmp = tempfile::tempdir().unwrap();
-        let p = paths(tmp.path());
-        let cfg = NetworkConfig::default();
-        assert!(load(None, &p, &cfg, &CancellationToken::new())
+        for _ in 0..2 {
+            assert_eq!(
+                load(
+                    Some(&fetcher),
+                    &paths.clone(),
+                    &cfg,
+                    &CancellationToken::new()
+                )
+                .await
+                .unwrap()
+                .len(),
+                1
+            );
+        }
+        assert_eq!(fetcher.calls().len(), 1);
+        let next_run = paths.with_fresh_measurements();
+        assert!(load(None, &next_run, &cfg, &CancellationToken::new())
             .await
             .is_none());
+        assert!(!paths.cache_dir.exists());
     }
 
     #[tokio::test]
-    async fn transport_error_serves_stale_cache() {
-        let tmp = tempfile::tempdir().unwrap();
-        let p = paths(tmp.path());
-        seed_cache(&p, CACHE_BODY, Some("v1"), now_secs() - 30 * 86_400);
-        let fetcher = MockHttpFetcher::new().on_err(CASK_URL);
+    async fn offline_cancellation_and_failures_never_serve_legacy_cache() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(home.path());
+        let legacy = seed_legacy_files(&paths);
         let cfg = NetworkConfig::default();
-        let cat = load(Some(&fetcher), &p, &cfg, &CancellationToken::new())
+        let offline = NetworkConfig {
+            offline: true,
+            ..cfg.clone()
+        };
+        let fetcher = MockHttpFetcher::new().on(CASK_URL, 200, None, CACHE_BODY);
+        assert!(
+            load(Some(&fetcher), &paths, &offline, &CancellationToken::new())
+                .await
+                .is_none()
+        );
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(load(Some(&fetcher), &paths, &cfg, &cancelled)
             .await
-            .unwrap();
-        assert_eq!(cat.len(), 1);
-        assert_eq!(fetcher.calls().len(), 1);
+            .is_none());
+        assert!(load(None, &paths, &cfg, &CancellationToken::new())
+            .await
+            .is_none());
+        assert!(fetcher.calls().is_empty());
+        for failing in [
+            MockHttpFetcher::new().on_err(CASK_URL),
+            MockHttpFetcher::new().on(CASK_URL, 304, None, ""),
+            MockHttpFetcher::new().on(CASK_URL, 200, None, "not json"),
+            MockHttpFetcher::new().on(CASK_URL, 500, None, CACHE_BODY),
+        ] {
+            assert!(
+                load(Some(&failing), &paths, &cfg, &CancellationToken::new())
+                    .await
+                    .is_none()
+            );
+        }
+        for (file, contents) in legacy {
+            assert_eq!(std::fs::read(file).unwrap(), contents);
+        }
     }
 }

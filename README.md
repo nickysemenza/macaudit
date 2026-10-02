@@ -1,7 +1,27 @@
 # macaudit
 
-A "why is my Mac like this" TUI — audits apps, disk hogs, daemons, and
-dev-environment sprawl, with safe, explicit remediation.
+A native macOS disk explorer, CLI and TUI for understanding disk allocation
+and global developer-environment audits, with safe, explicit remediation.
+
+## One root, one ephemeral run
+
+The app opens **Explore** with Home selected. Choose Home, Boot Volume or any
+folder (including `~/cf-repos`) using the root picker or path field. Explore
+combines a treemap, native table and inspector. **Audit** retains the global
+machine-wide sections; their totals do not use the selected root as a denominator.
+
+Changing root or refreshing restarts the entire run and clears old results.
+Cancel keeps incomplete results from the current run. Folder file listings are
+live observations, not an atomic snapshot or replacements for scanned totals.
+The treemap accounts for omitted entries in explicit Other buckets.
+Whole-root filename search matches names and relative paths without reading file
+contents, retains at most 1,000 results, and labels live file observations
+separately from scanned directory totals. Outside-root audit links reveal their
+location in Finder rather than silently changing the selected root.
+
+No scans, indexes, measurement caches, cleanup reports, preferences or navigation
+are saved between launches. Existing legacy files are left untouched and unused.
+Configuration is optional, explicit and read-only: pass `--config FILE`.
 
 <!-- screenshot placeholder -->
 
@@ -36,8 +56,8 @@ dev-environment sprawl, with safe, explicit remediation.
 - **Developer-tool audit.** Every global installation across npm, pnpm
   (current *and* legacy layouts), cargo, pipx, uv, pip site-packages and bun,
   with the manager that owns it, the launchers it exports, which copy your
-  *login shell* actually runs (fish/zsh/bash) versus what MacAudit's own
-  process sees, whether a project already pins its own copy, and an
+  inherited process `PATH` resolves (without executing user rc files),
+  whether a project already pins its own copy, and an
   evidence-ranked classification (broken / duplicate / shadowed /
   project-alternative / required / orphan / review). See
   [Global tools](#global-tools) below.
@@ -49,8 +69,8 @@ dev-environment sprawl, with safe, explicit remediation.
   `autoremove` candidates.
 - **Ownership-aware cleanup.** Marked removals are re-checked against a
   fresh scan right before they run, executed dependents-first with
-  manager-native commands, verified afterwards, and written to a JSON audit
-  report. See [Cleanup workflow](#cleanup-workflow).
+  manager-native commands and verified afterwards. Results stay in memory.
+  See [Cleanup workflow](#cleanup-workflow).
 - **Streaming, parallel scans.** Scanners run concurrently as async tasks
   (or in a blocking pool for the filesystem walk) and stream findings into
   the UI as they're discovered — nothing waits for the slowest scanner.
@@ -67,15 +87,16 @@ packages touched, no settings changed. Honest fine print on what a scan
 
 - **Read-only inspection commands are executed** (`system_profiler`, `brew`,
   `git status`, `lsof`, `tmutil`, `defaults export`, `diskutil`, `osascript`,
-  …). Worth knowing about: `brew` is always run with
-  `HOMEBREW_NO_AUTO_UPDATE=1` so it can't trigger Homebrew's auto-update
-  (`brew autoremove --dry-run` is read-only), and the Shell and Global Tools
-  sections start your *login shell* (fish, zsh or bash, found via directory
-  services) to read its real `$PATH` and measure startup time — which, by
-  definition, executes your own shell configuration files. No rc file is
-  ever read or displayed. The Global Tools scan otherwise reads manager
-  metadata from disk only (optionally `npm prefix -g`): it never executes
-  the tools it finds and never imports Python modules. The Time Machine
+  …). Every `brew` subprocess receives `HOMEBREW_NO_AUTO_UPDATE=1` and
+  `HOMEBREW_NO_BOOTSNAP=1`, preventing automatic updates and Bootsnap cache
+  writes (`brew autoremove --dry-run` is read-only). Git scans disable
+  optional locks so status does not refresh the index on disk. Shell and
+  Global Tools use inherited process `PATH` and filesystem discovery: no
+  automatic login/interactive shell startup, user rc execution, startup
+  timing, or `npm prefix -g` probes. Explicit npm prefixes remain supported.
+  Discovered tools are never executed and Python modules are never imported.
+  Optional shell-history evidence only reads and aggregates existing files.
+  The Time Machine
   section only ever queries `tmutil` (`listlocalsnapshots`,
   `destinationinfo`, `isexcluded`) and reads Time Machine's own preferences
   via `defaults export` (backed by `cfprefsd`, not direct file access) and
@@ -100,9 +121,8 @@ packages touched, no settings changed. Honest fine print on what a scan
   when you ask (`macaudit tools verify`, or the `Verify` alternative remedy
   on a tool), and after a cleanup for retained tools related to the batch —
   each capped by count and timeout, and always shown as a command.
-- **macaudit writes its own state**: the size cache and cleanup reports
-  (`~/.local/state/macaudit`), and the catalog cache
-  (`~/Library/Caches/macaudit`). Never anything outside its own directories.
+- **MacAudit is stateless:** runtime measurements, network responses and cleanup
+  results stay in memory. Old cache and report directories are not read or touched.
 - **Nothing runs unseen.** Every remedy — delete, `brew upgrade`, `docker
   builder prune`, whatever — is rendered as a literal command string and
   shown to you (in the detail pane, and again in the confirm dialog) before
@@ -121,9 +141,9 @@ packages touched, no settings changed. Honest fine print on what a scan
   versions are recorded in the report for manual reinstall guidance only.
 - **Network access is on by default, narrow, and easy to disable.** The only
   endpoints ever contacted are `formulae.brew.sh` (Homebrew cask catalog)
-  and `api.github.com` (release checks), both cached to disk so repeated
-  scans don't re-fetch. Run with `--offline` (or set `[network] offline =
-  true`) to guarantee zero HTTP — cached catalog data still works offline.
+  and `api.github.com` (release checks), with memory-only reuse within a run.
+  Run with `--offline` (or set `[network] offline = true` in an explicitly
+  supplied configuration) to disable HTTP. No persisted catalog is read offline.
 
 ## Install
 
@@ -146,6 +166,10 @@ runs without a Gatekeeper "killed" — no right-click → Open dance.
 ```sh
 cargo install --path .
 ```
+
+Build, CI and packaging helpers use Rust (`cargo devtools`), not Python.
+Dependency verification and third-party license collection are development-only;
+the helper is not included in the shipping app or CLI.
 
 ### MacAudit.app (SwiftUI)
 
@@ -183,8 +207,10 @@ requires it. Local builds are signed with an Apple Development certificate
 grants on the signing identity, and an ad-hoc signature changes with every
 rebuild, so it would re-prompt each time. Because a Finder-launched app
 inherits launchd's
-minimal `PATH`, the engine adopts the login shell's `PATH` at startup (the
-same disclosure as the Shell scanner: this starts your shell once). Mail,
+minimal `PATH`, command resolution reflects that inherited environment;
+startup does not launch a login shell or execute user rc files. Tools are
+also discovered from filesystem metadata and explicit prefixes, without
+`npm prefix -g` probes. Mail,
 Messages, Safari and Time Machine data need **Full Disk Access** granted to
 MacAudit.app in System Settings; without it those subtrees are skipped.
 
@@ -192,8 +218,10 @@ MacAudit.app in System Settings; without it those subtrees are skipped.
 
 ```sh
 macaudit                              # launch the TUI (default)
+macaudit --root ~/cf-repos            # explore one folder; global audits remain separate
+macaudit --root / scan --json         # boot-volume allocation + global audit contexts
 macaudit scan --json                  # machine-readable scan, for scripts
-macaudit scan --section apps,disk     # restrict to specific sections
+macaudit scan --section apps,disk     # filter output; the shared run still includes all audits
 macaudit footprints --axis projects   # per-project attribution with every entry; --axis apps, --json
 macaudit clean --dry-run              # print remedy commands, run nothing
 macaudit clean --dry-run --select wget,npm:/opt/homebrew/lib/node_modules:eslint
@@ -203,14 +231,15 @@ macaudit tools --class broken,duplicate,shadowed --json
 macaudit tools verify                 # explicit, bounded `--version` probes of every tool launcher
 macaudit brew why python@3.14         # why is it installed — who needs it, up to the roots you asked for
 macaudit brew deps wget               # what does it need (direct, then transitive)
-macaudit config path                  # print the config file path
-macaudit config edit                  # open the config file in $EDITOR
+macaudit --config ./audit.toml scan   # explicit read-only configuration input
 ```
 
 Global flags (apply to every subcommand and the TUI):
 
 | Flag | Effect |
 |---|---|
+| `--root PATH` | One disk root; default Home. `~` expands; CLI relative paths use the working directory. |
+| `--config FILE` | Read only this explicit file; no automatic config discovery. |
 | `--rm` | Delete for real (`rm -rf`) instead of moving to Trash. |
 | `--offline` | Disable all network access. |
 | `--fake` | Use synthetic findings instead of real scanners (for demos/testing). |
@@ -235,9 +264,8 @@ keys always switch sections, and row-movement keys always move rows.
 | `e` | Cycle which remedy the row will run (e.g. launcher-only removal, `--version` probe) and mark it |
 | `v` | Preview the marked batch: refusals, Homebrew impact, what stays, follow-ups |
 | `x` | Execute marked remedies (confirm dialog; every target is re-checked before running) |
-| `c` | Reopen the last cleanup report |
-| `r` | Refresh current section's point-in-time sample |
-| `R` | Refresh all sections |
+| `c` | Inspect this session's latest cleanup result |
+| `r` / `R` | Refresh the entire run |
 | `/` | Filter by substring (`esc` clears) |
 | `s` | Cycle sort (size / name / severity) |
 | `H` | Toggle System apps visibility |
@@ -266,18 +294,14 @@ Cleanup and Report overlays swallow it.
 
 ## Configuration
 
-`~/.config/macaudit/config.toml` — all fields optional; a missing or partial
-file falls back to these defaults:
+Pass `--config FILE` to read an existing TOML file. No implicit file is loaded
+or created. All supported fields are optional; the selected root comes from
+`--root`, not a multi-root configuration.
 
 ```toml
 [scan]
-roots = []                       # Disk walk roots; empty -> ["/"] (whole boot volume); ["~"] for home only
 ignore = []                      # paths to never descend into (tilde-expanded)
 large_file_threshold_gb = 1.0    # loose files larger than this are flagged
-# Applies to git worktree, Homebrew keg and Time Machine backup-set estimate
-# sizing only — the Disk section's single getattrlistbulk walk is never
-# cached, so this TTL has no effect on it.
-size_cache_ttl_hours = 24        # how long a cached artifact size stays fresh
 
 [artifacts]
 # user-extensible artifact-dir rules: a directory name plus a required
@@ -292,9 +316,7 @@ stale_after_days = 90            # threshold for the staleness badge
 
 [network]
 offline = false                  # disable all network access (overridden by --offline)
-catalog_max_age_days = 7         # refresh the Homebrew cask catalog at most this often
 github_max_checks_per_scan = 10  # max GitHub release lookups per scan
-github_cache_ttl_hours = 72      # how long a cached GitHub release result stays fresh
 
 [tools]
 shell_history_evidence = false   # opt in: per-command counts + last-used dates only, never raw history
@@ -304,7 +326,6 @@ project_time_budget_secs = 10    # correlation stops (and says so) past this
 verify_after_cleanup = true      # bounded --version probes of retained tools related to a batch
 verify_limit = 25
 verify_timeout_secs = 5
-write_cleanup_reports = true     # JSON audit trail under ~/.local/state/macaudit/cleanup-reports/
 extra_npm_prefixes = []          # besides Homebrew, /usr/local, ~/.npm-global and version-manager nodes
 pnpm_home = "~/Library/pnpm"
 cargo_home = "~/.cargo"
@@ -323,12 +344,12 @@ include_apple_python = true      # /Library/Python sites: inventory only, never 
 | Resource Health | Manual CPU load, memory pressure/compression, swap, and current high-CPU/RAM processes. Root Disk explicitly distinguishes raw APFS free space from macOS available capacity, which includes purgeable space. It names the count of local Time Machine snapshots, but does not invent a byte size for them: macOS does not report a reliable per-snapshot or aggregate total. It is a point-in-time view, not a background monitor. |
 | Apps | Installed applications, classified System / User / cask-managed / App Store / Unmanaged, with arch (Intel/Rosetta) and code-signing info. |
 | Brew | Installed formulae and casks as an origin-grouped dependency explorer (explicitly installed / installed as dependency / unknown origin / autoremove candidates / casks) built from `brew info --json=v2 --installed` install receipts; `d` flips between *needs* and *needed by*, direct and transitive rows are distinguished, cask `depends_on` and `binary` artifacts are included. Origin comes from Homebrew's `installed_on_request` flag — a leaf is never assumed to be user-requested or unneeded; `brew autoremove --dry-run` provides the confirmed-orphan signal. Uninstall remedies exist only for packages nothing installed still needs (never `--ignore-dependencies`); outdated packages keep `brew upgrade`. |
-| Global Tools | Every installation by npm, pnpm (hashed `global/v<N>` and legacy `global/<N>` layouts), cargo, pipx, uv, pip (Homebrew, Apple and user site-packages) and bun, keyed by manager + install root + package so two copies stay distinct and stable across scans. Per installation: version (or `unknown`), interpreter/runtime and whether it still exists, exported commands, launchers and their targets, resolution in your login shell vs this process, ownership, project evidence, and a classification. Includes one row per command name (shell vs process resolution with every PATH candidate and its owner) and a coverage row per manager. |
-| Disk | Build artifacts (`node_modules`, `target`, `.venv`, etc.), package-manager caches, and large loose files found by a single `getattrlistbulk`-based parallel filesystem walk of the whole boot volume (mount points are never crossed; `[scan] roots = ["~"]` limits it to the home directory), plus allocation categories measured exactly off that same walk rather than estimated: the home directory's (Development, Documents, Caches, Application Support, Package caches, …) and the system's (Applications, macOS, System Library, System data). Only the home directory — or a configured root that is not one of its ancestors — is mined for artifacts, repositories and loose large files; `/System`, `/Applications`, `/Library`, `/private` and other accounts are sized for the categories and the folder browser but never classified (Homebrew's taps are repositories, system frameworks contain `node_modules`). Unreadable folders are counted and surfaced as a coverage note on the affected category rather than silently under-reporting — TCC-protected user data (Mail, Messages, Safari, … without Full Disk Access) with a Full Disk Access hint, root-owned system folders as exactly that; a category is flagged for attention only once enough of it is unreadable to matter. A "Largest files" group lists the top 25 files on the scanned roots regardless of the size threshold, Reveal-in-Finder only — context for where the disk went, not a cleanup candidate. macOS packages (`.app`, `.xcodeproj`, Photos/Music/iMovie libraries, VM bundles, …) are opaque to the walk — nothing inside one is ever listed or offered for deletion; a large data library is reported as a single informational item ("Data libraries" group, Reveal in Finder only) so the disk picture is complete — it is never a cleanup candidate. A `target` dir is recognised by its sibling `Cargo.toml` *or* by cargo's own `.rustc_info.json`/`CACHEDIR.TAG` inside it (relocated target dirs, workspace members); its primary remedy is `cargo clean --manifest-path …` with Trash as the alternative. Artifacts inside a linked git worktree name the main repository they belong to. A pnpm-linked `node_modules` reports how much of its size is hard-linked from the pnpm store (reclaimed only by `pnpm store prune`) and estimates the real reclaim; APFS clones are not detectable and can make it smaller still. The full directory tree from the walk is also published (`ScanEvent::DirTree`) for a drill-down folder browser, which the app/TUI is building separately. |
+| Global Tools | Every installation by npm, pnpm (hashed `global/v<N>` and legacy `global/<N>` layouts), cargo, pipx, uv, pip (Homebrew, Apple and user site-packages) and bun, keyed by manager + install root + package so two copies stay distinct and stable across scans. Per installation: version (or `unknown`), interpreter/runtime and whether it still exists, exported commands, launchers and their targets, resolution through inherited process PATH, ownership, project evidence, and a classification. Includes one row per command name (inherited-PATH resolution with every candidate and its owner) and a coverage row per manager. |
+| Disk | A bulk-enumeration parallel walk of the selected root (Home by default; Boot Volume or an arbitrary folder explicitly selected). The compact directory arena retains allocation, logical size, unique-file counts and coverage, while bounded largest-file summaries and live folder observations support exploration. Descendant symlinks and mount boundaries are not followed. Shared hardlink allocation has deterministic ownership; APFS shared extents can make actual reclaim smaller. Unreadable, dataless, excluded or resource-limited paths remain explicitly incomplete. The treemap uses scanned totals and residual/Other buckets; separately observed folder files never change its denominator. Build artifacts, packages and known cache findings preserve existing guarded, findings-only remediation. |
 | Projects | One row per project (a non-vendored git repo root, or a directory with a project manifest outside any repo; linked worktrees and monorepo packages fold into their repo) with **exclusive / shared / reach / baseline** bytes, a breakdown by resource kind, and the live processes and listening ports whose working directory is inside it. Every entry names the evidence that linked it. Synthetic rows: **Baseline** (ecosystem-wide resources like the default toolchain that would remain with zero projects), **Unattributed** (an orphaned DerivedData entry whose workspace was deleted, a session whose cwd is gone — each with the reason), and **Coverage**. |
 | App Storage | One row per owner — `.app` bundles under `/Applications`, `~/Applications` and `/System/Applications` (helpers fold into their outer bundle, casks into their app), Homebrew formulae, Homebrew itself, and global dev tools — with the same four numbers and a breakdown of every `~/Library/{Application Support,Caches,Containers,Group Containers,Logs,HTTPStorages,WebKit,Preferences,…}`, dotdir, cache and well-known data location (Photos library, Mail, Messages, iCloud Drive, `~/Library/Developer`) linked to it. |
 | Daemons | LaunchAgents/LaunchDaemons, flagging orphaned entries whose binary no longer exists. |
-| Shell | Your login shell's `$PATH` (fish/zsh/bash): duplicates, dead entries, system dirs shadowing Homebrew, which entries MacAudit's own process cannot see (agents and apps launch with a different environment), and shell startup time. |
+| Shell | Inherited process `$PATH`: duplicates, dead entries, and system directories shadowing Homebrew. No automatic login/interactive shell startup, user rc execution, or startup timing. |
 | Runtimes | Language version managers (nvm/fnm/volta/mise/asdf/pyenv/rustup) and their installed toolchain versions. |
 | Docker | Reclaimable space per category (images, containers, volumes, build cache) via `docker system df`, plus active container CPU/RAM samples via one-shot `docker stats`. |
 | Ports | Listening TCP ports with the owning process and PID. |
@@ -374,7 +395,7 @@ What the section answers, and how honestly:
   binary is missing; *required* when something depends on it (a Homebrew
   formula owns the files, another package `Requires-Dist` it); *duplicate*
   when another installation or a cask binary provides the same command;
-  *shadowed* when another copy wins resolution in your login shell;
+  *shadowed* when another copy wins resolution through inherited process PATH;
   *project alternative* only when a repository under your roots has the tool
   **installed** locally (`node_modules/.bin`, `.venv/bin`, a pinned
   bootstrap download) — a manifest line alone is listed as evidence, not an
@@ -437,7 +458,7 @@ What the section answers, and how honestly:
    (run before *and* after, so a failure that already existed is reported as
    pre-existing, not as a regression), and the report (`c`) lists what ran,
    failed, was cancelled or refused, plus the verification table. The same
-   report is written to `~/.local/state/macaudit/cleanup-reports/<ts>.json`.
+   report exists only in the current process and is discarded on exit.
 
 Marks whose findings vanish on a rescan are dropped and announced; an open
 confirm dialog is rebuilt so it can never reference a stale target.
@@ -452,8 +473,10 @@ confirm dialog is rebuilt so it can never reference a stale target.
 - Python `Requires-Dist` markers other than `extra ==` are not evaluated
   (they are listed as unevaluated). Apple and application-bundled Pythons
   are inventory-only.
-- Login shells other than fish, zsh and bash fall back to the process PATH
-  (the coverage row says so).
+- All automatic command resolution uses inherited process PATH, independent
+  of shell type. Tools outside that PATH can still be discovered from
+  filesystem metadata or explicit prefixes; no user rc or npm prefix probe
+  is run.
 
 ## Cutting a release
 

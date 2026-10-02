@@ -5,25 +5,54 @@ import SwiftUI
 struct FindingInspector: View {
     @Environment(AuditStore.self) private var store
     let finding: Finding?
+    @State private var metadataPairs: [(String, String)] = []
+    @State private var metadataSource: String?
+    @State private var deviceStorage: IosDeviceStorage?
+    @State private var appUsage: IosAppUsage?
 
     var body: some View {
         if let f = finding {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     header(f)
+                    Text(f.auditScopeLabel).font(.caption).foregroundStyle(.secondary)
                     if !f.detail.isEmpty {
                         Text(f.detail).font(.callout).textSelection(.enabled)
                     }
                     facts(f)
-                    if let d = IosDeviceStorage(f) { iosStorage(d) }
-                    if let a = IosAppUsage(f) { iosApp(a) }
-                    if !f.remedies.isEmpty { remedies(f) }
-                    if let text = f.coverage { note("Coverage", text) }
-                    if let text = f.provenance { note("Provenance", text) }
+                    if metadataSource == f.metaJson, let deviceStorage {
+                        iosStorage(deviceStorage)
+                    }
+                    if metadataSource == f.metaJson, let appUsage {
+                        iosApp(appUsage)
+                    }
+                    if !f.remedies.isEmpty {
+                        remedies(f)
+                    }
+                    if let text = f.coverage {
+                        note("Coverage", text)
+                    }
+                    if let text = f.provenance {
+                        note("Provenance", text)
+                    }
                     meta(f)
                 }
                 .padding()
                 .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .task(id: finding) {
+                let json = f.metaJson
+                let (pairs, device, app) = await Task.detached {
+                    let started = PresentationTrace.start()
+                    let result = (Self.metaPairs(json), IosDeviceStorage(f), IosAppUsage(f))
+                    PresentationTrace.finish("audit.inspector.decode", since: started, rows: 1)
+                    return result
+                }.value
+                guard !Task.isCancelled else { return }
+                metadataPairs = pairs
+                deviceStorage = device
+                appUsage = app
+                metadataSource = json
             }
         } else {
             ContentUnavailableView("No selection", systemImage: "info.circle")
@@ -146,7 +175,9 @@ struct FindingInspector: View {
                         Text(label).foregroundStyle(.secondary)
                         VStack(alignment: .leading, spacing: 0) {
                             Text(value).monospacedDigit()
-                            if let hint { Text(hint).font(.caption2).foregroundStyle(.tertiary) }
+                            if let hint {
+                                Text(hint).font(.caption2).foregroundStyle(.tertiary)
+                            }
                         }
                     }
                 }
@@ -191,7 +222,7 @@ struct FindingInspector: View {
 
     @ViewBuilder
     private func meta(_ f: Finding) -> some View {
-        let pairs = metaPairs(f.metaJson)
+        let pairs = metadataSource == f.metaJson ? metadataPairs : []
         if !pairs.isEmpty {
             DisclosureGroup("Details") {
                 Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 10, verticalSpacing: 3) {
@@ -207,21 +238,20 @@ struct FindingInspector: View {
         }
     }
 
-    private func metaPairs(_ json: String) -> [(String, String)] {
+    private nonisolated static func metaPairs(_ json: String) -> [(String, String)] {
         guard let data = json.data(using: .utf8),
-            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return [] }
         return object.keys.sorted().map { key in
             let v = object[key]!
-            let text: String
-            if let s = v as? String {
-                text = s
+            let text: String = if let s = v as? String {
+                s
             } else if let d = try? JSONSerialization.data(withJSONObject: v, options: [.fragmentsAllowed, .sortedKeys]),
-                let s = String(data: d, encoding: .utf8)
+                      let s = String(data: d, encoding: .utf8)
             {
-                text = s
+                s
             } else {
-                text = "\(v)"
+                "\(v)"
             }
             return (key, text)
         }

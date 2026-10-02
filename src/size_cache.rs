@@ -1,217 +1,334 @@
-//! Artifact size cache (lane S) — persists `du_blocks` results keyed by path so
-//! a rescan can skip re-measuring artifacts whose root mtime hasn't changed
-//! since the last scan and whose cached size is still within the configured
-//! TTL (spec `scan.size_cache_ttl_hours`, default 24).
+//! Bounded, run-owned artifact measurements.
 //!
-//! Own rusqlite db file. Corrupted/unopenable db is never fatal to a scan:
-//! the `fs.rs` integration treats an `open` failure as an empty cache.
+//! Clones share measurements within one run; timestamps never establish validity.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use rusqlite::Connection;
+use crate::inventory::{MemoryBudget, Reservation};
 
-/// A previously computed artifact size, plus enough provenance to decide
-/// whether it's still trustworthy on the next scan.
+const MAX_ENTRIES: usize = 4096;
+const MAX_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CachedSize {
     pub size: u64,
-    /// Unix seconds when this size was measured.
-    pub computed_at: i64,
-    /// The artifact root's mtime (unix seconds) at measurement time — if the
-    /// root's current mtime differs, the tree has changed and the entry is stale.
-    pub root_mtime: i64,
 }
 
+#[derive(Debug)]
+struct Measurement {
+    size: CachedSize,
+    sequence: u64,
+    memory: Reservation,
+}
+
+#[derive(Debug, Default)]
+struct Measurements {
+    sizes: BTreeMap<PathBuf, Measurement>,
+    entitlements: BTreeMap<PathBuf, (CachedEntitlements, u64, usize)>,
+    bytes: usize,
+    sequence: u64,
+}
+
+impl Measurements {
+    fn evict_oldest(&mut self) -> bool {
+        let size_sequence = self.sizes.values().map(|entry| entry.sequence).min();
+        let group_sequence = self
+            .entitlements
+            .values()
+            .map(|(_, sequence, _)| *sequence)
+            .min();
+        if group_sequence.is_some_and(|sequence| size_sequence.is_none_or(|size| sequence < size)) {
+            self.entitlements.retain(|_, (_, sequence, bytes)| {
+                if Some(*sequence) == group_sequence {
+                    self.bytes -= *bytes;
+                    false
+                } else {
+                    true
+                }
+            });
+            if self.entitlements.is_empty() {
+                self.entitlements = BTreeMap::new();
+            }
+            return true;
+        }
+        let Some(sequence) = size_sequence else {
+            return false;
+        };
+        self.sizes.retain(|_, entry| {
+            if entry.sequence == sequence {
+                self.bytes -= entry.memory.bytes();
+                false
+            } else {
+                true
+            }
+        });
+        if self.sizes.is_empty() {
+            self.sizes = BTreeMap::new();
+        }
+        true
+    }
+}
+
+#[derive(Debug, Default)]
+struct SnapshotData {
+    sizes: BTreeMap<PathBuf, CachedSize>,
+    _memory: Option<Reservation>,
+}
+
+/// Immutable measurements whose reservation follows every shared snapshot.
+#[derive(Clone, Debug, Default)]
+pub struct SizeSnapshot {
+    data: Option<Arc<SnapshotData>>,
+}
+
+impl Deref for SizeSnapshot {
+    type Target = BTreeMap<PathBuf, CachedSize>;
+
+    fn deref(&self) -> &Self::Target {
+        static EMPTY: BTreeMap<PathBuf, CachedSize> = BTreeMap::new();
+        self.data.as_ref().map(|data| &data.sizes).unwrap_or(&EMPTY)
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct SizeCache {
-    conn: Connection,
+    measurements: Option<Arc<Mutex<Measurements>>>,
+    budget: Arc<MemoryBudget>,
+    _memory: Option<Arc<Reservation>>,
+}
+
+impl Default for SizeCache {
+    fn default() -> Self {
+        Self::with_budget(MemoryBudget::shared())
+    }
 }
 
 impl SizeCache {
-    /// Open (creating parent dirs + schema) the on-disk size cache database.
-    ///
-    /// Sets a 5s `busy_timeout`: the App Storage axis's entitlements lookup
-    /// (`src/attribution/apps/entitlements.rs`) opens this same db from
-    /// several `std::thread::scope` workers at once, and a rescan's own
-    /// artifact-size writes may be in flight concurrently too — without a
-    /// busy timeout a second writer gets `SQLITE_BUSY` immediately instead
-    /// of waiting for the first to finish its transaction.
-    pub fn open(path: &Path) -> anyhow::Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let conn = Connection::open(path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        let cache = SizeCache { conn };
-        cache.init_schema()?;
-        Ok(cache)
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// In-memory cache for tests.
+    pub fn with_budget(budget: Arc<MemoryBudget>) -> Self {
+        let memory = budget
+            .reserve(
+                std::mem::size_of::<Mutex<Measurements>>()
+                    + std::mem::size_of::<Reservation>()
+                    + 128,
+            )
+            .ok()
+            .map(Arc::new);
+        let measurements = memory
+            .as_ref()
+            .map(|_| Arc::new(Mutex::new(Measurements::default())));
+        Self {
+            measurements,
+            budget,
+            _memory: memory,
+        }
+    }
+
+    pub fn memory_budget(&self) -> Arc<MemoryBudget> {
+        self.budget.clone()
+    }
+
     pub fn open_in_memory() -> anyhow::Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        let cache = SizeCache { conn };
-        cache.init_schema()?;
-        Ok(cache)
+        Ok(Self::new())
     }
 
-    fn init_schema(&self) -> anyhow::Result<()> {
-        self.conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS size_cache (
-                path        TEXT PRIMARY KEY,
-                size        INTEGER NOT NULL,
-                computed_at INTEGER NOT NULL,
-                root_mtime  INTEGER NOT NULL
-            );
-            -- v2: dropped the unused `sandboxed` column (tier 2 always runs
-            -- when tier 1 misses — it never gated on sandbox status). A new
-            -- table name, not a migration, since a stale `entitlements` row
-            -- is harmless to leave behind and simpler than an ALTER TABLE.
-            CREATE TABLE IF NOT EXISTS entitlements_v2 (
-                app_path    TEXT PRIMARY KEY,
-                mtime       INTEGER NOT NULL,
-                app_groups  TEXT NOT NULL
-            );
-            "#,
-        )?;
-        Ok(())
-    }
-
-    /// Load every cached entry into memory, keyed by artifact path.
-    pub fn load_all(&self) -> anyhow::Result<HashMap<PathBuf, CachedSize>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT path, size, computed_at, root_mtime FROM size_cache")?;
-        let rows = stmt.query_map([], |row| {
-            let path: String = row.get(0)?;
-            Ok((
-                PathBuf::from(path),
-                CachedSize {
-                    size: row.get::<_, i64>(1)? as u64,
-                    computed_at: row.get(2)?,
-                    root_mtime: row.get(3)?,
-                },
-            ))
-        })?;
-        let mut map = HashMap::new();
-        for row in rows {
-            let (path, cached) = row?;
-            map.insert(path, cached);
-        }
-        Ok(map)
-    }
-
-    /// Upsert a batch of fresh entries in one transaction. A later entry for
-    /// the same path overwrites an earlier one (last wins).
-    pub fn upsert_batch(&mut self, entries: &[(PathBuf, CachedSize)]) -> anyhow::Result<()> {
-        let tx = self.conn.transaction()?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO size_cache (path, size, computed_at, root_mtime)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(path) DO UPDATE SET
-                     size = excluded.size,
-                     computed_at = excluded.computed_at,
-                     root_mtime = excluded.root_mtime",
-            )?;
-            for (path, cached) in entries {
-                stmt.execute(rusqlite::params![
-                    path.to_string_lossy(),
-                    cached.size as i64,
-                    cached.computed_at,
-                    cached.root_mtime,
-                ])?;
+    pub fn load_all(&self) -> anyhow::Result<SizeSnapshot> {
+        let Some(store) = &self.measurements else {
+            return Ok(SizeSnapshot::default());
+        };
+        let mut measurements = store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("measurement store poisoned"))?;
+        loop {
+            if measurements.sizes.is_empty() {
+                return Ok(SizeSnapshot::default());
+            }
+            let bytes = measurements
+                .sizes
+                .keys()
+                .try_fold(128usize, |bytes, path| bytes.checked_add(entry_bytes(path)))
+                .ok_or(crate::inventory::InventoryError::ResourceLimit)?;
+            if let Ok(memory) = self.budget.reserve(bytes) {
+                let sizes = measurements
+                    .sizes
+                    .iter()
+                    .map(|(path, entry)| (path.clone(), entry.size))
+                    .collect();
+                return Ok(SizeSnapshot {
+                    data: Some(Arc::new(SnapshotData {
+                        sizes,
+                        _memory: Some(memory),
+                    })),
+                });
+            }
+            if !measurements.evict_oldest() {
+                return Ok(SizeSnapshot::default());
             }
         }
-        tx.commit()?;
+    }
+
+    pub fn upsert_batch(&mut self, entries: &[(PathBuf, CachedSize)]) -> anyhow::Result<()> {
+        let Some(store) = &self.measurements else {
+            return Ok(());
+        };
+        let mut measurements = store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("measurement store poisoned"))?;
+        for (path, size) in entries {
+            if let Some(previous) = measurements.sizes.remove(path.as_path()) {
+                measurements.bytes -= previous.memory.bytes();
+            }
+            if measurements.sizes.is_empty() {
+                measurements.sizes = BTreeMap::new();
+            }
+            let bytes = entry_bytes(path);
+            if bytes > MAX_BYTES {
+                continue;
+            }
+            while measurements.sizes.len() + measurements.entitlements.len() >= MAX_ENTRIES
+                || measurements.bytes.saturating_add(bytes) > MAX_BYTES
+            {
+                if !measurements.evict_oldest() {
+                    break;
+                }
+            }
+            let memory = loop {
+                if let Ok(memory) = self.budget.reserve(bytes) {
+                    break Some(memory);
+                }
+                if !measurements.evict_oldest() {
+                    break None;
+                }
+            };
+            let Some(memory) = memory else {
+                continue;
+            };
+            measurements.sequence = measurements.sequence.saturating_add(1);
+            let sequence = measurements.sequence;
+            measurements.sizes.insert(
+                path.clone(),
+                Measurement {
+                    size: *size,
+                    sequence,
+                    memory,
+                },
+            );
+            measurements.bytes += bytes;
+        }
         Ok(())
     }
 
-    /// A cached `codesign -d --entitlements` read for one app bundle, if
-    /// there is one and the bundle's mtime hasn't moved since it was
-    /// recorded (a changed mtime means the app was reinstalled/updated, so
-    /// the cached entitlements can no longer be trusted).
     pub fn get_entitlements(
         &self,
         app_path: &Path,
-        mtime: i64,
+        _mtime: i64,
     ) -> anyhow::Result<Option<CachedEntitlements>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT mtime, app_groups FROM entitlements_v2 WHERE app_path = ?1")?;
-        let row = stmt
-            .query_row(rusqlite::params![app_path.to_string_lossy()], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
-            .ok();
-        let Some((cached_mtime, app_groups_json)) = row else {
+        let Some(store) = &self.measurements else {
             return Ok(None);
         };
-        if cached_mtime != mtime {
-            return Ok(None);
-        }
-        let app_groups: Vec<String> = serde_json::from_str(&app_groups_json).unwrap_or_default();
-        Ok(Some(CachedEntitlements { app_groups }))
+        let measurements = store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("measurement store poisoned"))?;
+        Ok(measurements
+            .entitlements
+            .get(app_path)
+            .map(|(groups, _, _)| groups.clone()))
     }
 
-    /// Upsert one app bundle's entitlements read.
     pub fn put_entitlements(
         &self,
         app_path: &Path,
-        mtime: i64,
+        _mtime: i64,
         app_groups: &[String],
     ) -> anyhow::Result<()> {
-        let app_groups_json = serde_json::to_string(app_groups)?;
-        self.conn.execute(
-            "INSERT INTO entitlements_v2 (app_path, mtime, app_groups)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(app_path) DO UPDATE SET
-                 mtime = excluded.mtime,
-                 app_groups = excluded.app_groups",
-            rusqlite::params![app_path.to_string_lossy(), mtime, app_groups_json],
-        )?;
+        let Some(store) = &self.measurements else {
+            return Ok(());
+        };
+        let bytes = crate::inventory::serialized_size(app_groups)?
+            .checked_add(
+                app_groups
+                    .len()
+                    .saturating_mul(std::mem::size_of::<String>()),
+            )
+            .and_then(|bytes| bytes.checked_add(entry_bytes(app_path)))
+            .unwrap_or(usize::MAX);
+        if bytes > MAX_BYTES {
+            return Ok(());
+        }
+        let mut measurements = store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("measurement store poisoned"))?;
+        if let Some((_, _, bytes)) = measurements.entitlements.remove(app_path) {
+            measurements.bytes -= bytes;
+        }
+        if measurements.entitlements.is_empty() {
+            measurements.entitlements = BTreeMap::new();
+        }
+        while measurements.sizes.len() + measurements.entitlements.len() >= MAX_ENTRIES
+            || measurements.bytes.saturating_add(bytes) > MAX_BYTES
+        {
+            if !measurements.evict_oldest() {
+                break;
+            }
+        }
+        let memory = loop {
+            if let Ok(memory) = self.budget.reserve(bytes) {
+                break Some(memory);
+            }
+            if !measurements.evict_oldest() {
+                break None;
+            }
+        };
+        let Some(memory) = memory else {
+            return Ok(());
+        };
+        let app_groups = SharedGroups(Arc::new(GroupData {
+            groups: app_groups.to_vec(),
+            _memory: memory,
+        }));
+        measurements.sequence = measurements.sequence.saturating_add(1);
+        let sequence = measurements.sequence;
+        measurements.entitlements.insert(
+            app_path.to_path_buf(),
+            (CachedEntitlements { app_groups }, sequence, bytes),
+        );
+        measurements.bytes += bytes;
         Ok(())
     }
 }
 
-/// A previously fetched app bundle's entitlements (`entitlements_v2` table).
-#[derive(Clone, Debug, PartialEq, Eq)]
+fn entry_bytes(path: &Path) -> usize {
+    path.as_os_str()
+        .len()
+        .saturating_add(std::mem::size_of::<(PathBuf, Measurement)>().saturating_mul(16))
+        .saturating_add(256)
+}
+
+#[derive(Clone, Debug)]
 pub struct CachedEntitlements {
-    pub app_groups: Vec<String>,
+    pub app_groups: SharedGroups,
 }
 
-/// Path to the size cache database, derived from `Paths::state_dir` (which is
-/// frozen — this stays a free function rather than a new `Paths` method).
-pub fn db_path(paths: &crate::config::Paths) -> PathBuf {
-    paths.state_dir.join("sizes.db")
+#[derive(Debug)]
+struct GroupData {
+    groups: Vec<String>,
+    _memory: Reservation,
 }
 
-/// Unix-seconds mtime of `path` itself (the measured tree's root), 0 on any
-/// failure (missing path, permission error, platforms without mtime support).
-pub fn root_mtime_secs(path: &Path) -> i64 {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
+#[derive(Clone, Debug)]
+pub struct SharedGroups(Arc<GroupData>);
 
-/// Is a cached size still trustworthy: measured within the TTL window AND the
-/// tree root's mtime hasn't moved since (a changed mtime means the tree was
-/// touched, so the old size can no longer be trusted). Shared by FsScanner's
-/// artifact sizing and GitScanner's repo sizing.
-pub fn is_fresh(
-    cached: &CachedSize,
-    current_root_mtime: i64,
-    now_secs: i64,
-    ttl_hours: u64,
-) -> bool {
-    let ttl_secs = (ttl_hours as i64).saturating_mul(3600);
-    let not_expired = cached.computed_at > now_secs.saturating_sub(ttl_secs);
-    let mtime_matches = cached.root_mtime == current_root_mtime;
-    not_expired && mtime_matches
+impl Deref for SharedGroups {
+    type Target = [String];
+    fn deref(&self) -> &[String] {
+        &self.0.groups
+    }
 }
 
 #[cfg(test)]
@@ -219,115 +336,204 @@ mod tests {
     use super::*;
     use crate::config::Paths;
 
-    fn sized(size: u64, computed_at: i64, root_mtime: i64) -> CachedSize {
-        CachedSize {
-            size,
-            computed_at,
-            root_mtime,
-        }
+    fn sized(size: u64) -> CachedSize {
+        CachedSize { size }
     }
 
     #[test]
-    fn in_memory_roundtrip() {
-        let mut cache = SizeCache::open_in_memory().unwrap();
-        let entries = vec![
-            (PathBuf::from("/a/node_modules"), sized(100, 1000, 500)),
-            (PathBuf::from("/b/target"), sized(200, 1001, 501)),
-        ];
-        cache.upsert_batch(&entries).unwrap();
-
-        let loaded = cache.load_all().unwrap();
-        assert_eq!(loaded.len(), 2);
-        assert_eq!(
-            loaded.get(&PathBuf::from("/a/node_modules")),
-            Some(&sized(100, 1000, 500))
-        );
-        assert_eq!(
-            loaded.get(&PathBuf::from("/b/target")),
-            Some(&sized(200, 1001, 501))
-        );
-    }
-
-    #[test]
-    fn batch_overwrite_last_wins() {
-        let mut cache = SizeCache::open_in_memory().unwrap();
+    fn snapshots_and_cache_clones_retain_their_own_reservations() {
+        let budget = MemoryBudget::new(MAX_BYTES);
+        let mut cache = SizeCache::with_budget(budget.clone());
         cache
-            .upsert_batch(&[(PathBuf::from("/a"), sized(100, 1000, 500))])
+            .upsert_batch(&[(PathBuf::from("/a"), sized(3))])
             .unwrap();
-        cache
-            .upsert_batch(&[(PathBuf::from("/a"), sized(999, 2000, 600))])
-            .unwrap();
-
-        let loaded = cache.load_all().unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(
-            loaded.get(&PathBuf::from("/a")),
-            Some(&sized(999, 2000, 600))
-        );
+        let cache_clone = cache.clone();
+        let snapshot = cache.load_all().unwrap();
+        let used = budget.used();
+        let snapshot_clone = snapshot.clone();
+        assert_eq!(budget.used(), used);
+        drop(cache);
+        assert_eq!(budget.used(), used);
+        drop(cache_clone);
+        assert!(budget.used() > 0);
+        assert_eq!(snapshot_clone.get(Path::new("/a")), Some(&sized(3)));
+        drop(snapshot);
+        assert!(budget.used() > 0);
+        drop(snapshot_clone);
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]
-    fn batch_overwrite_within_same_call_last_wins() {
-        let mut cache = SizeCache::open_in_memory().unwrap();
+    fn exhausted_budget_skips_allocations_and_evicts_old_measurements() {
+        let empty_budget = MemoryBudget::new(0);
+        let mut disabled = SizeCache::with_budget(empty_budget.clone());
+        disabled
+            .upsert_batch(&[(PathBuf::from("/a"), sized(1))])
+            .unwrap();
+        assert!(disabled.load_all().unwrap().is_empty());
+        assert_eq!(empty_budget.used(), 0);
+
+        let budget = MemoryBudget::new(16 * 1024);
+        let mut cache = SizeCache::with_budget(budget.clone());
+        cache
+            .upsert_batch(&[(PathBuf::from("/a"), sized(1))])
+            .unwrap();
+        let pressure = budget.reserve(budget.limit() - budget.used()).unwrap();
+        cache
+            .upsert_batch(&[(PathBuf::from("/b"), sized(2))])
+            .unwrap();
+        let measurements = cache.measurements.as_ref().unwrap().lock().unwrap();
+        assert!(!measurements.sizes.contains_key(Path::new("/a")));
+        assert!(measurements.sizes.contains_key(Path::new("/b")));
+        assert!(budget.peak() <= budget.limit());
+        drop(measurements);
+        assert!(cache.load_all().unwrap().is_empty());
+        drop(cache);
+        drop(pressure);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn clones_share_same_run_measurements_and_last_write_wins() {
+        let mut cache = SizeCache::new();
+        let shared = cache.clone();
+        let artifact = PathBuf::from("/a/node_modules");
         cache
             .upsert_batch(&[
-                (PathBuf::from("/a"), sized(100, 1000, 500)),
-                (PathBuf::from("/a"), sized(999, 2000, 600)),
+                (artifact.clone(), sized(100)),
+                (artifact.clone(), sized(200)),
             ])
             .unwrap();
+        assert_eq!(shared.load_all().unwrap().get(&artifact), Some(&sized(200)));
+        assert!(SizeCache::new().load_all().unwrap().is_empty());
+    }
 
+    #[test]
+    fn measurements_never_read_or_modify_existing_artifacts() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(home.path());
+        let database = paths.state_dir.join("sizes.db");
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        std::fs::write(&database, b"legacy database must remain untouched").unwrap();
+        let mut cache = paths.size_cache.clone();
+        assert!(cache.load_all().unwrap().is_empty());
+        cache
+            .upsert_batch(&[(PathBuf::from("/artifact"), sized(u64::MAX))])
+            .unwrap();
+        cache.put_entitlements(Path::new("/app"), 0, &[]).unwrap();
+        assert_eq!(
+            std::fs::read(&database).unwrap(),
+            b"legacy database must remain untouched"
+        );
+        assert!(paths
+            .with_fresh_measurements()
+            .size_cache
+            .load_all()
+            .unwrap()
+            .is_empty());
+        assert_eq!(std::fs::read_dir(&paths.state_dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn measurements_do_not_create_directories_or_files() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(home.path().join("missing"));
+        let mut cache = paths.size_cache.clone();
+        cache
+            .upsert_batch(&[(PathBuf::from("/a"), sized(1))])
+            .unwrap();
+        assert!(!home.path().join("missing").exists());
+        let blocked = home.path().join("not-a-directory");
+        std::fs::write(&blocked, b"untouched").unwrap();
+        let blocked_paths = Paths::from_home(&blocked);
+        assert!(blocked_paths.size_cache.load_all().unwrap().is_empty());
+        assert_eq!(std::fs::read(&blocked).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn run_isolation_does_not_depend_on_ttl_or_root_mtime() {
+        let paths = Paths::from_home("/unused");
+        let first = paths.with_fresh_measurements();
+        let second = first.with_fresh_measurements();
+        let mut cache = first.size_cache.clone();
+        cache
+            .upsert_batch(&[(PathBuf::from("/a"), sized(5))])
+            .unwrap();
+        assert!(second.size_cache.load_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn size_entries_are_bounded_and_oldest_is_evicted() {
+        let mut cache = SizeCache::new();
+        let entries: Vec<_> = (0..=MAX_ENTRIES)
+            .map(|index| {
+                (
+                    PathBuf::from(format!("/artifact/{index}")),
+                    sized(index as u64),
+                )
+            })
+            .collect();
+        cache.upsert_batch(&entries).unwrap();
         let loaded = cache.load_all().unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(
-            loaded.get(&PathBuf::from("/a")),
-            Some(&sized(999, 2000, 600))
-        );
+        assert!(loaded.len() <= MAX_ENTRIES);
+        assert!(!loaded.is_empty());
+        assert!(!loaded.contains_key(Path::new("/artifact/0")));
+        assert!(cache.measurements.as_ref().unwrap().lock().unwrap().bytes <= MAX_BYTES);
     }
 
     #[test]
-    fn entitlements_roundtrip() {
-        let cache = SizeCache::open_in_memory().unwrap();
-        let groups = vec!["group.io.robbie.homeassistant".to_string()];
+    fn entitlements_are_run_owned_immutable_and_payload_bounded() {
+        let cache = SizeCache::new();
+        let app = Path::new("/app");
         cache
-            .put_entitlements(Path::new("/Applications/Home Assistant.app"), 100, &groups)
+            .put_entitlements(app, 1, &["group.test".into()])
             .unwrap();
-        let got = cache
-            .get_entitlements(Path::new("/Applications/Home Assistant.app"), 100)
-            .unwrap();
-        assert_eq!(got, Some(CachedEntitlements { app_groups: groups }));
-    }
-
-    #[test]
-    fn entitlements_stale_mtime_misses() {
-        let cache = SizeCache::open_in_memory().unwrap();
+        let groups = cache.get_entitlements(app, 2).unwrap().unwrap().app_groups;
+        assert_eq!(&*groups, &["group.test".to_string()]);
+        assert!(SizeCache::new().get_entitlements(app, 1).unwrap().is_none());
+        for index in 0..10 {
+            cache
+                .put_entitlements(
+                    Path::new(&format!("/app/{index}")),
+                    0,
+                    &["x".repeat(MAX_BYTES / 3)],
+                )
+                .unwrap();
+        }
         cache
-            .put_entitlements(Path::new("/Applications/X.app"), 100, &[])
+            .put_entitlements(Path::new("/oversized"), 0, &["x".repeat(MAX_BYTES)])
             .unwrap();
-        assert_eq!(
-            cache
-                .get_entitlements(Path::new("/Applications/X.app"), 200)
-                .unwrap(),
-            None
-        );
+        assert!(cache
+            .get_entitlements(Path::new("/oversized"), 0)
+            .unwrap()
+            .is_none());
+        let measurements = cache.measurements.as_ref().unwrap().lock().unwrap();
+        assert!(measurements.sizes.is_empty());
+        assert!(measurements.bytes <= MAX_BYTES);
+        assert!(measurements.entitlements.len() < 10);
+        assert_eq!(&*groups, &["group.test".to_string()]);
     }
 
     #[test]
-    fn entitlements_missing_path_is_none() {
-        let cache = SizeCache::open_in_memory().unwrap();
-        assert_eq!(
-            cache
-                .get_entitlements(Path::new("/Applications/Nope.app"), 1)
-                .unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn db_path_shape() {
-        let paths = Paths::from_home("/tmp/fixture-home");
-        assert_eq!(
-            db_path(&paths),
-            PathBuf::from("/tmp/fixture-home/.local/state/macaudit/sizes.db")
-        );
+    fn returned_entitlement_groups_keep_their_reservation_after_cache_drop() {
+        let budget = MemoryBudget::new(1 << 20);
+        let cache = SizeCache::with_budget(budget.clone());
+        cache
+            .put_entitlements(Path::new("/app"), 0, &["group.test".into()])
+            .unwrap();
+        let groups = cache
+            .get_entitlements(Path::new("/app"), 0)
+            .unwrap()
+            .unwrap()
+            .app_groups;
+        let charged = budget.used();
+        let clone = groups.clone();
+        assert_eq!(budget.used(), charged);
+        drop(cache);
+        assert!(budget.used() > 0);
+        drop(groups);
+        assert_eq!(clone[0], "group.test");
+        drop(clone);
+        assert_eq!(budget.used(), 0);
     }
 }

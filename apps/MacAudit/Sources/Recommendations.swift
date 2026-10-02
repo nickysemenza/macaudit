@@ -4,7 +4,7 @@ import SwiftUI
 /// One actionable opportunity derived from the current findings — the
 /// "Recommendations" block of the Storage overview. `markable` rows can be
 /// marked wholesale; every row can be reviewed in its section.
-struct Recommendation: Identifiable {
+struct Recommendation: Identifiable, Sendable {
     let id: String
     let title: String
     let detail: String
@@ -13,18 +13,21 @@ struct Recommendation: Identifiable {
     let findings: [Finding]
     let markable: Bool
 
-    var bytes: UInt64 { findings.reduce(0) { $0 + ($1.sizeBytes ?? 0) } }
+    var bytes: UInt64 {
+        findings.reduce(0) { $0 + ($1.sizeBytes ?? 0) }
+    }
 }
 
 extension AuditStore {
     /// Rules in display order; a rule contributes a row only when it matches.
-    var recommendations: [Recommendation] {
-        let fs = findings(in: .fs)
-        let brew = findings(in: .brew).filter { !$0.isBrewSummaryRow }
+    nonisolated static func recommendations(from source: [SectionId: [Finding]]) -> [Recommendation] {
+        let fs = source[.fs, default: []]
+        let brew = source[.brew, default: []].filter { !$0.isBrewSummaryRow }
         let reclaimable = { (f: Finding) in f.severity == .reclaimable }
         var out: [Recommendation] = []
         func add(_ id: String, _ title: String, _ detail: String, _ icon: String, _ section: SectionId,
-                 _ items: [Finding], markable: Bool = true) {
+                 _ items: [Finding], markable: Bool = true)
+        {
             guard !items.isEmpty else { return }
             out.append(Recommendation(id: id, title: title, detail: detail, icon: icon, section: section,
                                       findings: items, markable: markable))
@@ -55,29 +58,32 @@ extension AuditStore {
             "arrow.up.circle", .brew, brew.filter(\.isBrewOutdated), markable: false)
         add("docker", "Docker leftovers",
             "Unused images, dangling layers, stopped containers and volumes.",
-            "shippingbox", .docker, findings(in: .docker).filter(reclaimable))
+            "shippingbox", .docker, source[.docker, default: []].filter(reclaimable))
         add("simulators", "Unused simulators",
             "Unavailable runtimes and devices Xcode no longer uses.",
-            "iphone", .simulator, findings(in: .simulator).filter(reclaimable))
-        let heavy = findings(in: .ios)
+            "iphone", .simulator, source[.simulator, default: []].filter(reclaimable))
+        let heavy = source[.ios, default: []]
             .filter { $0.kind == .iosApp && $0.severity == .attention }
-            .sorted { (IosAppUsage($0)?.dynamicBytes ?? 0) > (IosAppUsage($1)?.dynamicBytes ?? 0) }
+            .map { ($0, IosAppUsage($0)?.dynamicBytes ?? 0) }
+            .sorted { $0.1 > $1.1 }.map(\.0)
         add("ios-data-heavy", "Data-heavy iPhone apps",
             "Apps on the connected iPhone whose data dwarfs the app itself (offline downloads, caches). Clear it in Settings › General › iPhone Storage.",
             "iphone.gen3", .ios, heavy, markable: false)
         add("time-machine", "Local Time Machine snapshots",
             "APFS snapshots macOS keeps on the internal disk between backups (Time Machine section).",
-            "clock.arrow.2.circlepath", .timeMachine, findings(in: .timeMachine).filter(reclaimable))
+            "clock.arrow.2.circlepath", .timeMachine, source[.timeMachine, default: []].filter(reclaimable))
         add("intel-apps", "Intel-only apps",
             "Run under Rosetta on this Mac; check for Apple silicon builds.",
-            "cpu", .apps, findings(in: .apps).filter(\.isIntelOnlyApp), markable: false)
+            "cpu", .apps, source[.apps, default: []].filter(\.isIntelOnlyApp), markable: false)
         return out
     }
 
     /// Mark every finding of a recommendation that has a runnable remedy.
     func markAll(_ rec: Recommendation) {
         for f in rec.findings where f.remedies.contains(where: { !$0.alternative }) {
-            marked.insert(f.id)
+            if !marked.contains(f.id) {
+                toggleMark(f.id)
+            }
         }
     }
 
@@ -89,21 +95,32 @@ extension AuditStore {
 
 struct RecommendationsCard: View {
     @Environment(AuditStore.self) private var store
+    @State private var prepared: [Recommendation] = []
+    @State private var preparedSource: [SectionId: [Finding]] = [:]
 
     var body: some View {
-        let recs = store.recommendations
+        let source = Dictionary(grouping: store.auditPages.cachedRows, by: \.section)
+        let recs = preparedSource == source ? prepared : []
         Card(title: "Recommendations") {
             ReclaimableBreakdown()
             if recs.isEmpty {
-                Text(store.isScanning ? "Looking for reclaimable space…" : "Nothing to reclaim right now.")
+                Text(store.isScanning ? "Looking for reclaimable space…" : "No recommendations in loaded pages. Browse Audit sections to load findings.")
                     .foregroundStyle(.secondary)
                     .padding(.vertical, 4)
             } else {
                 ForEach(Array(recs.enumerated()), id: \.element.id) { i, rec in
-                    if i > 0 { Divider() }
+                    if i > 0 {
+                        Divider()
+                    }
                     RecommendationRow(rec: rec)
                 }
             }
+        }
+        .task(id: source) {
+            let recommendations = await Task.detached { AuditStore.recommendations(from: source) }.value
+            guard !Task.isCancelled else { return }
+            prepared = recommendations
+            preparedSource = source
         }
     }
 }
@@ -168,7 +185,9 @@ private struct ReclaimableBreakdown: View {
                         .contentTransition(.numericText())
                     Text("reclaimable").foregroundStyle(.secondary)
                     Spacer()
-                    if store.isScanning { ProgressView().controlSize(.small) }
+                    if store.isScanning {
+                        ProgressView().controlSize(.small)
+                    }
                 }
                 SegmentedBar(segments: segments, capacity: total)
                 if skipped.bytes > 0 {
@@ -197,7 +216,9 @@ struct Card<Content: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if let title { Text(title).font(.title3.weight(.semibold)) }
+            if let title {
+                Text(title).font(.title3.weight(.semibold))
+            }
             VStack(alignment: .leading, spacing: 6) { content }
                 .padding(14)
                 .frame(maxWidth: .infinity, alignment: .leading)

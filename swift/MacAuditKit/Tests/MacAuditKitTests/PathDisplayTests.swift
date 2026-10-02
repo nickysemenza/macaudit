@@ -1,5 +1,10 @@
 import Foundation
 import Testing
+
+@Test func bootVolumeBreadcrumbsHaveOneSlash() {
+    let components = PathDisplay.components("/Library/Caches", root: "/")
+    #expect(components.map(\.path) == ["/", "/Library", "/Library/Caches"])
+}
 @testable import MacAuditKit
 
 @Test func abbreviateHomeShortensPathsUnderHome() {

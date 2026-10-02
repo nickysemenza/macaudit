@@ -1,7 +1,7 @@
 //! Path canonicalisation and byte-sizing for resolver claims (§3): mapping a
 //! resolver's raw path (which may point through `/System/Volumes/Data`,
 //! `file://` URIs, or a trailing `/.git`) onto the same literal-component
-//! form `DirNode::find` expects, and looking up a claimed path's size —
+//! form `DiskInventory::find` expects, and looking up a claimed path's size —
 //! directories via the walked tree, individual files (`.crate`s, cacache
 //! blobs, `.plist`s, ...) via `lstat`, since the tree has no file nodes.
 
@@ -9,9 +9,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::scan::walk::{DirNode, DirTree};
+use crate::inventory::DirectoryRef;
+use crate::scan::walk::DirTree;
 
-/// Canonicalise `p` onto the literal-component form `DirNode::find` expects
+/// Canonicalise `p` onto the literal-component form `DiskInventory::find` expects
 /// (`walk/mod.rs`'s tree is rooted at the walk's own root, e.g. `/`, with
 /// paths matched component-by-component against on-disk directory names):
 ///
@@ -85,22 +86,24 @@ fn percent_decode(s: &str) -> String {
 /// The result of sizing a claimed path.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sized {
-    /// Found in a walked tree: allocated bytes of the whole subtree.
+    /// Found in a complete walked tree with no subtree errors: allocated
+    /// bytes of the whole subtree.
     Dir(u64),
     /// Not found in any tree, but `lstat` sees a regular file:
     /// `st_blocks * 512`.
     File(u64),
-    /// Neither: the path is missing, or it's a directory the walk didn't
-    /// reach (unreadable, or outside every configured root) — `bytes` is a
+    /// Neither: the path is missing, or it's a directory without complete
+    /// coverage (unreadable, partial, or outside every configured root) — `bytes` is a
     /// guess (0), and callers must flag the entry `unsized`.
     Unsized,
 }
 
 /// Memoised path → size lookup over every walked tree, shared by one
 /// `accounting::account` pass. A directory is looked up in each tree in
-/// turn (a resolver doesn't know which root's tree a path fell under);
+/// turn, reusing only complete, error-free coverage (a resolver doesn't
+/// know which root's tree a path fell under);
 /// anything not found there is `lstat`ed directly, since the tree carries no
-/// per-file nodes (`walk/mod.rs`'s `DirNode` doc).
+/// per-file nodes.
 pub struct Sizer<'a> {
     trees: &'a [Arc<DirTree>],
     memo: Mutex<HashMap<PathBuf, Sized>>,
@@ -128,12 +131,12 @@ impl<'a> Sizer<'a> {
     }
 
     fn compute(&self, path: &Path) -> Sized {
-        if let Some(node) = node_at(self.trees, path) {
-            return if node.errors > 0 && node.alloc == 0 {
-                Sized::Unsized
-            } else {
-                Sized::Dir(node.alloc)
-            };
+        for tree in self.trees.iter().filter(|tree| tree.complete) {
+            if let Some(node) = tree.node.find(&tree.root, path) {
+                if node.errors == 0 {
+                    return Sized::Dir(node.alloc);
+                }
+            }
         }
         match std::fs::symlink_metadata(path) {
             Ok(meta) if meta.is_file() => Sized::File(crate::scan::sizing::on_disk_bytes(&meta)),
@@ -142,13 +145,13 @@ impl<'a> Sizer<'a> {
     }
 }
 
-/// The `DirNode` at `path` in whichever walked tree reached it (a resolver
+/// The directory at `path` in whichever walked tree reached it (a resolver
 /// doesn't know which root's tree a path fell under, so every tree is tried
 /// in turn) — the shared lookup every subtree walk in this crate uses to
-/// traverse *directory* structure for free (`DirNode` has no file entries;
+/// traverse *directory* structure for free (the inventory has no file entries;
 /// callers still need one `listing::list` per directory they want filenames
 /// for).
-pub fn node_at<'t>(trees: &'t [Arc<DirTree>], path: &Path) -> Option<&'t DirNode> {
+pub fn node_at<'t>(trees: &'t [Arc<DirTree>], path: &Path) -> Option<DirectoryRef<'t>> {
     for tree in trees {
         if let Some(node) = tree.node.find(&tree.root, path) {
             return Some(node);
@@ -166,8 +169,8 @@ pub fn disk_total(trees: &[Arc<DirTree>]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attribution::testutil::tree_fixture;
     use crate::scan::walk::DirNode;
-    use std::time::{Duration, SystemTime};
 
     #[test]
     fn tree_path_strips_the_data_volume_prefix() {
@@ -255,21 +258,11 @@ mod tests {
             root_node.alloc += c.alloc;
             root_node.apparent += c.apparent;
             root_node.files += c.files;
-            root_node.dirs += 1;
+            root_node.dirs += 1 + c.dirs;
+            root_node.errors += c.errors;
         }
         root_node.children = children.into_boxed_slice();
-        Arc::new(DirTree {
-            root: PathBuf::from(root),
-            files: root_node.files,
-            dirs: root_node.dirs,
-            bytes: root_node.alloc,
-            errors: root_node.errors,
-            node: root_node,
-            top_files: Vec::new(),
-            complete: true,
-            scanned_at: SystemTime::now(),
-            elapsed: Duration::from_millis(1),
-        })
+        tree_fixture(root, &root_node)
     }
 
     #[test]
@@ -305,6 +298,60 @@ mod tests {
             sizer.bytes_of(Path::new("/home/dev/locked")),
             Sized::Unsized
         );
+    }
+
+    #[test]
+    fn bytes_of_flags_a_partially_unreadable_tree_entry_as_unsized() {
+        let tree = tiny_tree("/home/dev", vec![leaf("partial", 500, 3)]);
+        let sizer = Sizer::new(std::slice::from_ref(&tree));
+        assert_eq!(
+            sizer.bytes_of(Path::new("/home/dev/partial")),
+            Sized::Unsized
+        );
+    }
+
+    #[test]
+    fn bytes_of_does_not_reuse_an_incomplete_tree() {
+        let mut tree = tiny_tree("/home/dev", vec![leaf("proj", 500, 0)]);
+        Arc::get_mut(&mut tree).unwrap().complete = false;
+        let trees = [tree];
+        assert_eq!(
+            node_at(&trees, Path::new("/home/dev/proj")).unwrap().alloc,
+            500
+        );
+        assert_eq!(
+            Sizer::new(&trees).bytes_of(Path::new("/home/dev/proj")),
+            Sized::Unsized
+        );
+    }
+
+    #[test]
+    fn bytes_of_uses_complete_coverage_after_an_incomplete_or_unreadable_tree() {
+        let mut incomplete = tiny_tree("/home/dev", vec![leaf("proj", 100, 0)]);
+        Arc::get_mut(&mut incomplete).unwrap().complete = false;
+        let unreadable = tiny_tree("/home/dev", vec![leaf("proj", 200, 1)]);
+        let complete = tiny_tree("/home/dev", vec![leaf("proj", 500, 0)]);
+        let trees = [incomplete, unreadable, complete];
+        assert_eq!(
+            Sizer::new(&trees).bytes_of(Path::new("/home/dev/proj")),
+            Sized::Dir(500)
+        );
+    }
+
+    #[test]
+    fn node_at_returns_directory_handles_with_names_children_and_totals() {
+        let tree = tiny_tree("/home/dev", vec![leaf("project name", 500, 0)]);
+        let trees = [tree];
+        let root = node_at(&trees, Path::new("/home/dev")).unwrap();
+        let child = root.children().next().unwrap();
+        assert_eq!(root.name(), "/home/dev");
+        assert_eq!(root.dirs, 1);
+        assert_eq!(child.name(), "project name");
+        assert_eq!(
+            (child.alloc, child.apparent, child.files, child.errors),
+            (500, 500, 1, 0)
+        );
+        assert!(child.children().next().is_none());
     }
 
     #[test]

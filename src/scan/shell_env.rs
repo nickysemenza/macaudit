@@ -1,23 +1,15 @@
-//! ShellEnvScanner — the user's *login shell* `$PATH` (fish, zsh or bash,
-//! found via directory services) looking for duplicates, entries pointing
-//! at nonexistent directories, and ordering surprises (system bin shadowing
-//! a brew/local bin); how that PATH differs from MacAudit's own process
-//! PATH (agents and apps often launch with a different environment); and
-//! shell startup latency.
-//!
-//! Reading the login shell's PATH starts that shell, which executes its
-//! startup configuration. No rc file is read or shown.
+//! Audit inherited process PATH for duplicates, missing directories, and
+//! ordering surprises without executing shell startup configuration.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::json;
 
 use crate::model::{Finding, FindingKind, Remedy, RemedyCommand, ScannerId, Severity};
 use crate::scan::global_tools::shellpath::{self, ShellPath};
-use crate::scan::{run_with_timeout, ScanCtx, Scanner};
+use crate::scan::{ScanCtx, Scanner};
 
 #[derive(Default)]
 pub struct ShellEnvScanner;
@@ -33,9 +25,6 @@ const BREW_DIRS: &[&str] = &[
     "/usr/local/sbin",
 ];
 
-const SLOW_STARTUP_THRESHOLD: Duration = Duration::from_millis(500);
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
-
 #[async_trait]
 impl Scanner for ShellEnvScanner {
     fn id(&self) -> ScannerId {
@@ -45,7 +34,6 @@ impl Scanner for ShellEnvScanner {
     async fn scan(&self, ctx: ScanCtx) -> anyhow::Result<()> {
         let sp = shellpath::detect(&ctx).await;
         scan_path(&ctx, &sp).await;
-        scan_startup_time(&ctx, &sp).await;
         Ok(())
     }
 }
@@ -187,60 +175,6 @@ async fn scan_path(ctx: &ScanCtx, sp: &ShellPath) {
     }
 }
 
-async fn scan_startup_time(ctx: &ScanCtx, sp: &ShellPath) {
-    let Some(shell) = &sp.login_shell else {
-        return;
-    };
-    let name = sp.shell_name().unwrap_or("");
-    if shellpath::path_probe_args(name).is_none() {
-        return; // unsupported shell: never start something we don't understand
-    }
-    let program = shell.display().to_string();
-    let mut timings = Vec::with_capacity(3);
-    for _ in 0..3 {
-        let start = Instant::now();
-        let res = run_with_timeout(ctx, &program, &["-i", "-c", "exit"], STARTUP_TIMEOUT).await;
-        let elapsed = start.elapsed();
-        if res.is_some() {
-            timings.push(elapsed);
-        }
-    }
-    if timings.is_empty() {
-        return;
-    }
-    timings.sort();
-    let median = timings[timings.len() / 2];
-
-    let severity = if median > SLOW_STARTUP_THRESHOLD {
-        Severity::Attention
-    } else {
-        Severity::Info
-    };
-    let detail = format!(
-        "Median {name} startup: {:.0}ms across {} run(s)",
-        median.as_secs_f64() * 1000.0,
-        timings.len()
-    );
-
-    let meta = json!({
-        "shell": name,
-        "median_ms": median.as_secs_f64() * 1000.0,
-        "runs_ms": timings.iter().map(|d| d.as_secs_f64() * 1000.0).collect::<Vec<_>>(),
-        "group": "Startup",
-    });
-
-    let finding = Finding::new(
-        FindingKind::PathEntry,
-        "__shell_startup__",
-        "Shell startup time",
-    )
-    .detail(detail)
-    .severity(severity)
-    .provenance(format!("{program} -i -c exit ×3 (starts the login shell)"))
-    .meta(meta);
-    ctx.emit(finding).await;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,7 +182,7 @@ mod tests {
 
     fn ctx_with(
         tmp: &tempfile::TempDir,
-        mock: crate::runner::MockCommandRunner,
+        mock: std::sync::Arc<crate::runner::MockCommandRunner>,
     ) -> (ScanCtx, tokio::sync::mpsc::Receiver<ScanEvent>) {
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let ctx = ScanCtx {
@@ -257,7 +191,7 @@ mod tests {
             gen: 1,
             config: std::sync::Arc::new(crate::config::Config::default()),
             paths: std::sync::Arc::new(crate::config::Paths::from_home(tmp.path())),
-            runner: std::sync::Arc::new(mock),
+            runner: mock,
             current: ScannerId::ShellEnv,
             repo_tx: None,
             repo_rx: None,
@@ -288,42 +222,18 @@ mod tests {
         // `real` is duplicated.
         let path_value = format!("/usr/bin:{real}:/opt/homebrew/bin:/does/not/exist:{real}");
 
-        let user = tmp
-            .path()
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-        let mock = crate::runner::MockCommandRunner::new()
-            .on(
-                "dscl",
-                &[".", "-read", &format!("/Users/{user}"), "UserShell"],
-                "UserShell: /bin/zsh\n",
-            )
-            .on(
-                "/bin/zsh",
-                &["-ilc", "echo $PATH"],
-                &format!("{path_value}\n"),
-            )
-            .on("/bin/zsh", &["-i", "-c", "exit"], "");
-        let (ctx, mut rx) = ctx_with(&tmp, mock);
-
-        ShellEnvScanner.scan(ctx).await.unwrap();
+        let mock = std::sync::Arc::new(crate::runner::MockCommandRunner::new());
+        let (ctx, mut rx) = ctx_with(&tmp, mock.clone());
+        let sp = ShellPath {
+            process_path: shellpath::split_path(&path_value),
+            source: "process PATH".into(),
+            ..Default::default()
+        };
+        scan_path(&ctx, &sp).await;
+        assert!(mock.calls().is_empty());
         let findings = drain(&mut rx).await;
 
-        // 4 distinct PATH entries + shell-vs-process comparison + startup time.
-        assert_eq!(findings.len(), 6);
-        let diff = findings
-            .iter()
-            .find(|f| f.title == "Login shell vs process PATH")
-            .unwrap();
-        assert_eq!(diff.meta["shell"], "zsh");
-        assert!(diff.meta["only_in_shell"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v == "/does/not/exist"));
+        assert_eq!(findings.len(), 4);
 
         let by_entry = |e: &str| {
             findings
@@ -359,90 +269,49 @@ mod tests {
         // An existing directory is not a dead entry → no remedy.
         assert!(sys.remedies.is_empty());
 
-        let startup = findings
-            .iter()
-            .find(|f| f.title == "Shell startup time")
-            .unwrap();
-        assert_eq!(startup.severity, Severity::Info); // mock returns instantly
-        assert!(startup.meta["median_ms"].is_number());
-        assert_eq!(startup.meta["shell"], "zsh");
-        assert_eq!(sys.meta["from_login_shell"], true);
+        assert_eq!(sys.meta["from_login_shell"], false);
     }
 
     #[tokio::test]
-    async fn fish_login_shell_uses_string_join() {
+    async fn automatic_scan_does_not_execute_user_rc() {
         let tmp = tempfile::tempdir().unwrap();
-        let user = tmp
-            .path()
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-        let pnpm_bin = tmp.path().join("Library/pnpm/bin");
-        std::fs::create_dir_all(&pnpm_bin).unwrap();
-        let mock = crate::runner::MockCommandRunner::new()
-            .on(
-                "dscl",
-                &[".", "-read", &format!("/Users/{user}"), "UserShell"],
-                "UserShell: /opt/homebrew/bin/fish\n",
-            )
-            .on(
-                "/opt/homebrew/bin/fish",
-                &["-lc", "string join : $PATH"],
-                &format!("{}:/usr/bin\n", pnpm_bin.display()),
-            )
-            .on("/opt/homebrew/bin/fish", &["-i", "-c", "exit"], "");
-        let (ctx, mut rx) = ctx_with(&tmp, mock);
-        ShellEnvScanner.scan(ctx).await.unwrap();
+        let sentinel = tmp.path().join("rc-was-executed");
+        let rc = format!("printf executed > '{}'\n", sentinel.display());
+        for path in [
+            ".zshrc",
+            ".zprofile",
+            ".bashrc",
+            ".bash_profile",
+            ".config/fish/config.fish",
+        ] {
+            let path = tmp.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, &rc).unwrap();
+        }
+        let mock = std::sync::Arc::new(crate::runner::MockCommandRunner::new());
+        let (ctx, mut rx) = ctx_with(&tmp, mock.clone());
+        ShellEnvScanner.scan(ctx.clone()).await.unwrap();
         let findings = drain(&mut rx).await;
-        let pnpm = findings
-            .iter()
-            .find(|f| f.title == pnpm_bin.display().to_string())
-            .unwrap();
-        assert_eq!(pnpm.meta["shell"], "fish");
-        assert_eq!(pnpm.meta["in_process_path"], false);
-        assert!(pnpm.provenance.as_deref().unwrap().contains("string join"));
-        let diff = findings
-            .iter()
-            .find(|f| f.title == "Login shell vs process PATH")
-            .unwrap();
-        assert_eq!(diff.severity, Severity::Attention);
-        assert_eq!(
-            diff.meta["only_in_shell"][0],
-            pnpm_bin.display().to_string()
-        );
-    }
-
-    #[tokio::test]
-    async fn shell_path_failure_falls_back_to_process_path_and_notes_it() {
-        let tmp = tempfile::tempdir().unwrap();
-        let user = tmp
-            .path()
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-        let mock = crate::runner::MockCommandRunner::new()
-            .on(
-                "dscl",
-                &[".", "-read", &format!("/Users/{user}"), "UserShell"],
-                "UserShell: /bin/zsh\n",
-            )
-            .on_fail("/bin/zsh", &["-ilc", "echo $PATH"], 1, "boom")
-            .on("/bin/zsh", &["-i", "-c", "exit"], "");
-        let (ctx, mut rx) = ctx_with(&tmp, mock);
-
-        ShellEnvScanner.scan(ctx).await.unwrap();
-        let findings = drain(&mut rx).await;
-        assert!(findings.iter().any(|f| f.title == "Shell startup time"));
+        assert!(mock.calls().is_empty());
+        assert!(!sentinel.exists());
         assert!(!findings
             .iter()
-            .any(|f| f.title == "Login shell vs process PATH"));
-        for f in findings.iter().filter(|f| f.meta.get("entry").is_some()) {
-            assert_eq!(f.meta["from_login_shell"], false);
-            assert_eq!(f.provenance.as_deref(), Some("process PATH"));
+            .any(|finding| finding.title == "Shell startup time"));
+        for finding in findings
+            .iter()
+            .filter(|finding| finding.meta.get("entry").is_some())
+        {
+            assert_eq!(finding.meta["from_login_shell"], false);
+            assert_eq!(finding.provenance.as_deref(), Some("process PATH"));
+        }
+        for path in [
+            ".zshrc",
+            ".zprofile",
+            ".bashrc",
+            ".bash_profile",
+            ".config/fish/config.fish",
+        ] {
+            assert_eq!(std::fs::read_to_string(tmp.path().join(path)).unwrap(), rc);
         }
     }
 }

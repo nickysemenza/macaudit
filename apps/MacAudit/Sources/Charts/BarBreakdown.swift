@@ -1,16 +1,26 @@
 import Charts
 import SwiftUI
 
-struct BarRow: Identifiable, Hashable {
+struct BarRow: Identifiable, Hashable, Sendable {
     let name: String
     /// Stacked parts in draw order, e.g. ("stale", bytes), ("fresh", bytes).
     let parts: [(label: String, value: Double)]
-    var color: Color? = nil
-    var id: String { name }
-    var total: Double { parts.reduce(0) { $0 + $1.value } }
+    var color: Color?
+    var id: String {
+        name
+    }
 
-    static func == (a: BarRow, b: BarRow) -> Bool { a.name == b.name && a.total == b.total }
-    func hash(into h: inout Hasher) { h.combine(name); h.combine(total) }
+    var total: Double {
+        parts.reduce(0) { $0 + $1.value }
+    }
+
+    static func == (a: BarRow, b: BarRow) -> Bool {
+        a.name == b.name && a.total == b.total
+    }
+
+    func hash(into h: inout Hasher) {
+        h.combine(name); h.combine(total)
+    }
 }
 
 /// Horizontal bars, biggest first, optionally stacked (the reclaimable
@@ -22,6 +32,7 @@ struct BarBreakdown: View {
     var partColor: (String, BarRow) -> Color = { label, row in
         label == "stale" || label == "reclaimable" ? Palette.reclaimable : (row.color ?? Palette.color(for: row.name))
     }
+
     @Binding var selected: String?
 
     var body: some View {
@@ -50,7 +61,7 @@ struct BarBreakdown: View {
                 }
             }
             .chartYSelection(value: $selected)
-            .chartXScale(domain: 0...(max(rows.map(\.total).max() ?? 1, 1) * 1.3))
+            .chartXScale(domain: 0 ... (max(rows.map(\.total).max() ?? 1, 1) * 1.3))
             .chartPlotStyle { $0.frame(height: CGFloat(rows.count) * 26) }
             .frame(height: CGFloat(rows.count) * 26 + 8)
         }

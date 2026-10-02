@@ -10,12 +10,14 @@ import SwiftUI
 struct LensView: View {
     @Environment(AuditStore.self) private var store
     let axis: AttributionAxis
+    @State private var rows: [LensModel.Row] = []
 
-    private var sectionId: SectionId { axis.sectionId }
+    private var sectionId: SectionId {
+        axis.sectionId
+    }
 
     var body: some View {
         let browser = store.owners[axis]
-        let rows = LensModel.rows(store.findings(in: sectionId))
         VStack(spacing: 0) {
             LensHeaderCard(store: store, axis: axis, browser: browser)
                 .padding([.horizontal, .top], 14)
@@ -31,31 +33,38 @@ struct LensView: View {
                 }
             }
         }
+        .safeAreaInset(edge: .bottom) { AuditPageControls() }
         .task { browser?.refreshBuckets() }
+        .task(id: store.findings(in: sectionId)) {
+            let findings = store.findings(in: sectionId)
+            let decoded = await Task.detached { LensModel.rows(findings) }.value
+            guard !Task.isCancelled else { return }
+            rows = decoded
+        }
     }
 
     @ViewBuilder
     private var emptyState: some View {
         switch store.status(of: sectionId) {
-        case .scanning(let msg, _, _):
+        case let .scanning(msg, _, _):
             VStack(spacing: 12) {
                 ProgressView()
                 Text(msg.isEmpty ? "Scanning…" : msg).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-        case .failed(let error):
+        case let .failed(error):
             ContentUnavailableView {
                 Label("Scan failed", systemImage: "exclamationmark.triangle")
             } description: {
                 Text(error)
             } actions: {
-                Button("Retry") { store.rescan(sectionId) }
+                Button("Refresh All") { store.rescanAll() }.disabled(!store.canRefresh)
             }
         case .idle:
             ContentUnavailableView {
                 Label("Not scanned", systemImage: "magnifyingglass")
             } actions: {
-                Button("Scan") { store.rescan(sectionId) }
+                Button("Refresh All") { store.rescanAll() }.disabled(!store.canRefresh)
             }
         case .done:
             ContentUnavailableView("Nothing found", systemImage: "checkmark.circle")
@@ -88,7 +97,8 @@ private struct LensHeaderCard: View {
                     ],
                     capacity: coverage.diskTotal,
                     trailingLabel: coverage.restOfDisk > 0
-                        ? "\(Formatting.bytes(coverage.restOfDisk)) rest of disk" : nil)
+                        ? "\(Formatting.bytes(coverage.restOfDisk)) rest of disk" : nil
+                )
                 Text(
                     "\(Formatting.bytes(coverage.attributed)) attributed · \(Formatting.bytes(coverage.baseline)) baseline · \(Formatting.bytes(coverage.unattributed)) unattributed"
                 )
@@ -97,10 +107,11 @@ private struct LensHeaderCard: View {
                 if !coverage.missingDeps.isEmpty {
                     Label(
                         "Not yet scanned, so this coverage is partial: \(coverage.missingDeps.map { store.meta(for: $0)?.title ?? $0.slug }.joined(separator: ", "))",
-                        systemImage: "exclamationmark.triangle")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
+                        systemImage: "exclamationmark.triangle"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
                 }
             } else {
                 Text(store.isScanning ? "Coverage fills in as the scan completes…" : "Coverage not available yet.")
@@ -136,12 +147,14 @@ private struct ProjectsLensTable: View {
     let store: AuditStore
     let rows: [LensModel.Row]
     @State private var sortOrder: [KeyPathComparator<LensModel.Row>] = [
-        KeyPathComparator(\.summary.exclusive, order: .reverse)
+        KeyPathComparator(\.summary.exclusive, order: .reverse),
     ]
+    @State private var presented: [LensModel.Row] = []
+    @State private var presentedSource: [LensModel.Row] = []
 
     var body: some View {
         @Bindable var store = store
-        Table(rows.sorted(using: sortOrder), selection: $store.selectedFinding, sortOrder: $sortOrder) {
+        Table(presentedSource == rows ? presented : [], selection: $store.selectedFinding, sortOrder: $sortOrder) {
             lensSharedColumns()
             TableColumn("Worktrees", value: \.worktreeCount) { row in
                 Text("\(row.summary.worktrees.count)").foregroundStyle(.secondary)
@@ -159,6 +172,14 @@ private struct ProjectsLensTable: View {
             .width(min: 60, ideal: 110)
         }
         .lensRowActions(store: store, axis: .projects, rows: rows)
+        .task(id: LensSortRequest(rows: rows, order: sortOrder)) {
+            let source = rows
+            let order = sortOrder
+            let sorted = await Task.detached { source.sorted(using: order) }.value
+            guard !Task.isCancelled else { return }
+            presented = sorted
+            presentedSource = source
+        }
     }
 }
 
@@ -166,12 +187,14 @@ private struct AppsLensTable: View {
     let store: AuditStore
     let rows: [LensModel.Row]
     @State private var sortOrder: [KeyPathComparator<LensModel.Row>] = [
-        KeyPathComparator(\.summary.exclusive, order: .reverse)
+        KeyPathComparator(\.summary.exclusive, order: .reverse),
     ]
+    @State private var presented: [LensModel.Row] = []
+    @State private var presentedSource: [LensModel.Row] = []
 
     var body: some View {
         @Bindable var store = store
-        Table(rows.sorted(using: sortOrder), selection: $store.selectedFinding, sortOrder: $sortOrder) {
+        Table(presentedSource == rows ? presented : [], selection: $store.selectedFinding, sortOrder: $sortOrder) {
             lensSharedColumns()
             TableColumn("Kind", value: \.ownerKindLabel) { row in
                 Text(row.summary.ownerKind ?? "–").foregroundStyle(.secondary)
@@ -179,7 +202,20 @@ private struct AppsLensTable: View {
             .width(90)
         }
         .lensRowActions(store: store, axis: .appStorage, rows: rows)
+        .task(id: LensSortRequest(rows: rows, order: sortOrder)) {
+            let source = rows
+            let order = sortOrder
+            let sorted = await Task.detached { source.sorted(using: order) }.value
+            guard !Task.isCancelled else { return }
+            presented = sorted
+            presentedSource = source
+        }
     }
+}
+
+private struct LensSortRequest: Equatable {
+    var rows: [LensModel.Row]
+    var order: [KeyPathComparator<LensModel.Row>]
 }
 
 /// The five columns every lens table shows (Name/Share/Exclusive/Shared/
@@ -212,11 +248,11 @@ private func lensSharedColumns() -> some TableColumnContent<LensModel.Row, KeyPa
     .width(min: 70, ideal: 90)
 }
 
-extension View {
+private extension View {
     /// The lens table's shared row context menu + primary (double-click/
     /// Return) open action — identical between the two tables apart from
     /// `axis`.
-    fileprivate func lensRowActions(store: AuditStore, axis: AttributionAxis, rows: [LensModel.Row]) -> some View {
+    func lensRowActions(store: AuditStore, axis: AttributionAxis, rows: [LensModel.Row]) -> some View {
         contextMenu(forSelectionType: UInt64.self) { ids in
             if let id = ids.first, let row = rows.first(where: { $0.id == id }) {
                 LensRowContextMenu(store: store, axis: axis, row: row)
@@ -229,11 +265,22 @@ extension View {
     }
 }
 
-extension LensModel.Row {
-    fileprivate var worktreeCount: Int { summary.worktrees.count }
-    fileprivate var processCount: Int { summary.processCount }
-    fileprivate var portCount: Int { summary.ports.count }
-    fileprivate var ownerKindLabel: String { summary.ownerKind ?? "" }
+private extension LensModel.Row {
+    var worktreeCount: Int {
+        summary.worktrees.count
+    }
+
+    var processCount: Int {
+        summary.processCount
+    }
+
+    var portCount: Int {
+        summary.ports.count
+    }
+
+    var ownerKindLabel: String {
+        summary.ownerKind ?? ""
+    }
 }
 
 /// A small stacked capsule bar: exclusive (solid accent), shared (faded
@@ -271,10 +318,11 @@ private struct LensTreemap: View {
     let axis: AttributionAxis
     let rows: [LensModel.Row]
     let buckets: FootprintBuckets?
+    @State private var cells: [TreemapCell] = []
+    @State private var rowById: [String: LensModel.Row] = [:]
 
     var body: some View {
         GeometryReader { geo in
-            let (cells, rowById) = layout(size: geo.size)
             TreemapCanvas(
                 cells: cells,
                 // No treemap-level selection highlight here (never drawn
@@ -288,15 +336,32 @@ private struct LensTreemap: View {
                 onOpen: { cell in
                     guard cell.depth == 0, let row = rowById[cell.id] else { return }
                     store.owners[axis]?.open(row.finding)
-                })
+                }
+            )
+            .task(id: LegacySceneRequest(size: geo.size, rows: rows, buckets: buckets)) {
+                cells = []
+                rowById = [:]
+                let rows = rows
+                let buckets = buckets
+                let size = geo.size
+                let result = await Task.detached { Self.layout(rows: rows, buckets: buckets, size: size) }.value
+                guard !Task.isCancelled else { return }
+                cells = result.0
+                rowById = result.1
+            }
         }
     }
 
     // MARK: - Layout
 
-    private func layout(size: CGSize) -> ([TreemapCell], [String: LensModel.Row]) {
+    private nonisolated static func layout(rows: [LensModel.Row], buckets: FootprintBuckets?, size: CGSize) -> ([TreemapCell], [String: LensModel.Row]) {
         guard size.width > 0, size.height > 0 else { return ([], [:]) }
-        let items = LensModel.treemapItems(rows, buckets: buckets)
+        let allItems = LensModel.treemapItems(rows, buckets: buckets)
+        var items = Array(allItems.prefix(1023))
+        let residual = allItems.dropFirst(1023).reduce(0.0) { $0 + $1.value }
+        if residual > 0 {
+            items.append(Squarify.Item(id: "Other owners", value: residual))
+        }
         let rowById = Dictionary(uniqueKeysWithValues: rows.map { (LensModel.treemapOwnerId($0), $0) })
         let itemValueById = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0.value) })
 
@@ -315,23 +380,43 @@ private struct LensTreemap: View {
                 }
             cells.append(TreemapCell(id: cell.id, title: title, bytes: bytes, rect: cell.rect, depth: 0, fill: fill))
 
-            guard let row, cell.rect.width >= 60, cell.rect.height >= 40 else { continue }
+            guard let row, cell.rect.width >= 60, cell.rect.height >= 40, cells.count < 2048 - items.count else { continue }
             let kindItems = LensModel.kindItems(row)
             guard !kindItems.isEmpty else { continue }
             let inner = cell.rect.insetBy(dx: 3, dy: 3)
             let content = CGRect(x: inner.minX, y: inner.minY + 16, width: inner.width, height: inner.height - 16)
             guard content.width > 0, content.height > 0 else { continue }
             let kindByCellId = Dictionary(
-                uniqueKeysWithValues: kindItems.enumerated().map { i, item in (item.id, row.summary.byKind[i]) })
+                uniqueKeysWithValues: kindItems.enumerated().map { i, item in (item.id, row.summary.byKind[i]) }
+            )
             for kindCell in Squarify.layout(kindItems, in: content) {
+                guard cells.count < 2048 else { break }
                 guard let k = kindByCellId[kindCell.id] else { continue }
                 cells.append(
                     TreemapCell(
                         id: kindCell.id, title: k.label, bytes: k.bytes, rect: kindCell.rect, depth: 1,
-                        fill: Palette.color(for: k.label).opacity(0.55)))
+                        fill: Palette.color(for: k.label).opacity(0.55)
+                    )
+                )
             }
         }
         return (cells, rowById)
+    }
+}
+
+private struct LegacySceneRequest: Equatable {
+    let size: CGSize
+    let rows: [LensModel.Row]
+    let buckets: FootprintBuckets?
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.size == rhs.size && lhs.rows == rhs.rows
+            && lhs.buckets?.axis == rhs.buckets?.axis
+            && lhs.buckets?.baseline == rhs.buckets?.baseline
+            && lhs.buckets?.unattributed == rhs.buckets?.unattributed
+            && lhs.buckets?.diskTotal == rhs.buckets?.diskTotal
+            && lhs.buckets?.attributedTotal == rhs.buckets?.attributedTotal
+            && lhs.buckets?.missingDeps == rhs.buckets?.missingDeps
     }
 }
 
@@ -350,8 +435,9 @@ private struct LensRowContextMenu: View {
             }
         }
         Divider()
-        Button("Rescan \(axis.title)") {
-            store.rescan(axis.sectionId)
+        Button("Refresh All") {
+            store.rescanAll()
         }
+        .disabled(!store.canRefresh)
     }
 }

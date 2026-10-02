@@ -1,19 +1,7 @@
-//! Global developer-tool audit: what is installed by npm, pnpm, cargo, pipx,
-//! uv, pip and bun; which manager owns each copy; which executable the user's
-//! login shell actually runs; and what evidence supports keeping or removing
-//! each installation.
-//!
-//! Scans are filesystem-metadata-first: the only subprocesses are one login
-//! shell probe for `$PATH` (plus `dscl` to find that shell) and an optional
-//! `npm prefix -g`. Discovered binaries are never executed and Python modules
-//! are never imported. Each manager probe degrades independently: a missing
-//! manager is `absent`, malformed metadata is `partial`, and neither aborts
-//! the section.
-//!
-//! Findings: one `GlobalTool` per installation (keyed
-//! `{manager}:{root}:{name}` so two copies of one package stay distinct and
-//! stable across scans), one `CommandResolution` per exported command
-//! name (login shell vs this process), and one `ToolCoverage` row.
+//! Filesystem-only global developer-tool audit for npm, pnpm, cargo, pipx,
+//! uv, pip and bun. Command resolution uses inherited process PATH; no
+//! automatic shell startup or npm prefix subprocess is executed. Discovered
+//! binaries are never executed and Python modules are never imported.
 
 pub mod bun;
 pub mod cargo;
@@ -33,14 +21,13 @@ pub mod uv;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::config::{Paths, ToolsConfig};
 use crate::model::{Finding, FindingKind, Guard, Remedy, RemedyCommand, ScannerId, Severity};
-use crate::scan::{run_with_timeout, ScanCtx, Scanner};
+use crate::scan::{ScanCtx, Scanner};
 use shellpath::ShellPath;
 use types::*;
 
@@ -52,7 +39,7 @@ pub struct ProbeCtx<'a> {
     pub shell: &'a ShellPath,
     /// Homebrew prefix with a `Cellar/`, when present.
     pub brew_prefix: Option<PathBuf>,
-    /// Extra npm prefixes reported by `npm prefix -g`.
+    /// Explicit additional npm filesystem candidates.
     pub extra_npm_prefixes: Vec<PathBuf>,
 }
 
@@ -659,8 +646,8 @@ fn coverage_finding(
             shell.shell_name().unwrap_or(&s.display().to_string()),
             p.len()
         ),
-        (Some(s), None) => format!("{} PATH unavailable; process PATH used", s.display()),
-        (None, _) => "login shell unknown; process PATH used".to_string(),
+        (_, None) => "inherited process PATH; shell startup not executed".to_string(),
+        (None, Some(_)) => "explicit PATH supplied".to_string(),
     };
     Finding::new(
         FindingKind::ToolCoverage,
@@ -709,7 +696,7 @@ impl Scanner for ToolsScanner {
     }
 
     async fn scan(&self, ctx: ScanCtx) -> anyhow::Result<()> {
-        ctx.progress("login shell PATH", 0, None).await;
+        ctx.progress("inherited process PATH", 0, None).await;
         let shell = shellpath::detect(&ctx).await;
         let config = ctx.config.tools.clone();
         let brew_prefix = config
@@ -718,17 +705,7 @@ impl Scanner for ToolsScanner {
             .map(|p| ctx.paths.expand(p))
             .filter(|p| p.join("Cellar").is_dir() || p.join("lib").is_dir())
             .or_else(crate::scan::brew::brew_prefix);
-        // `npm prefix -g` is just one more candidate prefix; a missing npm
-        // costs nothing.
-        let mut extra_npm_prefixes = Vec::new();
-        if let Some(out) =
-            run_with_timeout(&ctx, "npm", &["prefix", "-g"], Duration::from_secs(10)).await
-        {
-            let line = out.stdout_str().trim().to_string();
-            if !line.is_empty() {
-                extra_npm_prefixes.push(PathBuf::from(line));
-            }
-        }
+        let extra_npm_prefixes = Vec::new();
         ctx.progress("manager metadata", 1, None).await;
         let paths = ctx.paths.clone();
         let shell_for_probe = shell.clone();
@@ -811,6 +788,7 @@ mod tests {
     use crate::runner::MockCommandRunner;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn exe(p: &Path) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -1034,40 +1012,24 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.tools.include_apple_python = false;
         config.tools.homebrew_prefix = Some(prefix.display().to_string());
-        let mock = MockCommandRunner::new()
-            .on(
-                "dscl",
-                &[
-                    ".",
-                    "-read",
-                    &format!("/Users/{}", home.file_name().unwrap().to_str().unwrap()),
-                    "UserShell",
-                ],
-                "UserShell: /opt/homebrew/bin/fish\n",
-            )
-            .on(
-                "/opt/homebrew/bin/fish",
-                &["-lc", "string join : $PATH"],
-                &format!(
-                    "{}:{}:{}\n",
-                    home.join("Library/pnpm/bin").display(),
-                    home.join(".local/bin").display(),
-                    prefix.join("bin").display()
-                ),
-            );
+        let mock = Arc::new(MockCommandRunner::new());
         let ctx = ScanCtx {
             tx,
             token: tokio_util::sync::CancellationToken::new(),
             gen: 1,
             config: Arc::new(config),
             paths: Arc::new(Paths::from_home(home)),
-            runner: Arc::new(mock),
+            runner: mock.clone(),
             current: ScannerId::Tools,
             repo_tx: None,
             repo_rx: None,
             fs_discovery_only: false,
         };
         ToolsScanner.scan(ctx).await.unwrap();
+        assert!(
+            mock.calls().is_empty(),
+            "automatic tool scans must not launch subprocesses"
+        );
         let mut findings = Vec::new();
         while let Ok(ev) = rx.try_recv() {
             if let ScanEvent::Finding { finding, .. } = ev {
@@ -1131,20 +1093,21 @@ mod tests {
         assert!(certifi.remedies.is_empty());
         assert_eq!(certifi.meta["group"], "pip (homebrew-3.14)");
 
-        // The process PATH here is the real one (not injectable in-process),
-        // so only shell-side facts are asserted: the tmp shim wins in fish.
         let cmds: Vec<&Finding> = findings
             .iter()
             .filter(|f| f.kind == FindingKind::CommandResolution)
             .collect();
         let wr = cmds.iter().find(|f| f.title == "wrangler").unwrap();
-        assert_eq!(wr.meta["user_shell"]["shell"], "fish");
-        assert!(wr.meta["user_resolution"]
-            .as_str()
-            .unwrap()
-            .ends_with("Library/pnpm/bin/wrangler"));
-        assert_eq!(wr.meta["differs"], true);
-        assert_eq!(wr.severity, Severity::Attention);
+        assert_eq!(
+            wr.meta["process_resolution"],
+            json!(shellpath::resolve_first("wrangler", &Paths::process_path()))
+        );
+        assert!(cmds.iter().all(|finding| {
+            finding.meta["user_resolution"].is_null()
+                && finding.meta["differs"].is_null()
+                && finding.severity == Severity::Info
+                && finding.provenance.as_deref() == Some("process PATH only")
+        }));
 
         let cov = findings
             .iter()
@@ -1152,12 +1115,18 @@ mod tests {
             .unwrap();
         assert_eq!(cov.meta["managers"]["bun"]["status"], "absent");
         assert_eq!(cov.meta["managers"]["pnpm"]["status"], "ok");
-        assert_eq!(cov.meta["shell"]["login_shell"], "/opt/homebrew/bin/fish");
+        assert_eq!(cov.meta["shell"]["login_shell"], json!(Paths::env_shell()));
+        assert_eq!(cov.meta["shell"]["source"], "process PATH");
+        assert!(cov.meta["shell"]["entries"].is_null());
+        assert_eq!(
+            cov.meta["shell"]["process_entries"],
+            Paths::process_path().len()
+        );
         assert!(cov
             .coverage
             .as_deref()
             .unwrap()
-            .contains("startup configuration"));
+            .contains("user shell startup configuration is not executed"));
     }
 
     #[tokio::test]

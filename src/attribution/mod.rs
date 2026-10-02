@@ -134,15 +134,20 @@ async fn run(
     // async runtime. The snapshots are moved in; the ctx handles are Arcs.
     let (paths, config, runner) = (ctx.paths.clone(), ctx.config.clone(), ctx.runner.clone());
     let gen = ctx.gen;
-    let set = tokio::task::spawn_blocking(move || {
+    let set = tokio::task::spawn_blocking(move || -> anyhow::Result<FootprintSet> {
+        let _materialization = crate::scan::walk::listing::MaterializationGuard::enter().map_err(
+            |error| {
+                anyhow::anyhow!("attribution filesystem pass unavailable: no-materialization policy failed: {error}")
+            },
+        )?;
         let trees: Vec<Arc<crate::scan::walk::DirTree>> = snapshots
             .values()
             .flat_map(|s| s.dir_trees.iter().cloned())
             .collect();
         let env = ResolveEnv::new(&paths, &config, &trees, &snapshots, runner.as_ref());
-        resolve_axis(axis, &env)
+        Ok(resolve_axis(axis, &env))
     })
-    .await?;
+    .await??;
     // `resolve_axis`'s resolve pass has no way to know this scan's
     // generation or which dependency sections came back missing — both are
     // only known here, before the pass even starts. Reconstructed rather

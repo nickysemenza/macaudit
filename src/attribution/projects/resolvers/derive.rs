@@ -5,7 +5,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use super::Key;
 use super::super::parsers;
@@ -16,20 +15,14 @@ use crate::attribution::projects::Project;
 /// hold entries for every package ever installed anywhere.
 const MAX_NPM_INDEX_FILES: usize = 50_000;
 
-/// `(name, version) -> integrity` built once per process from the whole
+/// `(name, version) -> integrity` built once per run from the whole
 /// cacache index (a full scan can touch tens of thousands of small files),
 /// then reused for every package `npm-cacache` rows look up — the
 /// per-`Key` signature `Target::Derive` calls with would otherwise re-walk
 /// the index once per locked package.
-static NPM_INDEX: Mutex<Option<HashMap<(String, String), String>>> = Mutex::new(None);
-
 pub fn npm_cacache(key: &Key, _project: &Project, env: &ResolveEnv<'_>) -> Vec<PathBuf> {
     let index_dir = env.paths.home.join(".npm/_cacache/index-v5");
-    let mut guard = NPM_INDEX.lock().unwrap();
-    if guard.is_none() {
-        *guard = Some(scan_npm_index(&index_dir));
-    }
-    let index = guard.as_ref().unwrap();
+    let (index, _) = env.package_integrities.get_or_init(|| scan_npm_index(&index_dir));
     let Some(integrity) = index.get(&(key.name.clone(), key.version.clone())) else {
         return Vec::new();
     };
@@ -45,8 +38,13 @@ pub fn npm_cacache(key: &Key, _project: &Project, env: &ResolveEnv<'_>) -> Vec<P
         .join(rest)]
 }
 
-fn scan_npm_index(index_dir: &Path) -> HashMap<(String, String), String> {
+fn scan_npm_index(index_dir: &Path) -> crate::attribution::model::PackageIntegrities {
+    let mut memory = crate::inventory::MemoryBudget::shared().reserve(0).expect("zero-byte reservation");
     let mut out = HashMap::new();
+    let Ok(_materialization) = crate::scan::walk::listing::MaterializationGuard::enter() else {
+        return (out, memory);
+    };
+    if memory.grow(4 * 1024 * 1024).is_err() { return (out, memory); }
     let mut scanned = 0usize;
     let mut stack = vec![index_dir.to_path_buf()];
     'outer: while let Some(dir) = stack.pop() {
@@ -62,11 +60,12 @@ fn scan_npm_index(index_dir: &Path) -> HashMap<(String, String), String> {
                 continue;
             };
             if file_type.is_dir() {
+                if stack.len() >= 4096 { break 'outer; }
                 stack.push(path);
                 continue;
             }
             scanned += 1;
-            let Ok(content) = std::fs::read_to_string(&path) else {
+            let Some(content) = crate::scan::read_head(&path, 64 * 1024) else {
                 continue;
             };
             for line in content.lines() {
@@ -97,6 +96,10 @@ fn scan_npm_index(index_dir: &Path) -> HashMap<(String, String), String> {
                     let (name, version) = name_version.split_at(idx);
                     let version = &version[1..];
                     if !name.is_empty() && !version.is_empty() {
+                        if out.len() >= MAX_NPM_INDEX_FILES || name.len() > 4096 || version.len() > 4096 || integrity.len() > 4096 {
+                            break 'outer;
+                        }
+                        if memory.grow(256 + name.len() + version.len() + integrity.len()).is_err() { break 'outer; }
                         out.insert(
                             (name.to_string(), version.to_string()),
                             integrity.to_string(),
@@ -106,7 +109,7 @@ fn scan_npm_index(index_dir: &Path) -> HashMap<(String, String), String> {
             }
         }
     }
-    out
+    (out, memory)
 }
 
 /// `key.name` is the raw, unexpanded `CARGO_TARGET_DIR`/`target-dir` value —
@@ -191,10 +194,11 @@ pub fn project_name_cache(key: &Key, _project: &Project, env: &ResolveEnv<'_>) -
         let Some(node) = crate::attribution::paths::node_at(env.trees, &parent) else {
             continue;
         };
-        for child in node.children.iter() {
-            let child_lower = child.name.to_ascii_lowercase();
+        for child in node.children() {
+            let child_name = child.name();
+            let child_lower = child_name.to_ascii_lowercase();
             if variants.contains(&child_lower) {
-                out.push(parent.join(&*child.name));
+                out.push(parent.join(child_name.as_ref()));
             }
         }
     }

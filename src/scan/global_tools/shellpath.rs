@@ -1,31 +1,21 @@
-//! The user's *login shell* PATH versus this process's PATH, and command
-//! resolution against either. The agent/app that launches MacAudit often has
-//! a different PATH than the interactive shell (on the audited Mac, fish
-//! resolved `pnpm` and Codex differently than the process did), so nothing
-//! here assumes they match.
-//!
-//! Reading the login shell's PATH starts that shell, which executes its
-//! startup files — disclosed on the coverage finding and in the README. No
-//! rc file is read or displayed.
+//! Inherited process PATH and filesystem-only executable resolution.
+//! Automatic scans never launch a shell or execute user startup files.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use serde::Serialize;
 
 use crate::config::Paths;
-use crate::scan::{run_with_timeout, ScanCtx};
+use crate::scan::ScanCtx;
 
 pub const DISCLOSURE: &str =
-    "Reading the login shell's PATH starts that shell (fish/zsh/bash -l), which executes its startup configuration.";
-
-const SHELL_TIMEOUT: Duration = Duration::from_secs(5);
+    "Automatic scans use inherited process PATH and filesystem metadata; user shell startup configuration is not executed.";
 
 #[derive(Serialize, Clone, Debug, Default)]
 pub struct ShellPath {
     pub login_shell: Option<PathBuf>,
-    /// `None` when the login shell could not be probed.
+    /// Optional explicitly supplied shell PATH; automatic detection leaves it unset.
     pub shell_path: Option<Vec<PathBuf>>,
     pub process_path: Vec<PathBuf>,
     pub source: String,
@@ -60,25 +50,6 @@ impl ShellPath {
     }
 }
 
-/// Parse `dscl . -read /Users/<user> UserShell` output.
-pub fn parse_user_shell(stdout: &str) -> Option<PathBuf> {
-    stdout
-        .lines()
-        .find_map(|l| l.strip_prefix("UserShell:"))
-        .map(|s| PathBuf::from(s.trim()))
-        .filter(|p| !p.as_os_str().is_empty())
-}
-
-/// The PATH-printing invocation for a shell, by basename.
-pub fn path_probe_args(shell_name: &str) -> Option<Vec<&'static str>> {
-    match shell_name {
-        "fish" => Some(vec!["-lc", "string join : $PATH"]),
-        "zsh" => Some(vec!["-ilc", "echo $PATH"]),
-        "bash" => Some(vec!["-ilc", "echo $PATH"]),
-        _ => None,
-    }
-}
-
 pub fn split_path(line: &str) -> Vec<PathBuf> {
     line.split(':')
         .filter(|s| !s.is_empty())
@@ -86,76 +57,19 @@ pub fn split_path(line: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Detect the login shell and read its PATH (bounded). Never fails: every
-/// gap becomes a note and `shell_path: None`.
-pub async fn detect(ctx: &ScanCtx) -> ShellPath {
-    let mut out = ShellPath {
+pub fn path_probe_args(_shell_name: &str) -> Option<Vec<&'static str>> {
+    None
+}
+
+/// Read inherited environment metadata without starting any subprocess.
+pub async fn detect(_ctx: &ScanCtx) -> ShellPath {
+    ShellPath {
+        login_shell: Paths::env_shell(),
+        shell_path: None,
         process_path: Paths::process_path(),
-        ..Default::default()
-    };
-    let user = ctx.paths.user_name();
-    let mut shell: Option<PathBuf> = None;
-    if let Some(user) = &user {
-        let record = format!("/Users/{user}");
-        if let Some(o) = run_with_timeout(
-            ctx,
-            "dscl",
-            &[".", "-read", &record, "UserShell"],
-            SHELL_TIMEOUT,
-        )
-        .await
-        {
-            shell = parse_user_shell(&o.stdout_str());
-        }
+        source: "process PATH".into(),
+        notes: Vec::new(),
     }
-    if shell.is_none() {
-        shell = Paths::env_shell();
-        if shell.is_some() {
-            out.notes
-                .push("login shell taken from $SHELL (directory services unavailable)".into());
-        }
-    }
-    out.login_shell = shell.clone();
-    let Some(shell) = shell else {
-        out.notes
-            .push("login shell unknown; using the process PATH only".into());
-        out.source = "process PATH".into();
-        return out;
-    };
-    let name = shell
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("")
-        .to_string();
-    let Some(args) = path_probe_args(&name) else {
-        out.notes.push(format!(
-            "unsupported login shell {name}; using the process PATH only"
-        ));
-        out.source = "process PATH".into();
-        return out;
-    };
-    let program = shell.to_string_lossy().to_string();
-    out.source = format!("{program} {}", args.join(" "));
-    match run_with_timeout(ctx, &program, &args, SHELL_TIMEOUT).await {
-        Some(o) => {
-            let stdout = o.stdout_str();
-            let line = stdout
-                .lines()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("");
-            let entries = split_path(line.trim());
-            if entries.is_empty() {
-                out.notes.push(format!("{name} printed an empty PATH"));
-            } else {
-                out.shell_path = Some(entries);
-            }
-        }
-        None => out.notes.push(format!(
-            "could not start {name} to read its PATH (timeout or failure)"
-        )),
-    }
-    out
 }
 
 /// Every executable named `name` on `dirs`, in PATH order. Dangling links
@@ -178,18 +92,10 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn parses_dscl_and_probe_args() {
-        assert_eq!(
-            parse_user_shell("UserShell: /opt/homebrew/bin/fish\n"),
-            Some(PathBuf::from("/opt/homebrew/bin/fish"))
-        );
-        assert_eq!(parse_user_shell("garbage"), None);
-        assert_eq!(
-            path_probe_args("fish").unwrap(),
-            ["-lc", "string join : $PATH"]
-        );
-        assert_eq!(path_probe_args("zsh").unwrap(), ["-ilc", "echo $PATH"]);
-        assert!(path_probe_args("nu").is_none());
+    fn automatic_shell_startup_probes_are_disabled() {
+        for shell in ["fish", "zsh", "bash", "sh"] {
+            assert!(path_probe_args(shell).is_none());
+        }
     }
 
     #[test]

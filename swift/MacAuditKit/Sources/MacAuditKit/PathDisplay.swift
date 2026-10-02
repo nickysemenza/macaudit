@@ -20,7 +20,8 @@ public enum PathDisplay {
     /// else its last path component. A `path` outside `root` yields just its
     /// own last component (no breadcrumb trail is possible).
     public static func components(_ path: String, root: String) -> [(label: String, path: String)] {
-        guard path == root || path.hasPrefix(root + "/") else {
+        let prefix = root == "/" ? "/" : root + "/"
+        guard path == root || path.hasPrefix(prefix) else {
             return [(lastComponent(path), path)]
         }
         let rootLabel = root == NSHomeDirectory() ? "~" : lastComponent(root)
@@ -28,9 +29,9 @@ public enum PathDisplay {
         guard path != root else { return out }
 
         var current = root
-        let suffix = path.dropFirst(root.count + 1)
+        let suffix = path.dropFirst(prefix.count)
         for part in suffix.split(separator: "/") {
-            current += "/" + part
+            current = current == "/" ? "/" + part : current + "/" + part
             out.append((String(part), current))
         }
         return out

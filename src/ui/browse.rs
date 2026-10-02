@@ -6,9 +6,10 @@
 //!
 //! The main panel lists only *directories* — a directory's own loose files
 //! never get a row there, since there is nothing to descend into. They show
-//! up instead as the cursor's "Largest files" in the detail pane.
+//! up instead as bounded retained scan summaries in the detail pane.
 
 use std::collections::BTreeMap;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -18,8 +19,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
 
+use crate::inventory::{DirectoryRef, MemoryBudget, Reservation};
 use crate::model::{ScannerId, Severity};
-use crate::scan::walk::{DirNode, DirTree};
+use crate::scan::walk::DirTree;
 use crate::ui::app::AppState;
 use crate::ui::layout::{self, Hit, Viewport};
 use crate::ui::present::{self, kv, Field};
@@ -58,24 +60,83 @@ impl Default for BrowseState {
 /// The tree node for `path`: the tree whose root is a prefix of `path`, then
 /// `DirNode::find` down to it. `None` when no loaded tree covers `path` (no
 /// scan yet, or a path outside every walked root).
-pub fn node_at<'a>(trees: &'a BTreeMap<PathBuf, Arc<DirTree>>, path: &Path) -> Option<&'a DirNode> {
+pub fn node_at<'a>(
+    trees: &'a BTreeMap<PathBuf, Arc<DirTree>>,
+    path: &Path,
+) -> Option<DirectoryRef<'a>> {
     let (root, tree) = trees
         .iter()
         .find(|(root, _)| path.starts_with(root.as_path()))?;
     tree.node.find(root, path)
 }
 
-/// `node`'s children in the active sort: `Size` is allocated-bytes
-/// descending (ties broken by name), `Name` is case-insensitive.
-pub fn entries(node: &DirNode, sort: BrowseSort) -> Vec<&DirNode> {
-    let mut v: Vec<&DirNode> = node.children.iter().collect();
+/// The first bounded page of `node`'s scanned children, sorted within the page:
+/// `Size` is allocation descending; `Name` is case-insensitive.
+const MAX_CHILDREN: usize = 500;
+
+pub struct BrowseEntries<'arena> {
+    rows: Vec<DirectoryRef<'arena>>,
+    truncated: bool,
+    resource_limited: bool,
+    _memory: Option<Reservation>,
+}
+
+impl<'arena> std::ops::Deref for BrowseEntries<'arena> {
+    type Target = [DirectoryRef<'arena>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.rows
+    }
+}
+
+pub fn entries(node: DirectoryRef<'_>, sort: BrowseSort) -> BrowseEntries<'_> {
+    entries_with_budget(node, sort, &MemoryBudget::shared())
+}
+
+fn entries_with_budget<'arena>(
+    node: DirectoryRef<'arena>,
+    sort: BrowseSort,
+    budget: &Arc<MemoryBudget>,
+) -> BrowseEntries<'arena> {
+    let memory = match budget.reserve(MAX_CHILDREN * std::mem::size_of::<DirectoryRef<'_>>() + 8192)
+    {
+        Ok(memory) => memory,
+        Err(_) => {
+            return BrowseEntries {
+                rows: Vec::new(),
+                truncated: false,
+                resource_limited: true,
+                _memory: None,
+            };
+        }
+    };
+    let mut children = node.children();
+    let mut rows = Vec::with_capacity(MAX_CHILDREN);
+    rows.extend(children.by_ref().take(MAX_CHILDREN));
+    let truncated = children.next().is_some();
     match sort {
         BrowseSort::Size => {
-            v.sort_by(|a, b| b.alloc.cmp(&a.alloc).then_with(|| a.name.cmp(&b.name)))
+            rows.sort_unstable_by(|left, right| {
+                right
+                    .alloc
+                    .cmp(&left.alloc)
+                    .then_with(|| left.raw_name().cmp(right.raw_name()))
+            });
         }
-        BrowseSort::Name => v.sort_by_key(|a| a.name.to_lowercase()),
+        BrowseSort::Name => rows.sort_unstable_by(|left, right| {
+            left.name()
+                .chars()
+                .flat_map(char::to_lowercase)
+                .cmp(right.name().chars().flat_map(char::to_lowercase))
+                .then_with(|| left.raw_name().cmp(right.raw_name()))
+        }),
     }
-    v
+    BrowseEntries {
+        rows,
+        truncated,
+        resource_limited: false,
+        _memory: Some(memory),
+    }
 }
 
 /// A `width`-cell bar, `part / whole` filled with `█`, the rest `░`. A zero
@@ -117,7 +178,7 @@ fn thousands(n: u64) -> String {
 
 /// Main panel: the current directory's children as a directory listing (no
 /// group headers, no files — a directory's own files are the detail pane's
-/// "Largest files"). Falls back to an "indexing" placeholder when the tree
+/// bounded scan summary). Falls back to an "indexing" placeholder when the tree
 /// has vanished (a Disk rescan clears `dir_trees` while still in Browse).
 pub fn draw(app: &AppState, frame: &mut Frame, area: Rect, vp: &mut Viewport) {
     let Some(node) = node_at(&app.dir_trees, &app.browse.path) else {
@@ -125,7 +186,8 @@ pub fn draw(app: &AppState, frame: &mut Frame, area: Rect, vp: &mut Viewport) {
         return;
     };
 
-    let title = format!(
+    let entries = entries(node, app.browse.sort);
+    let mut title = format!(
         " {} · {} · {} files{} ",
         fmt::abbrev_home(&app.browse.path),
         fmt::bytes(node.alloc),
@@ -136,14 +198,20 @@ pub fn draw(app: &AppState, frame: &mut Frame, area: Rect, vp: &mut Viewport) {
             String::new()
         },
     );
+    if entries.truncated {
+        title.push_str(" first 500 scanned children · page-local sort ");
+    }
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
 
-    let entries = entries(node, app.browse.sort);
     if entries.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "no subdirectories",
+                if entries.resource_limited {
+                    "memory budget exhausted; folder page unavailable"
+                } else {
+                    "no subdirectories"
+                },
                 Style::default().fg(Color::DarkGray),
             )))
             .block(block)
@@ -213,19 +281,22 @@ pub fn draw(app: &AppState, frame: &mut Frame, area: Rect, vp: &mut Viewport) {
 }
 
 fn render_entry_row(
-    child: &DirNode,
+    child: &DirectoryRef<'_>,
     parent_alloc: u64,
     show_bar: bool,
     rects: &[Rect],
 ) -> Row<'static> {
-    let has_children = !child.children.is_empty();
+    let has_children = child.children().next().is_some();
     let gutter = if child.errors > 0 {
         Span::styled("!", Style::default().fg(Color::Red))
     } else {
         Span::raw(" ")
     };
     let glyph = if has_children { theme::COLLAPSED } else { " " };
-    let name = fmt::truncate_end(&format!("{glyph} {}", child.name), rects[1].width as usize);
+    let name = fmt::truncate_end(
+        &format!("{glyph} {}", child.name()),
+        rects[1].width as usize,
+    );
     let size = fmt::bytes(child.alloc);
     let pct = if parent_alloc == 0 {
         0.0
@@ -264,7 +335,7 @@ fn draw_indexing(frame: &mut Frame, area: Rect) {
 }
 
 /// Detail pane: totals for the entry under the cursor (or the current
-/// directory itself when it has no children), its largest own files, and
+/// directory itself when it has no children), retained own-file summaries, and
 /// the Disk findings rooted under it.
 pub fn draw_detail(app: &AppState, frame: &mut Frame, area: Rect) {
     let block = Block::default().borders(Borders::LEFT).title(" Detail ");
@@ -273,11 +344,23 @@ pub fn draw_detail(app: &AppState, frame: &mut Frame, area: Rect) {
         return;
     };
     let kids = entries(node, app.browse.sort);
+    if kids.resource_limited {
+        frame.render_widget(
+            Paragraph::new("memory budget exhausted; folder detail unavailable").block(block),
+            area,
+        );
+        return;
+    }
     let (target, path) = if kids.is_empty() {
         (node, app.browse.path.clone())
     } else {
         let idx = app.browse.cursor.min(kids.len() - 1);
-        (kids[idx], app.browse.path.join(&*kids[idx].name))
+        (
+            kids[idx],
+            app.browse
+                .path
+                .join(std::ffi::OsStr::from_bytes(kids[idx].raw_name())),
+        )
     };
     let fields = detail_fields(app, target, &path);
     let inner_width = block.inner(area).width;
@@ -288,10 +371,10 @@ pub fn draw_detail(app: &AppState, frame: &mut Frame, area: Rect) {
     );
 }
 
-fn detail_fields(app: &AppState, node: &DirNode, path: &Path) -> Vec<Field> {
+fn detail_fields(app: &AppState, node: DirectoryRef<'_>, path: &Path) -> Vec<Field> {
     let mut fields = vec![
         Field::Header(""),
-        Field::Text(node.name.to_string()),
+        Field::Text(node.name().into_owned()),
         Field::Blank,
         kv("Allocated", fmt::bytes(node.alloc)),
         kv("Apparent", fmt::bytes(node.apparent)),
@@ -304,17 +387,42 @@ fn detail_fields(app: &AppState, node: &DirNode, path: &Path) -> Vec<Field> {
         kv("Unreadable", "0")
     });
 
-    // Listed live (one directory, no recursion) rather than kept in the tree.
-    let top = crate::scan::walk::top_files_in(path, 3);
-    if !top.is_empty() {
+    if let Some(tree) = app
+        .dir_trees
+        .values()
+        .find(|tree| path.starts_with(&tree.root))
+    {
         fields.push(Field::Blank);
-        fields.push(Field::Header("Largest files"));
-        for f in &top {
+        fields.push(Field::Header("Large files · scan summary"));
+        fields.push(Field::Text(
+            "Up to 3 retained entries; not an exact folder ranking".into(),
+        ));
+        fields.push(kv(
+            "Scan coverage",
+            if tree.complete {
+                "complete snapshot"
+            } else {
+                "partial snapshot; files may be absent"
+            },
+        ));
+        let mut retained = 0;
+        for f in tree
+            .top_files
+            .iter()
+            .filter(|file| file.path.parent() == Some(path))
+            .take(3)
+        {
             let name = f
                 .path
                 .file_name()
                 .map_or_else(|| f.path.to_string_lossy(), |n| n.to_string_lossy());
             fields.push(kv(fmt::bytes(f.alloc), name.into_owned()));
+            retained += 1;
+        }
+        if retained == 0 {
+            fields.push(Field::Text(
+                "No entries retained for this folder; it may still contain files".into(),
+            ));
         }
     }
 
@@ -370,11 +478,11 @@ mod tests {
     fn node_at_resolves_root_nested_and_outside() {
         let trees = trees();
         let root = PathBuf::from("/Users/dev");
-        assert_eq!(&*node_at(&trees, &root).unwrap().name, "/Users/dev");
+        assert_eq!(&*node_at(&trees, &root).unwrap().name(), "/Users/dev");
 
         let nested = root.join("dev/cubby");
         let node = node_at(&trees, &nested).expect("nested path resolves");
-        assert_eq!(&*node.name, "cubby");
+        assert_eq!(&*node.name(), "cubby");
 
         assert!(node_at(&trees, Path::new("/Users/other")).is_none());
     }
@@ -391,10 +499,91 @@ mod tests {
         );
 
         let by_name = entries(root, BrowseSort::Name);
-        let names: Vec<String> = by_name.iter().map(|n| n.name.to_lowercase()).collect();
+        let names: Vec<String> = by_name.iter().map(|n| n.name().to_lowercase()).collect();
         let mut sorted = names.clone();
         sorted.sort();
         assert_eq!(names, sorted, "Name sort must be case-insensitive A-Z");
+    }
+
+    #[test]
+    fn wide_child_pages_are_bounded_and_hold_their_memory_credit() {
+        let arena_budget = MemoryBudget::new(8 * 1024 * 1024);
+        let mut arena = crate::inventory::DiskInventory::new(arena_budget).unwrap();
+        let root = arena
+            .add_directory(None, std::ffi::OsStr::new("root"))
+            .unwrap();
+        for position in 0..10_000 {
+            arena
+                .add_directory(
+                    Some(root),
+                    std::ffi::OsStr::new(&format!("child-{position:05}")),
+                )
+                .unwrap();
+        }
+        let node = arena.directory(root).unwrap();
+        let page_budget = MemoryBudget::new(64 * 1024);
+        for sort in [BrowseSort::Name, BrowseSort::Size] {
+            let page = entries_with_budget(node, sort, &page_budget);
+            assert_eq!(page.len(), MAX_CHILDREN);
+            assert!(page.truncated);
+            assert!(!page.resource_limited);
+            assert!(page_budget.used() > 0);
+            assert!(page
+                .iter()
+                .all(|child| child.raw_name() >= b"child-09500".as_slice()));
+            drop(page);
+            assert_eq!(page_budget.used(), 0);
+        }
+        let denied_budget = MemoryBudget::new(1);
+        let denied = entries_with_budget(node, BrowseSort::Name, &denied_budget);
+        assert!(denied.is_empty());
+        assert!(denied.resource_limited);
+        assert_eq!(denied_budget.used(), 0);
+    }
+
+    #[test]
+    fn detail_uses_retained_direct_file_summaries_without_frame_time_io() {
+        let home = tempfile::tempdir().unwrap();
+        let selected = home.path().join("Movies");
+        std::fs::create_dir(&selected).unwrap();
+        std::fs::write(selected.join("fresh-not-scanned.bin"), vec![1; 1024]).unwrap();
+        let mut tree = fake::dir_tree_at(home.path());
+        tree.complete = false;
+        tree.top_files = (0..4)
+            .map(|position| crate::scan::walk::BigFile {
+                path: selected.join(format!("retained-{position}.bin")),
+                alloc: 1000 - position,
+            })
+            .collect();
+        tree.top_files.insert(
+            0,
+            crate::scan::walk::BigFile {
+                path: selected.join("nested/not-direct.bin"),
+                alloc: 2000,
+            },
+        );
+        let mut app = AppState::default();
+        app.dir_trees.insert(tree.root.clone(), Arc::new(tree));
+        let node = node_at(&app.dir_trees, &selected).unwrap();
+        let fields = detail_fields(&app, node, &selected);
+        let rendered = crate::ui::detail::render(&fields, 80)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("scan summary"));
+        assert!(rendered.contains("not an exact folder ranking"));
+        assert!(rendered.contains("partial snapshot"));
+        assert!(rendered.contains("retained-0.bin"));
+        assert!(rendered.contains("retained-2.bin"));
+        assert!(!rendered.contains("retained-3.bin"));
+        assert!(!rendered.contains("not-direct.bin"));
+        assert!(!rendered.contains("fresh-not-scanned.bin"));
     }
 
     #[test]

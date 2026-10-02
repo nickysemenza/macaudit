@@ -2,6 +2,7 @@
 //! reducers. `Mode::Confirm`'s reducer (`handle_confirm`) lives in
 //! `marking.rs`, alongside the confirm-dialog planning it feeds.
 
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use crate::model::{FindingKind, ScannerId};
@@ -43,10 +44,12 @@ impl AppState {
             Action::Char('c') => self.open_report(),
             Action::Char('e') => self.cycle_remedy_choice(),
             Action::Char('d') => self.toggle_deps_direction(),
-            Action::Char('r') => {
-                self.pending_rescan = Some(RescanRequest::Section(self.selected_section_id()));
+            Action::Char('r') | Action::Char('R') => self.pending_rescan = Some(RescanRequest::All),
+            Action::Char('S') => self.pending_cancel_scan = true,
+            Action::Char('o') => {
+                self.root_input = self.selected_root.to_string_lossy().into_owned();
+                self.mode = Mode::Root;
             }
-            Action::Char('R') => self.pending_rescan = Some(RescanRequest::All),
             Action::Char('/') => self.mode = Mode::Filter,
             Action::Char('s') => self.set_sort(self.presenter().next_sort(self.sort())),
             Action::SortBy(col) => self.set_sort(self.presenter().click_sort(self.sort(), col)),
@@ -54,6 +57,22 @@ impl AppState {
             Action::Char('?') => self.mode = Mode::Help,
             Action::Char('b') => self.open_browse(),
             Action::OpenBrowseCategory(i) => self.open_browse_at_category(i),
+            _ => {}
+        }
+    }
+
+    pub(super) fn handle_root(&mut self, action: Action) {
+        match action {
+            Action::CtrlC => self.should_quit = true,
+            Action::Esc => self.mode = Mode::Normal,
+            Action::Backspace => {
+                self.root_input.pop();
+            }
+            Action::Char(character) => self.root_input.push(character),
+            Action::Enter => {
+                self.pending_root = Some(PathBuf::from(&self.root_input));
+                self.mode = Mode::Normal;
+            }
             _ => {}
         }
     }
@@ -77,6 +96,12 @@ impl AppState {
             Action::Backspace | Action::Left | Action::Char('h') => self.browse_up(),
             Action::Char('s') => self.browse_toggle_sort(),
             Action::Char('p') => self.toggle_detail(),
+            Action::Char('r') | Action::Char('R') => self.pending_rescan = Some(RescanRequest::All),
+            Action::Char('S') => self.pending_cancel_scan = true,
+            Action::Char('o') => {
+                self.root_input = self.selected_root.to_string_lossy().into_owned();
+                self.mode = Mode::Root;
+            }
             Action::Char('?') => self.mode = Mode::Help,
             _ => {}
         }
@@ -151,10 +176,13 @@ impl AppState {
         let Some(child) = entries.get(self.browse.cursor) else {
             return;
         };
-        if child.children.is_empty() {
+        if child.children().next().is_none() {
             return;
         }
-        let child_path = self.browse.path.join(&*child.name);
+        let child_path = self
+            .browse
+            .path
+            .join(std::ffi::OsStr::from_bytes(child.raw_name()));
         self.browse
             .stack
             .push((self.browse.path.clone(), self.browse.cursor));
@@ -429,6 +457,25 @@ mod tests {
             gen: 1,
             tree: Arc::new(fake::dir_tree()),
         });
+    }
+
+    #[test]
+    fn root_input_is_pending_until_manager_validates_it() {
+        let mut app = app_with_gen(1);
+        app.selected_root = PathBuf::from("/current");
+        app.apply(finding_event(1, "/partial", Some(9)));
+        app.handle(Action::Char('o'));
+        assert_eq!(app.mode, Mode::Root);
+        app.root_input = "/not-validated".to_string();
+        app.handle(Action::Enter);
+        assert_eq!(app.pending_root, Some(PathBuf::from("/not-validated")));
+        assert_eq!(app.selected_root, PathBuf::from("/current"));
+        assert_eq!(app.section_count(ScannerId::Apps), 1);
+        app.pending_root = None;
+        app.handle(Action::Char('o'));
+        app.handle(Action::Esc);
+        assert!(app.pending_root.is_none());
+        assert_eq!(app.selected_root, PathBuf::from("/current"));
     }
 
     #[test]

@@ -133,9 +133,28 @@ pub fn build_with_choice(
     if let Some(coverage) = &f.coverage {
         fields.push(kv("Coverage", coverage.clone()));
     }
+    if f.meta.get("context").and_then(serde_json::Value::as_str) == Some("audit_host") {
+        fields.push(kv("Context", "Global host audit"));
+    } else if let Some(context) = f
+        .meta
+        .get("run_context")
+        .and_then(|value| serde_json::from_value::<crate::engine::RunContext>(value.clone()).ok())
+    {
+        fields.push(kv(
+            "Context",
+            match context {
+                crate::engine::RunContext::Disk { selected_root } => {
+                    format!("Selected-root disk: {}", selected_root.display())
+                }
+                crate::engine::RunContext::AuditHost { .. } => "Global host audit".to_string(),
+            },
+        ));
+    }
 
     if f.meta.is_object() {
         let mut view = MetaView::new(&f.meta);
+        view.skip("context");
+        view.skip("run_context");
         let mut typed = (present::presenter(section).detail)(f, &mut view, ctx);
         typed.extend(present::generic_fields(&view.remaining()));
         if !typed.is_empty() {
@@ -279,6 +298,21 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn fixed_target_context_is_labelled_as_global() {
+        let finding = Finding::new(FindingKind::BuildArtifact, "fixed", "Fixed target")
+            .meta(serde_json::json!({"context": "audit_host"}));
+        let fields = build(
+            &finding,
+            ScannerId::Fs,
+            DeleteMode::Trash,
+            SystemTime::now(),
+        );
+        let text = text_of(&render(&fields, 100));
+        assert!(text.contains("Global host audit"));
+        assert!(!text.contains("audit_host"));
     }
 
     #[test]

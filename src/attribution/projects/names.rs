@@ -12,9 +12,9 @@ use serde_json::Value;
 
 use crate::attribution::model::ResolveEnv;
 use crate::attribution::paths::node_at;
+use crate::inventory::DirectoryRef;
 use crate::scan::global_tools::projects::SKIP_DIRS;
 use crate::scan::walk::listing::{self, Kind};
-use crate::scan::walk::DirNode;
 
 use super::discovery::is_package_dir;
 use super::{Project, ARTIFACT_DIR_NAMES};
@@ -157,7 +157,9 @@ fn resolve_simple_glob(env: &ResolveEnv<'_>, root: &Path, glob: &str) -> Vec<Pat
     let Some(node) = node_at(env.trees, &dir) else {
         return Vec::new();
     };
-    node.children.iter().map(|c| dir.join(&*c.name)).collect()
+    node.children()
+        .map(|child| dir.join(child.name().as_ref()))
+        .collect()
 }
 
 /// Walk the project's subtree once (depth-bounded, artifact/vendor dirs
@@ -170,7 +172,8 @@ fn collect_cargo_and_xcode(
     let Some(root_node) = node_at(env.trees, &project.root) else {
         return;
     };
-    let mut stack: Vec<(PathBuf, &DirNode, usize)> = vec![(project.root.clone(), root_node, 0)];
+    let mut stack: Vec<(PathBuf, DirectoryRef<'_>, usize)> =
+        vec![(project.root.clone(), root_node, 0)];
     while let Some((path, node, depth)) = stack.pop() {
         if let Ok(dir_listing) = listing::list(&path) {
             let has_cargo_toml = dir_listing
@@ -184,8 +187,9 @@ fn collect_cargo_and_xcode(
             }
         }
 
-        for child in node.children.iter() {
-            let name = &*child.name;
+        for child in node.children() {
+            let child_name = child.name();
+            let name = child_name.as_ref();
             if name.ends_with(".xcodeproj") {
                 let pbxproj = path.join(name).join("project.pbxproj");
                 if let Some(text) = env.read_head(&pbxproj, MAX_MANIFEST_BYTES) {
@@ -284,6 +288,85 @@ fn extract_swift_package_name(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attribution::testutil::{tree_fixture, EnvFixture};
+    use crate::scan::walk::DirNode;
+
+    #[test]
+    fn resolves_workspace_globs_from_inventory_children() {
+        let root = Path::new("/workspace");
+        let root_node = DirNode {
+            name: root.to_string_lossy().into(),
+            children: vec![DirNode {
+                name: "apps".into(),
+                children: vec![
+                    DirNode {
+                        name: "tool one".into(),
+                        ..DirNode::default()
+                    },
+                    DirNode {
+                        name: "tool-two".into(),
+                        ..DirNode::default()
+                    },
+                ]
+                .into_boxed_slice(),
+                ..DirNode::default()
+            }]
+            .into_boxed_slice(),
+            ..DirNode::default()
+        };
+        let mut fixture = EnvFixture::new();
+        fixture.trees.push(tree_fixture(root, &root_node));
+        let env = fixture.env();
+        let mut matches = resolve_simple_glob(&env, root, "apps/*");
+        matches.sort();
+        assert_eq!(
+            matches,
+            vec![root.join("apps/tool one"), root.join("apps/tool-two")]
+        );
+        assert!(resolve_simple_glob(&env, root, "missing/*").is_empty());
+    }
+
+    #[test]
+    fn collects_cargo_names_from_inventory_children_and_prunes_artifacts() {
+        let root = tempfile::tempdir().unwrap();
+        for (relative, name) in [("crate name", "workspace-tool"), ("target", "ignored-tool")] {
+            let directory = root.path().join(relative);
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::write(
+                directory.join("Cargo.toml"),
+                format!("[package]\nname = '{name}'\n"),
+            )
+            .unwrap();
+        }
+        let root_node = DirNode {
+            name: root.path().to_string_lossy().into(),
+            children: vec![
+                DirNode {
+                    name: "crate name".into(),
+                    ..DirNode::default()
+                },
+                DirNode {
+                    name: "target".into(),
+                    ..DirNode::default()
+                },
+            ]
+            .into_boxed_slice(),
+            ..DirNode::default()
+        };
+        let mut fixture = EnvFixture::new();
+        fixture.trees.push(tree_fixture(root.path(), &root_node));
+        let env = fixture.env();
+        let mut project = Project {
+            root: root.path().to_path_buf(),
+            name: "project".into(),
+            worktrees: Vec::new(),
+            names: Vec::new(),
+            bundle_ids: Vec::new(),
+            is_git: false,
+        };
+        collect_cargo_and_xcode(&mut project, &env, &mut HashSet::new());
+        assert_eq!(project.names, vec!["workspace-tool"]);
+    }
 
     #[test]
     fn extracts_bundle_identifier_from_a_pbxproj_snippet() {

@@ -7,10 +7,10 @@ use std::path::{Path, PathBuf};
 
 use crate::attribution::model::ResolveEnv;
 use crate::attribution::paths::node_at;
+use crate::inventory::DirectoryRef;
 use crate::model::{FindingKind, ScannerId};
 use crate::scan::global_tools::projects::{PROJECT_MARKERS, SKIP_DIRS};
 use crate::scan::walk::listing::{self, Kind};
-use crate::scan::walk::DirNode;
 
 use super::{Project, ProjectIndex, ARTIFACT_DIR_NAMES};
 
@@ -126,9 +126,9 @@ fn checkout_from_gitdir(content: &str, admin_dir: &Path) -> Option<PathBuf> {
 
 /// Sweep `$HOME`'s walked subtree for manifest-only projects: directories
 /// matching `PROJECT_MARKERS` that aren't already inside a discovered git
-/// root or worktree. A directory tree walk (`DirNode::children`, free —
+/// root or worktree. A directory tree walk (`DirectoryRef::children`, free —
 /// already in memory) chooses which directories to look at; each one costs
-/// exactly one live `listing::list` to check its filenames, since `DirNode`
+/// exactly one live `listing::list` to check its filenames, since the inventory
 /// tracks subdirectories but never individual files.
 fn manifest_projects(env: &ResolveEnv<'_>, exclude: &[PathBuf]) -> Vec<Project> {
     let home = env.paths.home.clone();
@@ -138,7 +138,7 @@ fn manifest_projects(env: &ResolveEnv<'_>, exclude: &[PathBuf]) -> Vec<Project> 
 
     let mut projects = Vec::new();
     let mut checked = 0usize;
-    let mut stack: Vec<(PathBuf, &DirNode, usize)> = vec![(home, home_node, 0)];
+    let mut stack: Vec<(PathBuf, DirectoryRef<'_>, usize)> = vec![(home, home_node, 0)];
     while let Some((path, node, depth)) = stack.pop() {
         if checked >= MAX_CANDIDATES {
             break;
@@ -173,8 +173,9 @@ fn manifest_projects(env: &ResolveEnv<'_>, exclude: &[PathBuf]) -> Vec<Project> 
         if depth >= MAX_SWEEP_DEPTH {
             continue;
         }
-        for child in node.children.iter() {
-            let name = &*child.name;
+        for child in node.children() {
+            let child_name = child.name();
+            let name = child_name.as_ref();
             if name.starts_with('.')
                 || name == "Library"
                 || SKIP_DIRS.contains(&name)
@@ -228,6 +229,44 @@ pub(crate) fn is_package_dir(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attribution::testutil::{tree_fixture, EnvFixture};
+    use crate::config::Paths;
+    use crate::scan::walk::DirNode;
+
+    #[test]
+    fn manifest_projects_sweeps_inventory_children_and_prunes_artifact_directories() {
+        let home = tempfile::tempdir().unwrap();
+        let project_path = home.path().join("project name");
+        let artifact_path = home.path().join("target");
+        for directory in [&project_path, &artifact_path] {
+            std::fs::create_dir(directory).unwrap();
+            std::fs::write(directory.join("Cargo.toml"), b"[package]\nname = 'test'\n").unwrap();
+        }
+        let root_node = DirNode {
+            name: home.path().to_string_lossy().into(),
+            children: vec![
+                DirNode {
+                    name: "project name".into(),
+                    ..DirNode::default()
+                },
+                DirNode {
+                    name: "target".into(),
+                    ..DirNode::default()
+                },
+            ]
+            .into_boxed_slice(),
+            ..DirNode::default()
+        };
+        let mut fixture = EnvFixture::new();
+        fixture.paths = Paths::from_home(home.path());
+        fixture.trees.push(tree_fixture(home.path(), &root_node));
+        let env = fixture.env();
+        let projects = manifest_projects(&env, &[]);
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].root, project_path);
+        assert_eq!(projects[0].name, "project name");
+        assert!(manifest_projects(&env, &[project_path]).is_empty());
+    }
 
     #[test]
     fn checkout_from_gitdir_handles_an_absolute_path() {

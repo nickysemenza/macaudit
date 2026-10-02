@@ -42,7 +42,7 @@ pub async fn enrich(
         return;
     }
 
-    // 2. Load the cask catalog (may be served from cache, or unavailable).
+    // 2. Load the cask catalog into run-owned memory, or leave apps unchanged.
     let net = &config.network;
     let Some(catalog) = catalog::load(fetcher.as_deref(), paths, net, token).await else {
         return;
@@ -133,7 +133,7 @@ pub async fn enrich(
     if gh_candidates.is_empty() {
         return;
     }
-    let mut checker = github::GithubChecker::load(&paths.cache_dir, net);
+    let mut checker = github::GithubChecker::with_budget(net, paths.size_cache.memory_budget());
     for cand in gh_candidates {
         if token.is_cancelled() {
             break;
@@ -156,7 +156,6 @@ pub async fn enrich(
             }
         }
     }
-    checker.save();
 }
 
 /// An App finding still classified `"unmanaged"` (i.e. `correlate` did not
@@ -181,19 +180,16 @@ mod tests {
     ]"#;
 
     fn paths_with_catalog(home: &Path) -> Paths {
-        let p = Paths::from_home(home);
-        std::fs::create_dir_all(&p.cache_dir).unwrap();
-        std::fs::write(p.cache_dir.join("cask.json"), CATALOG).unwrap();
-        let meta = json!({ "etag": "v1", "fetched_at": now_secs() });
-        std::fs::write(p.cache_dir.join("cask.json.meta"), meta.to_string()).unwrap();
-        p
+        Paths::from_home(home)
     }
 
-    fn now_secs() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
+    fn catalog_fetcher() -> Arc<MockHttpFetcher> {
+        Arc::new(MockHttpFetcher::new().on(
+            "https://formulae.brew.sh/api/cask.json",
+            200,
+            None,
+            CATALOG,
+        ))
     }
 
     fn unmanaged_app(path: &str, name: &str, version: &str) -> Finding {
@@ -226,8 +222,8 @@ mod tests {
         let id = app.id;
         insert(&mut map, app);
 
-        // Fresh cache ⇒ the fetcher is never touched.
-        let fetcher = Arc::new(MockHttpFetcher::new());
+        // The catalog is fetched into run-owned memory.
+        let fetcher = catalog_fetcher();
         enrich(
             &mut map,
             Some(fetcher.clone()),
@@ -252,7 +248,10 @@ mod tests {
             "brew install --cask --adopt slack"
         );
         assert!(!adopt.destructive);
-        assert!(fetcher.calls().is_empty());
+        assert_eq!(
+            fetcher.calls(),
+            vec![("https://formulae.brew.sh/api/cask.json".to_string(), None)]
+        );
     }
 
     #[tokio::test]
@@ -281,7 +280,14 @@ mod tests {
         let id = app.id;
         insert(&mut map, app);
 
-        enrich(&mut map, None, &paths, &config(), &CancellationToken::new()).await;
+        enrich(
+            &mut map,
+            Some(catalog_fetcher()),
+            &paths,
+            &config(),
+            &CancellationToken::new(),
+        )
+        .await;
 
         let f = map.get(&id).unwrap();
         let count = f
@@ -307,7 +313,14 @@ mod tests {
         insert(&mut map, un);
         insert(&mut map, managed);
 
-        enrich(&mut map, None, &paths, &config(), &CancellationToken::new()).await;
+        enrich(
+            &mut map,
+            Some(catalog_fetcher()),
+            &paths,
+            &config(),
+            &CancellationToken::new(),
+        )
+        .await;
 
         let m = map.get(&managed_id).unwrap();
         assert!(m.meta.get("available_cask").is_none());
@@ -347,12 +360,11 @@ mod tests {
         insert(&mut map, app);
 
         let releases_url = "https://api.github.com/repos/acme/acme/releases/latest";
-        let fetcher = Arc::new(MockHttpFetcher::new().on(
-            releases_url,
-            200,
-            None,
-            r#"{"tag_name":"v2.0.0"}"#,
-        ));
+        let fetcher = Arc::new(
+            MockHttpFetcher::new()
+                .on("https://formulae.brew.sh/api/cask.json", 200, None, CATALOG)
+                .on(releases_url, 200, None, r#"{"tag_name":"v2.0.0"}"#),
+        );
         enrich(
             &mut map,
             Some(fetcher.clone()),
@@ -367,7 +379,13 @@ mod tests {
         assert_eq!(f.meta["latest_release"], "v2.0.0");
         assert!(f.detail.contains("newer release v2.0.0 available"));
         assert_eq!(f.severity, Severity::Attention);
-        assert_eq!(fetcher.calls(), vec![(releases_url.to_string(), None)]);
+        assert_eq!(
+            fetcher.calls(),
+            vec![
+                ("https://formulae.brew.sh/api/cask.json".to_string(), None),
+                (releases_url.to_string(), None)
+            ]
+        );
     }
 
     // Sanity: NetworkConfig default is what these tests assume.

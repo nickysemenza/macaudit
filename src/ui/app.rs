@@ -78,6 +78,7 @@ pub enum Mode {
     /// finding / the Overview's "Disk categories" list. Not modal — the
     /// sidebar, statusbar, and mouse all keep working (see `nav.rs`).
     Browse,
+    Root,
 }
 
 /// What the confirm dialog shows: the actions that passed the in-memory
@@ -85,6 +86,8 @@ pub enum Mode {
 /// the batch's impact.
 #[derive(Clone, Debug, Default)]
 pub struct ConfirmModel {
+    pub run_id: crate::engine::RunId,
+    pub identities: crate::cleanup::TargetIdentities,
     pub actions: Vec<PlannedAction>,
     pub refused: Vec<crate::cleanup::Refused>,
     pub removed: Vec<String>,
@@ -97,8 +100,45 @@ pub struct ConfirmModel {
 /// A confirmed batch handed to the loop for asynchronous execution.
 #[derive(Clone, Debug)]
 pub struct CleanupRequest {
-    pub actions: Vec<PlannedAction>,
+    pub run_id: crate::engine::RunId,
+    pub confirmed: crate::cleanup::PreflightReport,
     pub affected: Vec<ScannerId>,
+}
+
+impl CleanupRequest {
+    pub(super) fn refusal_reason(
+        &self,
+        current_run: crate::engine::RunId,
+        fake: bool,
+    ) -> Option<&'static str> {
+        if self.run_id != current_run {
+            Some(
+                "cleanup confirmation belongs to a retired run; confirm the current findings again",
+            )
+        } else if fake {
+            Some("fake mode refuses physical cleanup side effects")
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn refused_report(self, reason: &str) -> crate::cleanup::CleanupReport {
+        let mut refused = self.confirmed.refused;
+        refused.extend(
+            self.confirmed
+                .ok
+                .into_iter()
+                .map(|action| crate::cleanup::Refused {
+                    action,
+                    reason: reason.to_string(),
+                }),
+        );
+        crate::cleanup::CleanupReport {
+            refused,
+            note: reason.to_string(),
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,6 +164,17 @@ pub struct CleanupRun {
 }
 
 pub struct AppState {
+    pub selected_root: PathBuf,
+    pub retiring_count: usize,
+    pub(super) memory_budget: Arc<crate::inventory::MemoryBudget>,
+    pub(super) finding_memory: BTreeMap<FindingId, Arc<crate::inventory::Reservation>>,
+    pub(super) footprint_memory:
+        BTreeMap<crate::attribution::model::Axis, Arc<crate::inventory::Reservation>>,
+    pub(super) pending_resource_limit: Option<ScannerId>,
+    pub(super) root_input: String,
+    pub pending_root: Option<PathBuf>,
+    pub pending_cancel_scan: bool,
+    pub(super) scan_cancelled: bool,
     /// Findings per section, upserted by stable id (last write wins — this is the
     /// invariant that makes deferred size updates correct).
     pub(super) findings: HashMap<ScannerId, BTreeMap<FindingId, Finding>>,
@@ -203,7 +254,7 @@ pub struct AppState {
     /// Set when the user requests a rescan; the loop consumes and clears it.
     pub pending_rescan: Option<RescanRequest>,
     /// Set when the confirm dialog is accepted; the loop consumes and clears
-    /// it, running the batch asynchronously (see `cleanup::run_batch`).
+    /// it, running the batch asynchronously (see `cleanup::run_confirmed_batch`).
     pub pending_execute: Option<CleanupRequest>,
 
     /// Geometry from the last `draw`: hit regions for the mouse, the main
@@ -227,6 +278,16 @@ impl Default for AppState {
             .map(|id| (*id, SectionStatus::Idle))
             .collect();
         AppState {
+            selected_root: PathBuf::new(),
+            retiring_count: 0,
+            memory_budget: crate::inventory::MemoryBudget::shared(),
+            finding_memory: BTreeMap::new(),
+            footprint_memory: BTreeMap::new(),
+            pending_resource_limit: None,
+            root_input: String::new(),
+            pending_root: None,
+            pending_cancel_scan: false,
+            scan_cancelled: false,
             findings: HashMap::new(),
             dir_trees: BTreeMap::new(),
             footprints: BTreeMap::new(),
@@ -279,6 +340,7 @@ impl AppState {
             Mode::Cleanup => self.handle_cleanup(action),
             Mode::Report => self.handle_report(action),
             Mode::Browse => self.handle_browse(action),
+            Mode::Root => self.handle_root(action),
         }
     }
 

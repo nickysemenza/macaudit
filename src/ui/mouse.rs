@@ -26,7 +26,7 @@ impl AppState {
         // means, so pointing still works there.
         if matches!(
             self.mode,
-            Mode::Confirm | Mode::Help | Mode::Preview | Mode::Cleanup | Mode::Report
+            Mode::Confirm | Mode::Help | Mode::Preview | Mode::Cleanup | Mode::Report | Mode::Root
         ) {
             return;
         }

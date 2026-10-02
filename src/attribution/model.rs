@@ -439,6 +439,11 @@ impl Claim {
 /// Everything a resolver needs: the dependency sections' latest snapshots
 /// (via `findings`), the walked trees (for `paths::bytes_of`), and a
 /// memoised file-head reader for manifest parsing.
+pub(crate) type PackageIntegrities = (
+    HashMap<(String, String), String>,
+    crate::inventory::Reservation,
+);
+
 pub struct ResolveEnv<'a> {
     pub paths: &'a Paths,
     pub config: &'a Config,
@@ -450,7 +455,13 @@ pub struct ResolveEnv<'a> {
     /// `entitlements::app_groups_for` can share a `&ResolveEnv` directly
     /// across `std::thread::scope` worker threads instead of splitting its
     /// fields apart first.
-    head_cache: Mutex<HashMap<PathBuf, Option<String>>>,
+    head_cache: Mutex<HeadCache>,
+    pub(crate) package_integrities: std::sync::OnceLock<PackageIntegrities>,
+}
+
+struct HeadCache {
+    values: HashMap<PathBuf, Option<String>>,
+    memory: crate::inventory::Reservation,
 }
 
 impl<'a> ResolveEnv<'a> {
@@ -467,7 +478,13 @@ impl<'a> ResolveEnv<'a> {
             trees,
             snapshots,
             runner,
-            head_cache: Mutex::new(HashMap::new()),
+            head_cache: Mutex::new(HeadCache {
+                values: HashMap::new(),
+                memory: crate::inventory::MemoryBudget::shared()
+                    .reserve(0)
+                    .expect("zero-byte reservation"),
+            }),
+            package_integrities: std::sync::OnceLock::new(),
         }
     }
 
@@ -485,14 +502,22 @@ impl<'a> ResolveEnv<'a> {
     /// same manifest from multiple resolvers). `None` when the file can't be
     /// read.
     pub fn read_head(&self, path: &Path, max_bytes: usize) -> Option<String> {
-        if let Some(cached) = self.head_cache.lock().unwrap().get(path) {
+        let mut cache = self.head_cache.lock().unwrap();
+        if let Some(cached) = cache.values.get(path) {
             return cached.clone();
         }
+        let max_bytes = max_bytes.min(256 * 1024);
+        if cache.values.len() >= 4096
+            || cache
+                .memory
+                .grow(max_bytes * 3 + path.as_os_str().len() * 2 + 256)
+                .is_err()
+        {
+            return None;
+        }
+        let _materialization = crate::scan::walk::listing::MaterializationGuard::enter().ok()?;
         let result = crate::scan::read_head(path, max_bytes);
-        self.head_cache
-            .lock()
-            .unwrap()
-            .insert(path.to_path_buf(), result.clone());
+        cache.values.insert(path.to_path_buf(), result.clone());
         result
     }
 
@@ -505,7 +530,11 @@ impl<'a> ResolveEnv<'a> {
     /// in directly), the program isn't on `$PATH`, it exits non-zero, or it
     /// times out — every caller treats that the same as "this data source
     /// is unavailable".
-    pub fn run_blocking(&self, program: &str, args: &[&str]) -> Option<Vec<u8>> {
+    pub fn run_blocking(
+        &self,
+        program: &str,
+        args: &[&str],
+    ) -> Option<crate::runner::CapturedBytes> {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return None;
         };

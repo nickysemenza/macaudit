@@ -6,12 +6,15 @@
 //! `entitlements.rs`, and `model.rs` each hand-rolled.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use crate::config::{Config, Paths};
+use crate::inventory::{DiskInventory, MemoryBudget, DEFAULT_MEMORY_LIMIT};
 use crate::model::ScannerId;
 use crate::runner::MockCommandRunner;
-use crate::scan::walk::DirTree;
+use crate::scan::walk::{DirNode, DirTree};
 
 use super::bus::Snapshot;
 use super::model::{Claim, EntryKind, EvidenceTier, ResolveEnv};
@@ -50,6 +53,25 @@ impl Default for EnvFixture {
     fn default() -> Self {
         Self::new()
     }
+}
+
+pub(crate) fn tree_fixture(root: impl Into<PathBuf>, root_node: &DirNode) -> Arc<DirTree> {
+    Arc::new(DirTree {
+        root: root.into(),
+        files: root_node.files,
+        entries: Some(root_node.files.saturating_add(root_node.dirs)),
+        externally_linked: Some(0),
+        dirs: root_node.dirs,
+        bytes: root_node.alloc,
+        errors: root_node.errors,
+        node: DiskInventory::from_node(root_node, MemoryBudget::new(DEFAULT_MEMORY_LIMIT)).unwrap(),
+        top_files: Vec::new(),
+        complete: true,
+        coverage: Default::default(),
+        memory: None,
+        scanned_at: SystemTime::now(),
+        elapsed: Duration::from_millis(1),
+    })
 }
 
 /// A claim with an overridden raw size — the shape almost every accounting

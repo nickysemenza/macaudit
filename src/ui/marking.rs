@@ -76,6 +76,13 @@ impl AppState {
         let current = self.all_findings();
         let report = cleanup::preflight_static(&planned, &current);
         self.confirm = Some(ConfirmModel {
+            run_id: crate::engine::RunId(
+                self.expected_gen
+                    .get(&crate::model::ScannerId::Fs)
+                    .copied()
+                    .unwrap_or_default(),
+            ),
+            identities: report.identities,
             actions: report.ok,
             refused: report.refused,
             removed: report.removed,
@@ -99,6 +106,20 @@ impl AppState {
                     self.mode = Mode::Normal;
                     return;
                 }
+                let run_id = crate::engine::RunId(
+                    self.expected_gen
+                        .get(&crate::model::ScannerId::Fs)
+                        .copied()
+                        .unwrap_or_default(),
+                );
+                if model.run_id != run_id {
+                    self.mode = Mode::Normal;
+                    self.push_activity(
+                        "cleanup: stale confirmation refused; confirm current findings again"
+                            .to_string(),
+                    );
+                    return;
+                }
                 let current = self.all_findings();
                 let affected = cleanup::affected_sections(&model.actions, &current);
                 for a in &model.actions {
@@ -116,7 +137,16 @@ impl AppState {
                     report: None,
                 });
                 self.pending_execute = Some(CleanupRequest {
-                    actions: model.actions,
+                    run_id: model.run_id,
+                    confirmed: cleanup::PreflightReport {
+                        ok: model.actions,
+                        refused: model.refused,
+                        removed: model.removed,
+                        remaining: model.remaining,
+                        follow_up: model.follow_up,
+                        brew_preview: model.impact,
+                        identities: model.identities,
+                    },
                     affected,
                 });
                 self.mode = Mode::Cleanup;
@@ -244,6 +274,13 @@ impl AppState {
         let current = self.all_findings();
         let report = cleanup::preflight_static(&planned, &current);
         Some(ConfirmModel {
+            run_id: crate::engine::RunId(
+                self.expected_gen
+                    .get(&crate::model::ScannerId::Fs)
+                    .copied()
+                    .unwrap_or_default(),
+            ),
+            identities: report.identities,
             actions: report.ok,
             refused: report.refused,
             removed: report.removed,
@@ -339,8 +376,11 @@ mod tests {
 
     #[test]
     fn confirm_flow_produces_pending_execute() {
+        let targets = tempfile::tempdir().unwrap();
+        let target = targets.path().join("Old.app");
+        std::fs::create_dir(&target).unwrap();
         let mut app = app_with_gen(1);
-        app.apply(finding_with_remedy(1, "/Applications/Old.app"));
+        app.apply(finding_with_remedy(1, target.to_str().unwrap()));
         app.handle(Action::Down); // Apps is Tree view: row 0 is the group header
         app.handle(Action::Char(' ')); // mark the only row
         assert_eq!(app.marked_total().0, 1);
@@ -356,8 +396,124 @@ mod tests {
         assert_eq!(app.mode, Mode::Cleanup);
         assert_eq!(app.marked_total().0, 0); // cleared after queuing
         let req = app.pending_execute.take().expect("pending_execute set");
-        assert_eq!(req.actions.len(), 1);
+        assert_eq!(req.confirmed.ok.len(), 1);
+        assert_eq!(req.run_id, crate::engine::RunId(1));
         assert_eq!(req.affected, vec![crate::model::ScannerId::Apps]);
+    }
+
+    #[test]
+    fn stale_confirmation_and_fake_execution_are_refused() {
+        let targets = tempfile::tempdir().unwrap();
+        let target = targets.path().join("Old.app");
+        std::fs::create_dir(&target).unwrap();
+        let mut app = app_with_gen(1);
+        app.apply(finding_with_remedy(1, target.to_str().unwrap()));
+        app.handle(Action::Down);
+        app.handle(Action::Char(' '));
+        app.handle(Action::Char('x'));
+        app.expected_gen.insert(crate::model::ScannerId::Fs, 2);
+        app.handle(Action::Char('y'));
+        assert!(app.pending_execute.is_none());
+        assert_eq!(app.marked_total().0, 1);
+        app.handle(Action::Char('x'));
+        app.handle(Action::Char('y'));
+        let mut request = app.pending_execute.take().unwrap();
+        assert!(request
+            .refusal_reason(crate::engine::RunId(3), false)
+            .is_some());
+        assert!(request
+            .refusal_reason(crate::engine::RunId(2), true)
+            .is_some());
+        assert!(request
+            .refusal_reason(crate::engine::RunId(2), false)
+            .is_none());
+        let original = request.confirmed.ok[0].clone();
+        for command in [
+            crate::model::RemedyCommand::Shell {
+                program: "must-not-run".into(),
+                args: vec!["must-not-run".into()],
+            },
+            crate::model::RemedyCommand::CopyToClipboard {
+                text: "must-not-copy".into(),
+            },
+            crate::model::RemedyCommand::RevealInFinder {
+                path: target.clone(),
+            },
+        ] {
+            let mut action = original.clone();
+            action.rendered = command.rendered();
+            action.command = command;
+            request.confirmed.ok.push(action);
+        }
+        let report = request.refused_report("fake mode refuses physical cleanup side effects");
+        assert_eq!(report.refused.len(), 4);
+        assert!(report.executed.is_empty());
+        assert!(target.is_dir());
+    }
+
+    #[tokio::test]
+    async fn confirmed_target_replacement_is_refused_without_side_effects() {
+        struct RefuseEffects;
+        impl crate::remedy::TrashOps for RefuseEffects {
+            fn trash(&self, _: &std::path::Path) -> anyhow::Result<()> {
+                panic!("replacement target must not reach trash");
+            }
+        }
+        impl crate::remedy::ClipboardOps for RefuseEffects {
+            fn copy(&self, _: &str) -> anyhow::Result<()> {
+                panic!("replacement refusal must not reach the clipboard");
+            }
+        }
+        let targets = tempfile::tempdir().unwrap();
+        let target = targets.path().join("Old.app");
+        let original = targets.path().join("confirmed-original");
+        std::fs::create_dir(&target).unwrap();
+        let mut app = app_with_gen(7);
+        app.apply(finding_with_remedy(7, target.to_str().unwrap()));
+        app.handle(Action::Down);
+        app.handle(Action::Char(' '));
+        app.handle(Action::Char('x'));
+        assert_eq!(app.confirm.as_ref().unwrap().actions.len(), 1);
+        std::fs::rename(&target, &original).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        app.handle(Action::Char('y'));
+        let request = app.pending_execute.take().unwrap();
+        assert_eq!(request.run_id, crate::engine::RunId(7));
+        let runner = std::sync::Arc::new(crate::runner::MockCommandRunner::new());
+        let deps = crate::cleanup::ExecDeps {
+            runner: runner.clone(),
+            trash: std::sync::Arc::new(RefuseEffects),
+            clipboard: std::sync::Arc::new(RefuseEffects),
+            paths: std::sync::Arc::new(crate::config::Paths::from_home(targets.path())),
+            config: std::sync::Arc::new(crate::config::Config::default()),
+            delete_mode: crate::config::DeleteMode::Trash,
+        };
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(32);
+        let report = crate::cleanup::run_confirmed_batch(
+            request.confirmed,
+            app.all_findings(),
+            deps,
+            sender,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        while let Ok(event) = receiver.try_recv() {
+            app.apply_exec(event);
+        }
+        assert!(report.executed.is_empty());
+        assert!(report.failed.is_empty());
+        assert_eq!(report.refused.len(), 1);
+        assert!(
+            report.refused[0]
+                .reason
+                .contains("replaced since confirmation"),
+            "{}",
+            report.refused[0].reason
+        );
+        assert!(runner.calls().is_empty());
+        assert_eq!(app.mode, Mode::Report);
+        assert!(target.is_dir());
+        assert!(original.is_dir());
     }
 
     #[test]
@@ -417,8 +573,11 @@ mod tests {
     fn e_cycles_remedy_choice_and_marks_v_opens_preview_c_reopens_report() {
         use crate::cleanup::{CleanupReport, ExecEvent, PreflightReport};
         use crate::ui::app::CleanupPhase;
+        let targets = tempfile::tempdir().unwrap();
+        let target = targets.path().join("Old.app");
+        std::fs::create_dir(&target).unwrap();
         let mut app = app_with_gen(1);
-        app.apply(finding_with_remedy(1, "/Applications/Old.app"));
+        app.apply(finding_with_remedy(1, target.to_str().unwrap()));
         app.handle(Action::Down);
         // No report yet: `c` is a no-op; `v` needs marks.
         app.handle(Action::Char('c'));
@@ -441,7 +600,7 @@ mod tests {
 
         // Drive the batch through its phases.
         app.apply_exec(ExecEvent::PreflightDone(Box::new(PreflightReport {
-            ok: req.actions.clone(),
+            ok: req.confirmed.ok.clone(),
             ..Default::default()
         })));
         assert!(matches!(
@@ -468,11 +627,16 @@ mod tests {
     }
 
     #[test]
-    fn stale_marks_are_dropped_after_rescan_and_confirm_is_rebuilt() {
+    fn unified_refresh_clears_marks_and_confirmation_immediately() {
         use crate::model::{ScanEvent, ScannerId};
+        let targets = tempfile::tempdir().unwrap();
+        let old = targets.path().join("Old.app");
+        let other = targets.path().join("Other.app");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::create_dir(&other).unwrap();
         let mut app = app_with_gen(1);
-        app.apply(finding_with_remedy(1, "/Applications/Old.app"));
-        app.apply(finding_with_remedy(1, "/Applications/Other.app"));
+        app.apply(finding_with_remedy(1, old.to_str().unwrap()));
+        app.apply(finding_with_remedy(1, other.to_str().unwrap()));
         app.handle(Action::Down);
         app.handle(Action::Char(' '));
         app.handle(Action::Down);
@@ -482,15 +646,17 @@ mod tests {
         assert_eq!(app.confirm.as_ref().unwrap().actions.len(), 2);
         // Rescan Apps: only one of the two comes back.
         app.begin_scan(2, &[ScannerId::Apps]);
-        app.apply(finding_with_remedy(2, "/Applications/Other.app"));
+        assert_eq!(app.marked_total().0, 0);
+        assert!(app.confirm.is_none());
+        assert_eq!(app.mode, Mode::Normal);
+        app.apply(finding_with_remedy(2, other.to_str().unwrap()));
         app.apply(ScanEvent::Finished {
             scanner: ScannerId::Apps,
             gen: 2,
             duration: std::time::Duration::from_secs(1),
         });
-        assert_eq!(app.marked_total().0, 1);
-        assert!(app.activity.iter().any(|l| l.contains("stale mark")));
-        assert_eq!(app.mode, Mode::Confirm);
-        assert_eq!(app.confirm.as_ref().unwrap().actions.len(), 1);
+        assert_eq!(app.marked_total().0, 0);
+        assert_eq!(app.section_count(ScannerId::Apps), 1);
+        assert!(app.confirm.is_none());
     }
 }

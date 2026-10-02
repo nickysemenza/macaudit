@@ -7,7 +7,7 @@ use anyhow::Context;
 use clap::Parser;
 
 use macaudit::cli::{
-    BrewCmd, CleanArgs, Cli, Command, ConfigCmd, FootprintsArgs, ScanArgs, ToolsArgs, ToolsCmd,
+    BrewCmd, CleanArgs, Cli, Command, FootprintsArgs, ScanArgs, ToolsArgs, ToolsCmd,
 };
 use macaudit::config::{Config, DeleteMode, Paths};
 use macaudit::engine::{Mode, ScannerManager};
@@ -18,13 +18,27 @@ use macaudit::runner::{CommandRunner, RealCommandRunner};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if std::env::var_os("RUST_LOG").is_some() {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .context("invalid RUST_LOG")?,
+            )
+            .with_writer(std::io::stderr)
+            .try_init()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    }
 
     // A scan must never mutate Homebrew state: `brew outdated` triggers brew's
     // auto-update unless this is set. Applies to every child process we spawn.
     std::env::set_var("HOMEBREW_NO_AUTO_UPDATE", "1");
 
     let paths = Arc::new(Paths::resolve()?);
-    let mut config = Config::load(&paths.config_file()).context("loading config")?;
+    let request = cli.run_request(&paths.home, &std::env::current_dir()?)?;
+    let mut config = match &cli.config {
+        Some(path) => Config::load(path).context("loading explicit config")?,
+        None => Config::default(),
+    };
     if cli.rm {
         config.behavior.delete_mode = DeleteMode::Rm;
     }
@@ -35,7 +49,8 @@ async fn main() -> anyhow::Result<()> {
     let runner: Arc<dyn CommandRunner> = Arc::new(RealCommandRunner);
     let mode = if cli.fake { Mode::Fake } else { Mode::Real };
 
-    let mut manager = ScannerManager::new(config.clone(), paths.clone(), runner, mode);
+    let mut manager =
+        ScannerManager::new(config.clone(), paths.clone(), runner, mode).with_request(request)?;
     // Network enrichment only when online and scanning for real — synthetic
     // findings don't need the cask catalog.
     if !config.network.offline && mode == Mode::Real {
@@ -52,15 +67,12 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Clean(args)) => run_clean(&manager, &args).await,
         Some(Command::Tools(args)) => run_tools(&manager, &args).await,
         Some(Command::Brew(cmd)) => run_brew(&manager, cmd).await,
-        Some(Command::Config(cmd)) => run_config(&paths, cmd),
         Some(Command::Footprints(args)) => run_footprints(&manager, &args).await,
     }
 }
 
 /// Keep only findings belonging to a section the user actually asked for.
-/// `run_to_completion` silently expands `requested` with attribution
-/// dependencies (Fs, Git, ...) so the two axis scanners have something to
-/// resolve against; callers that print findings must undo that expansion so
+/// Every run executes all audits; display filtering happens afterwards so
 /// `--section projects` prints Projects findings, not also Fs/Git/....
 fn filter_to_requested(
     findings: std::collections::BTreeMap<macaudit::model::FindingId, macaudit::model::Finding>,
@@ -74,12 +86,12 @@ fn filter_to_requested(
 
 async fn run_scan(manager: &ScannerManager, args: &ScanArgs) -> anyhow::Result<()> {
     let sections = args.sections()?;
-    let outcome = manager.run_to_completion(&sections).await;
+    let outcome = manager.run_request_to_completion(manager.request()).await?;
     warn_failures(&outcome.failures);
-    let findings = filter_to_requested(outcome.findings, &sections);
     if args.json {
-        println!("{}", output::findings_to_json(&findings)?);
+        println!("{}", output::run_to_json(&outcome, &sections)?);
     } else {
+        let findings = filter_to_requested(outcome.findings, &sections);
         for f in findings.values() {
             let size = f
                 .size_bytes
@@ -94,8 +106,7 @@ async fn run_scan(manager: &ScannerManager, args: &ScanArgs) -> anyhow::Result<(
 
 async fn run_footprints(manager: &ScannerManager, args: &FootprintsArgs) -> anyhow::Result<()> {
     let axes = args.axes()?;
-    let sections: Vec<ScannerId> = axes.iter().map(|a| a.scanner()).collect();
-    let outcome = manager.run_to_completion(&sections).await;
+    let outcome = manager.run_request_to_completion(manager.request()).await?;
     warn_failures(&outcome.failures);
     let sets: Vec<&macaudit::attribution::model::FootprintSet> = outcome
         .footprints
@@ -142,7 +153,7 @@ async fn run_clean(manager: &ScannerManager, args: &CleanArgs) -> anyhow::Result
         anyhow::bail!("only --dry-run is supported from the CLI; use the TUI to execute remedies");
     }
     let sections = args.sections()?;
-    let outcome = manager.run_to_completion(&sections).await;
+    let outcome = manager.run_request_to_completion(manager.request()).await?;
     warn_failures(&outcome.failures);
     let findings = filter_to_requested(outcome.findings, &sections);
     if args.json {
@@ -160,7 +171,7 @@ async fn run_clean(manager: &ScannerManager, args: &CleanArgs) -> anyhow::Result
 }
 
 async fn run_tools(manager: &ScannerManager, args: &ToolsArgs) -> anyhow::Result<()> {
-    let outcome = manager.run_to_completion(&[ScannerId::Tools]).await;
+    let outcome = manager.run_request_to_completion(manager.request()).await?;
     warn_failures(&outcome.failures);
     match &args.cmd {
         Some(ToolsCmd::Verify { json, limit }) => {
@@ -278,7 +289,7 @@ async fn verify_tools(
 }
 
 async fn run_brew(manager: &ScannerManager, cmd: BrewCmd) -> anyhow::Result<()> {
-    let outcome = manager.run_to_completion(&[ScannerId::Brew]).await;
+    let outcome = manager.run_request_to_completion(manager.request()).await?;
     warn_failures(&outcome.failures);
     let graph = macaudit::brewgraph::BrewGraph::from_findings(outcome.findings.values());
     let (name, dir, json, max_depth) = match cmd {
@@ -310,26 +321,6 @@ async fn run_brew(manager: &ScannerManager, cmd: BrewCmd) -> anyhow::Result<()> 
         println!("{}", output::brew_tree_json(&graph, &name, dir, max_depth)?);
     } else {
         print!("{}", output::brew_tree_text(&graph, &name, dir, max_depth));
-    }
-    Ok(())
-}
-
-fn run_config(paths: &Paths, cmd: ConfigCmd) -> anyhow::Result<()> {
-    match cmd {
-        ConfigCmd::Path => {
-            println!("{}", paths.config_file().display());
-        }
-        ConfigCmd::Edit => {
-            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
-            let path = paths.config_file();
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let status = std::process::Command::new(editor).arg(&path).status()?;
-            if !status.success() {
-                anyhow::bail!("editor exited with failure");
-            }
-        }
     }
     Ok(())
 }

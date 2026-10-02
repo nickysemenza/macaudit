@@ -224,6 +224,7 @@ mod tests {
                 ..Default::default()
             }),
             scroll: 0,
+            ..Default::default()
         };
         let t = text(&lines(&model, DeleteMode::Trash));
         assert!(t.contains("Execute 1 remedy (trash mode)?"));

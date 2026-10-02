@@ -45,9 +45,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cleanup::{self, ExecDeps, ExecEvent};
 use crate::engine::ScannerManager;
-use crate::model::{Finding, FindingKind, ScanEvent, ScannerId};
+use crate::model::{Finding, FindingKind, ScanEvent};
 use crate::remedy::{RealClipboard, RealTrash};
-use crate::ui::app::{AppState, RescanRequest};
+use crate::ui::app::AppState;
 
 /// Run the TUI to completion. Owns the manager and the app state, wiring
 /// keypresses to rescans and scan events to the reducer.
@@ -58,7 +58,8 @@ pub async fn run(manager: Arc<ScannerManager>) -> anyhow::Result<()> {
     // keyboard-only. Disabled again before restore so the shell's own mouse
     // behavior (text selection, scroll) returns intact.
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
-    let result = run_loop(&mut terminal, manager).await;
+    let result = run_loop(&mut terminal, manager.clone()).await;
+    manager.cancel();
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
@@ -68,30 +69,38 @@ async fn run_loop(
     terminal: &mut ratatui::DefaultTerminal,
     manager: Arc<ScannerManager>,
 ) -> anyhow::Result<()> {
-    let (tx, mut rx) = mpsc::channel::<ScanEvent>(1024);
+    let (tx, mut rx) = mpsc::channel::<ScanEvent>(32);
     // Async network-enrichment results: (gen, enriched App findings).
-    let (enrich_tx, mut enrich_rx) = mpsc::channel::<(u64, Vec<Finding>)>(4);
+    let (enrich_tx, mut enrich_rx) =
+        mpsc::channel::<(u64, Vec<Finding>, Vec<Arc<crate::inventory::Reservation>>)>(4);
     // Cleanup progress from the spawned batch task.
     let (exec_tx, mut exec_rx) = mpsc::channel::<ExecEvent>(64);
     // Stop token of the running batch (Esc cancels the remaining actions).
     let mut cleanup_stop: Option<CancellationToken> = None;
     // Sections to rescan once the running batch has executed.
-    let mut cleanup_affected: Vec<ScannerId> = Vec::new();
+    let mut cleanup_changed = false;
     let mut app = AppState::default();
     app.set_delete_mode(manager.delete_mode());
 
     // Kick off an initial full scan.
-    let all = ScannerId::ALL.to_vec();
     // Generation for which correlation has already run (0 = never).
     let mut correlated_gen: u64 = 0;
-    let gen = manager.start(&tx, &all);
-    let mut full_scan_gen = gen;
-    app.begin_scan(gen, &all);
+    let run_id = manager.start_run(&tx, manager.request())?;
+    let mut full_scan_gen = run_id.0;
+    app.begin_run(&manager.current_run().unwrap());
 
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(33));
 
     loop {
+        if let Some(run) = manager.current_run() {
+            app.retiring_count = run.retiring_count;
+            if rx.is_empty() {
+                app.reconcile_run(&run);
+            }
+        } else {
+            app.retiring_count = 0;
+        }
         terminal.draw(|f| app.draw(f))?;
 
         tokio::select! {
@@ -120,7 +129,7 @@ async fn run_loop(
             maybe_enriched = enrich_rx.recv() => {
                 // Network enrichment landed: upsert (stale generations are
                 // dropped inside apply_enriched).
-                if let Some((gen, findings)) = maybe_enriched {
+                if let Some((gen, findings, _memory)) = maybe_enriched {
                     let n = findings.len();
                     app.apply_enriched(gen, findings);
                     if n > 0 {
@@ -133,19 +142,13 @@ async fn run_loop(
                     let executed = matches!(ev, ExecEvent::Executed { .. });
                     let finished = matches!(ev, ExecEvent::Finished(_));
                     app.apply_exec(ev);
-                    if executed && !cleanup_affected.is_empty() {
-                        // Re-check the touched sections now that the batch
-                        // has run; stale marks/previews are dropped as the
-                        // new findings land.
-                        let affected = std::mem::take(&mut cleanup_affected);
-                        let gen = manager.start(&tx, &affected);
-                        app.begin_scan(gen, &affected);
-                        if affected.iter().any(|s| state::CORRELATED_SECTIONS.contains(s)) {
-                            full_scan_gen = gen;
-                        }
-                    }
+                    cleanup_changed |= executed;
                     if finished {
                         cleanup_stop = None;
+                        if cleanup_changed {
+                            cleanup_changed = false;
+                            app.pending_rescan = Some(app::RescanRequest::All);
+                        }
                     }
                 }
             }
@@ -159,18 +162,27 @@ async fn run_loop(
         // findings, matching the headless path. Then kick the async network
         // half (catalog matching + release checks) in the background; results
         // arrive on `enrich_rx`. Once per generation.
-        if correlated_gen != full_scan_gen && app.sections_terminal(state::CORRELATED_SECTIONS) {
+        if correlated_gen != full_scan_gen
+            && app.sections_terminal(state::CORRELATED_SECTIONS)
+            && manager
+                .run_token()
+                .is_some_and(|token| !token.is_cancelled())
+        {
             correlated_gen = full_scan_gen;
             app.correlate_now();
 
-            if let Some(fetcher) = manager.fetcher() {
+            if let Some(fetcher) = manager
+                .fetcher()
+                .filter(|_| !manager.request().options.offline)
+            {
                 let mut map = app.apps_brew_findings();
-                let paths = manager.paths();
+                let memory = app.result_memory();
+                let paths = manager.run_paths().unwrap();
                 let config = manager.config();
                 let etx = enrich_tx.clone();
                 let gen = full_scan_gen;
+                let token = manager.run_token().unwrap();
                 tokio::spawn(async move {
-                    let token = CancellationToken::new();
                     crate::net::enrich(&mut map, Some(fetcher), &paths, &config, &token).await;
                     // Ship back only findings enrichment actually touched
                     // (catalog matches carry `available_cask`; the GitHub pass
@@ -181,39 +193,57 @@ async fn run_loop(
                             f.kind == FindingKind::App && f.meta.get("available_cask").is_some()
                         })
                         .collect();
-                    let _ = etx.send((gen, changed)).await;
+                    let _ = etx.send((gen, changed, memory)).await;
                 });
             }
         }
 
-        // Service a requested rescan. Per-section generations mean a targeted
-        // rescan cancels ONLY the requested sections.
-        if let Some(req) = app.pending_rescan.take() {
-            let sections: Vec<ScannerId> = match req {
-                RescanRequest::All => ScannerId::ALL.to_vec(),
-                RescanRequest::Section(id) => vec![id],
-            };
-            let gen = manager.start(&tx, &sections);
-            app.begin_scan(gen, &sections);
-            if matches!(req, RescanRequest::All) {
-                full_scan_gen = gen;
-            } else if sections
-                .iter()
-                .any(|s| state::CORRELATED_SECTIONS.contains(s))
-            {
-                // Rescanning Apps/Brew invalidates correlation for the new data.
-                full_scan_gen = gen;
+        if app.pending_cancel_scan {
+            app.pending_cancel_scan = false;
+            manager.cancel();
+            app.cancel_scan();
+        }
+
+        if let Some(scanner) = app.pending_resource_limit.take() {
+            manager.resource_limited(crate::engine::RunId(full_scan_gen), scanner);
+            app.cancel_scan();
+            app.push_activity("resource limit: current partial results retained".to_string());
+        }
+
+        if cleanup_stop.is_none() && (app.pending_rescan.is_some() || app.pending_root.is_some()) {
+            let mut request = manager.request();
+            if let Some(root) = app.pending_root.take() {
+                request.selected_root = root;
+            }
+            app.pending_rescan = None;
+            match manager.start_run(&tx, request) {
+                Ok(run_id) => {
+                    full_scan_gen = run_id.0;
+                    app.begin_run(&manager.current_run().unwrap());
+                }
+                Err(error) => app.push_activity(format!("root unchanged: {error:#}")),
             }
         }
 
-        // Service a confirmed batch: spawn `cleanup::run_batch`, which
+        // Service a confirmed batch: spawn `cleanup::run_confirmed_batch`, which
         // re-checks every target, runs the exact commands in dependency
-        // order, verifies retained tools and writes the audit report. The
+        // order and verifies retained tools. The
         // loop keeps drawing (and can stop the batch between actions).
         if let Some(req) = app.pending_execute.take() {
+            let current_run = crate::engine::RunId(manager.current_generation());
+            let refusal = req
+                .refusal_reason(current_run, manager.is_fake())
+                .or_else(|| {
+                    (req.run_id.0 != full_scan_gen)
+                        .then_some("cleanup confirmation belongs to a retired UI run")
+                });
+            if let Some(reason) = refusal {
+                app.apply_exec(ExecEvent::Finished(Box::new(req.refused_report(reason))));
+                continue;
+            }
             let stop = CancellationToken::new();
             cleanup_stop = Some(stop.clone());
-            cleanup_affected = req.affected.clone();
+            cleanup_changed = false;
             let deps = ExecDeps {
                 runner: manager.runner(),
                 trash: Arc::new(RealTrash),
@@ -223,9 +253,11 @@ async fn run_loop(
                 delete_mode: manager.delete_mode(),
             };
             let current = app.all_findings();
+            let memory = app.result_memory();
             let etx = exec_tx.clone();
             tokio::spawn(async move {
-                cleanup::run_batch(req.actions, current, deps, etx, stop).await;
+                cleanup::run_confirmed_batch(req.confirmed, current, deps, etx, stop).await;
+                drop(memory);
             });
         }
         if app.pending_cancel_cleanup {

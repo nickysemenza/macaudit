@@ -1,12 +1,13 @@
 import AppKit
 import Foundation
+import MacAuditCollections
 import MacAuditKit
 import Observation
 
 enum SectionStatus: Equatable {
     case idle
     case scanning(msg: String, done: UInt64, total: UInt64?)
-    case done(durationMs: UInt64)
+    case done(durationMs: UInt64?)
     case failed(String)
 
     var isTerminal: Bool {
@@ -15,6 +16,10 @@ enum SectionStatus: Equatable {
         case .idle, .scanning: false
         }
     }
+}
+
+enum SheetRoute: String {
+    case root, confirm, cleanup
 }
 
 /// One cleanup batch from confirmation to report.
@@ -52,7 +57,7 @@ enum SidebarItem: Hashable {
     /// lenses, not entries in the generic Sections list.
     var section: SectionId? {
         switch self {
-        case .section(let id): id
+        case let .section(id): id
         case .projects: .projects
         case .apps: .appStorage
         case .storage, .folders: nil
@@ -87,9 +92,23 @@ extension AttributionAxis {
 @MainActor
 @Observable
 final class AuditStore {
+    private struct RetainedFinding {
+        var finding: Finding
+        var metadata: SessionMetadata?
+    }
+
     private(set) var engine: any MacAuditEngine
     private(set) var sections: [SectionMeta]
-    private(set) var findings: [SectionId: [UInt64: Finding]] = [:]
+    let auditPages: AuditFindingsBrowser
+    private var retainedMarks: OrderedDictionary<UInt64, RetainedFinding> = [:]
+    var findings: [SectionId: [UInt64: Finding]] {
+        var result: [SectionId: [UInt64: Finding]] = [:]
+        for finding in auditPages.cachedRows {
+            result[finding.section, default: [:]][finding.id] = finding
+        }
+        return result
+    }
+
     private(set) var status: [SectionId: SectionStatus] = [:]
     private var expectedGen: [SectionId: UInt64] = [:]
     private(set) var activity: [String] = []
@@ -98,7 +117,16 @@ final class AuditStore {
     /// `LensView`/`ContentView` look them up (`SidebarItem.axis`).
     let owners: [AttributionAxis: OwnerBrowser]
 
-    var selectedItem: SidebarItem? = .storage
+    var selectedItem: SidebarItem? = .folders {
+        didSet {
+            if oldValue != selectedItem {
+                selectedFinding = nil
+                searchText = ""
+                auditPages.select(selectedItem?.section ?? (selectedItem == .storage ? .system : nil))
+            }
+        }
+    }
+
     var selectedFinding: UInt64?
     /// Free-text filter for the current section (title / detail / path).
     var searchText = ""
@@ -110,10 +138,46 @@ final class AuditStore {
     private(set) var pendingSummary: PlanSummary?
     private(set) var planError: String?
     private(set) var cleanup: CleanupRun?
+    var sheetRoute: SheetRoute?
+    private(set) var isPlanning = false
+    private(set) var selectedRoot: String
+    private(set) var rootError: String?
+    private(set) var isStartingRun = false
+    private let homeRoot: String
+    private var runGeneration: UInt64 = 0
+    private var planGeneration: UInt64 = 0
+    private var runTask: Task<Void, Never>?
+    private let queries: MacAuditQueries
+
+    var canRefresh: Bool {
+        !isStartingRun && !isPlanning && cleanup == nil && pendingPlan == nil
+    }
 
     let usingFakeData: Bool
-    private var scanBridge: ScanBridge?
+    private var scanBridge: ScanMailbox?
     private var scanTask: Task<Void, Never>?
+    private var retirementTask: Task<Void, Never>?
+    private var currentRunId: UInt64?
+    private(set) var scanMetadata: SessionMetadata?
+    private(set) var scanCancelRequested = false
+    private let revealLocation: @MainActor (String) -> Void
+
+    var canCancelScan: Bool {
+        !isStartingRun && cleanup == nil && scanBridge != nil && isScanning && !scanCancelRequested
+    }
+
+    var isRetiringScan: Bool {
+        scanCancelRequested && (scanMetadata?.activeScanners ?? 1) > 0
+    }
+
+    var scanCancellationStatus: String? {
+        guard scanCancelRequested else { return nil }
+        guard let metadata = scanMetadata else { return "Cancelling scan · waiting for worker status…" }
+        if metadata.activeScanners > 0 {
+            return "Cancelling scan · \(metadata.activeScanners) workers retiring · partial results remain available"
+        }
+        return "Scan cancelled · partial results retained · Disk: \(metadata.diskCoverage) · Global Audit: \(metadata.auditCoverage)"
+    }
 
     /// Whether the engine can currently read TCC-protected user data
     /// (Safari, Mail, …). Refreshed after every fs scan and whenever the app
@@ -121,12 +185,23 @@ final class AuditStore {
     /// Settings), so the banner clears without a rescan.
     var hasFullDiskAccess = true
 
-    init(engine: any MacAuditEngine, usingFakeData: Bool) {
+    init(engine: any MacAuditEngine, usingFakeData: Bool,
+         initialRoot: String = FileManager.default.homeDirectoryForCurrentUser.path,
+         homeRoot: String? = nil,
+         revealLocation: @escaping @MainActor (String) -> Void = {
+             NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: $0)])
+         })
+    {
         self.engine = engine
+        selectedRoot = initialRoot
+        self.homeRoot = homeRoot ?? FileManager.default.homeDirectoryForCurrentUser.path
+        self.revealLocation = revealLocation
+        queries = MacAuditQueries(engine: engine)
+        auditPages = AuditFindingsBrowser(engine: engine)
         self.usingFakeData = usingFakeData
-        self.sections = engine.sections()
-        self.browser = DirBrowser(engine: engine)
-        self.owners = [
+        sections = engine.sections()
+        browser = DirBrowser(engine: engine)
+        owners = [
             .projects: OwnerBrowser(axis: .projects, engine: engine),
             .appStorage: OwnerBrowser(axis: .appStorage, engine: engine),
         ]
@@ -135,7 +210,7 @@ final class AuditStore {
         Task { [weak self] in
             for await _ in NotificationCenter.default.notifications(named: NSApplication.didBecomeActiveNotification) {
                 guard let self else { return }
-                self.refreshFullDiskAccess()
+                refreshFullDiskAccess()
             }
         }
     }
@@ -143,7 +218,7 @@ final class AuditStore {
     /// Re-probes Full Disk Access off-main and applies the result on the
     /// main actor.
     func refreshFullDiskAccess() {
-        let engine = self.engine
+        let engine = engine
         Task {
             let ok = await Task.detached { engine.fullDiskAccess() }.value
             hasFullDiskAccess = ok
@@ -158,7 +233,7 @@ final class AuditStore {
 
     /// `sections` minus the Projects/App Storage lenses — they're top-level
     /// items (Sidebar) and axis-driven rescans, not generic scanner sections;
-    /// kept out of the Sections list (`SectionSidebar`), the Rescan-All menu
+    /// kept out of the Sections list (`SectionSidebar`), the Refresh-All menu
     /// (`MacAuditApp`), and the menu bar extra the same way.
     var scanSections: [SectionMeta] {
         sections.filter { $0.id != .projects && $0.id != .appStorage }
@@ -168,10 +243,12 @@ final class AuditStore {
         status[id] ?? .idle
     }
 
-    var selectedSection: SectionId? { selectedItem?.section }
+    var selectedSection: SectionId? {
+        selectedItem?.section
+    }
 
     func findings(in id: SectionId) -> [Finding] {
-        findings[id].map { Array($0.values) } ?? []
+        auditPages.findings(in: id)
     }
 
     /// Findings from the fs section whose path is under (or equal to) `path`
@@ -179,7 +256,10 @@ final class AuditStore {
     /// Disk findings at or below `path`, largest first.
     func fsFindings(under path: String) -> [Finding] {
         findings(in: .fs)
-            .filter { $0.path?.hasPrefix(path) == true }
+            .filter { finding in
+                guard let findingPath = finding.path else { return false }
+                return findingPath == path || findingPath.hasPrefix(path == "/" ? "/" : path + "/")
+            }
             .sorted { ($0.sizeBytes ?? 0) > ($1.sizeBytes ?? 0) }
     }
 
@@ -206,14 +286,19 @@ final class AuditStore {
 
     func finding(_ id: UInt64?) -> Finding? {
         guard let id else { return nil }
+        if let finding = retainedMarks[id] {
+            return finding.finding
+        }
         for map in findings.values {
-            if let f = map[id] { return f }
+            if let f = map[id] {
+                return f
+            }
         }
         return nil
     }
 
     func count(of id: SectionId) -> Int {
-        findings[id]?.count ?? 0
+        findings(in: id).count
     }
 
     func reclaimableBytes(in id: SectionId) -> UInt64 {
@@ -237,7 +322,11 @@ final class AuditStore {
             switch f.kind {
             case .buildArtifact: name = f.isStaleArtifact ? "Stale build artifacts" : "Recent build artifacts"
             case .cacheDir: name = "Caches"
-            case .brewFormula: if f.isBrewSummaryRow { continue } else { name = "Homebrew" }
+            case .brewFormula: if f.isBrewSummaryRow {
+                    continue
+                } else {
+                    name = "Homebrew"
+                }
             case .dockerObject: name = "Docker"
             case .simulator: name = "Simulators"
             case .localSnapshot: name = "Time Machine snapshots"
@@ -260,100 +349,261 @@ final class AuditStore {
     }
 
     var isScanning: Bool {
-        status.values.contains { if case .scanning = $0 { true } else { false } }
+        status.values.contains {
+            if case .scanning = $0 {
+                true
+            } else {
+                false
+            }
+        }
     }
 
     // MARK: - Scanning
 
     func rescanAll() {
-        startScan(SectionId.allCases)
+        guard canRefresh else { return }
+        startRootRun(selectedRoot)
     }
 
-    func rescan(_ id: SectionId) {
-        startScan([id])
+    static func expandedRoot(_ input: String,
+                             home: String = FileManager.default.homeDirectoryForCurrentUser.path) -> String?
+    {
+        let path = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty, !path.contains("\0") else { return nil }
+        let expanded: String = if path == "~" {
+            home
+        } else if path.hasPrefix("~/") {
+            (home as NSString).appendingPathComponent(String(path.dropFirst(2)))
+        } else if path.hasPrefix("/") {
+            path
+        } else {
+            (home as NSString).appendingPathComponent(path)
+        }
+        return URL(fileURLWithPath: expanded).standardizedFileURL.path
     }
 
-    private func startScan(_ ids: [SectionId]) {
-        if scanBridge == nil {
-            let bridge = ScanBridge()
-            scanBridge = bridge
-            scanTask = Task { [weak self] in
-                for await event in bridge.events {
-                    guard let self else { return }
-                    self.apply(event)
+    func changeRoot(_ input: String) {
+        guard canRefresh else { return }
+        guard let path = Self.expandedRoot(input, home: homeRoot) else {
+            rootError = "Enter a folder path. Relative paths are resolved against Home."
+            return
+        }
+        startRootRun(path)
+    }
+
+    private func startRootRun(_ root: String) {
+        runGeneration &+= 1
+        let generation = runGeneration
+        runTask?.cancel()
+        isStartingRun = true
+        rootError = nil
+        let bridge = ScanMailbox()
+        let queries = queries
+        runTask = Task { [weak self] in
+            do {
+                let gen = try await queries.startRun(root: root, listener: bridge)
+                let metadata = await queries.metadata()
+                guard let self, runGeneration == generation, !Task.isCancelled else {
+                    bridge.finish()
+                    return
                 }
+                guard metadata.runId == gen else {
+                    throw MacAuditError.Invalid(message: "The selected root belongs to a superseded run.")
+                }
+                acceptRootRun(metadata.selectedRoot, runId: gen, bridge: bridge)
+            } catch {
+                bridge.finish()
+                guard let self, runGeneration == generation else { return }
+                isStartingRun = false
+                rootError = "\(error)"
             }
         }
-        guard let bridge = scanBridge else { return }
-        let gen = engine.startScan(sections: ids, listener: bridge)
-        for id in ids {
-            expectedGen[id] = gen
-            findings[id] = [:]
-            status[id] = .scanning(msg: "", done: 0, total: nil)
+    }
+
+    private func acceptRootRun(_ root: String, runId: UInt64, bridge: ScanMailbox) {
+        retirementTask?.cancel()
+        retirementTask = nil
+        currentRunId = runId
+        scanMetadata = nil
+        scanCancelRequested = false
+        scanBridge?.finish()
+        scanTask?.cancel()
+        scanBridge = bridge
+        selectedRoot = root
+        expectedGen.removeAll()
+        auditPages.reset()
+        retainedMarks.removeAll()
+        status.removeAll()
+        activity.removeAll()
+        marked.removeAll()
+        remedyChoice.removeAll()
+        selectedFinding = nil
+        searchText = ""
+        pendingPlan = nil
+        pendingSummary = nil
+        planGeneration &+= 1
+        planError = nil
+        rootError = nil
+        sheetRoute = nil
+        browser.reset()
+        for owner in owners.values {
+            owner.reset()
+        }
+        for section in sections {
+            status[section.id] = .scanning(msg: "Starting…", done: 0, total: nil)
+        }
+        for section in sections {
+            expectedGen[section.id] = runId
+        }
+        auditPages.activate(runId: runId, section: selectedItem?.section
+            ?? (selectedItem == .storage ? .system : nil))
+        bridge.activate(runId: runId)
+        consume(bridge)
+        isStartingRun = false
+    }
+
+    private func consume(_ bridge: ScanMailbox) {
+        scanTask = Task { [weak self] in
+            var revisions: [SectionId: UInt64] = [:]
+            for await _ in bridge.updates {
+                let snapshot = await bridge.snapshot()
+                guard let self, scanBridge === bridge, !Task.isCancelled else { return }
+                for (section, state) in snapshot.sections where expectedGen[section] == snapshot.runId {
+                    let changed = revisions[section, default: 0] != state.revision
+                    revisions[section] = state.revision
+                    let wasTerminal = self.status(of: section).isTerminal
+                    if let error = state.error {
+                        self.status[section] = .failed(error)
+                    } else if state.terminal {
+                        self.status[section] = .done(durationMs: state.durationMs)
+                    } else if !scanCancelRequested {
+                        self.status[section] = .scanning(msg: state.progress ?? "", done: state.progressDone ?? 0,
+                                                         total: state.progressTotal)
+                    }
+                    if changed || (state.terminal && !wasTerminal) {
+                        self.auditPages.invalidate()
+                        if section == .fs {
+                            self.browser.inventoryChanged()
+                            if state.terminal {
+                                self.refreshFullDiskAccess()
+                            }
+                        }
+                        if let axis = section.attributionAxis {
+                            self.owners[axis]?.inventoryChanged()
+                        }
+                    }
+                }
+            }
         }
     }
 
     func cancelScan() {
+        guard canCancelScan, let runId = currentRunId else { return }
+        scanCancelRequested = true
         engine.cancelScan()
+        auditPages.invalidate()
+        browser.inventoryChanged()
+        let queries = queries
+        retirementTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let metadata = await queries.metadata()
+                guard let self, currentRunId == runId, metadata.runId == runId, !Task.isCancelled else { return }
+                scanMetadata = metadata
+                guard metadata.activeScanners == 0 else {
+                    do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
+                    continue
+                }
+                for section in sections where expectedGen[section.id] == runId {
+                    let summary = try? await queries.sectionSummary(section: section.id, runId: runId)
+                    guard currentRunId == runId, !Task.isCancelled else { return }
+                    guard !status(of: section.id).isTerminal else { continue }
+                    if let error = summary?.error {
+                        status[section.id] = .failed(error)
+                    } else if summary?.terminal == true {
+                        status[section.id] = .done(durationMs: nil)
+                    } else {
+                        status[section.id] = .failed("Scan cancelled · partial results retained")
+                    }
+                }
+                auditPages.invalidate()
+                browser.inventoryChanged()
+                for owner in owners.values {
+                    owner.inventoryChanged()
+                }
+                return
+            }
+        }
     }
 
     /// Apply a scan event. Same rule as the engine session: only the
     /// generation a section currently expects is accepted.
     func apply(_ event: ScanEvent) {
         switch event {
-        case .sectionStarted(let section, let gen):
-            guard expectedGen[section] == gen else { return }
-            findings[section] = [:]
+        case let .sectionStarted(section, gen):
+            guard expectedGen[section] == gen, !scanCancelRequested else { return }
+            auditPages.invalidate()
             status[section] = .scanning(msg: "", done: 0, total: nil)
-        case .progress(let section, let gen, let msg, let done, let total):
-            guard expectedGen[section] == gen else { return }
+        case let .progress(section, gen, msg, done, total):
+            guard expectedGen[section] == gen, !scanCancelRequested else { return }
             status[section] = .scanning(msg: msg, done: done, total: total)
-        case .findings(let section, let gen, let batch):
+        case let .findings(section, gen, _):
             guard expectedGen[section] == gen else { return }
-            var map = findings[section] ?? [:]
-            for f in batch { map[f.id] = f }
-            findings[section] = map
-        case .sectionFinished(let section, let gen, let durationMs):
+            auditPages.invalidate()
+            if section == .fs {
+                browser.inventoryChanged()
+            }
+            if let axis = section.attributionAxis {
+                owners[axis]?.inventoryChanged()
+            }
+        case let .sectionFinished(section, gen, durationMs):
             guard expectedGen[section] == gen else { return }
             status[section] = .done(durationMs: durationMs)
-            dropStaleMarks(after: [section])
+            auditPages.invalidate()
             if section == .fs {
                 browser.refreshRoot()
-                browser.invalidate()
                 refreshFullDiskAccess()
             }
             if let axis = section.attributionAxis {
                 owners[axis]?.refresh()
             }
-        case .sectionFailed(let section, let gen, let error):
+        case let .sectionFailed(section, gen, error):
             guard expectedGen[section] == gen else { return }
             status[section] = .failed(error)
             push("\(section.slug): \(error)")
-            dropStaleMarks(after: [section])
-        case .correlated(_, let batch), .enriched(_, let batch):
+            auditPages.invalidate()
+        case let .correlated(gen, batch), let .enriched(gen, batch):
             for f in batch {
-                findings[f.section, default: [:]][f.id] = f
+                guard expectedGen[f.section] == gen else { continue }
+                auditPages.invalidate()
             }
         }
-    }
-
-    private func dropStaleMarks(after sections: [SectionId]) {
-        guard !marked.isEmpty else { return }
-        let present = Set(findings.values.flatMap(\.keys))
-        let stale = marked.subtracting(present)
-        guard !stale.isEmpty else { return }
-        marked.subtract(stale)
-        for id in stale { remedyChoice[id] = nil }
-        push("dropped \(stale.count) stale mark(s) after rescanning \(sections.map(\.slug).joined(separator: ", "))")
     }
 
     // MARK: - Folders
 
     /// Switch the sidebar to Folders and drill the browser into `path`.
     func browse(path: String) {
+        guard Self.containsLocation(path, under: selectedRoot) else {
+            revealLocation(path)
+            return
+        }
         browser.navigate(to: path)
         selectedItem = .folders
         selectedFinding = nil
+    }
+
+    nonisolated static func containsLocation(_ path: String, under root: String) -> Bool {
+        guard path.hasPrefix("/"), root.hasPrefix("/"), !path.contains("\0"), !root.contains("\0") else { return false }
+        let components = URL(fileURLWithPath: path).standardizedFileURL.pathComponents
+        let rootComponents = URL(fileURLWithPath: root).standardizedFileURL.pathComponents
+        return components.starts(with: rootComponents)
+    }
+
+    func showFindings(under path: String) {
+        selectedItem = .section(.fs)
+        selectedFinding = nil
+        searchText = ""
+        auditPages.filterLocation(path)
     }
 
     // MARK: - Attribution lenses
@@ -373,14 +623,19 @@ final class AuditStore {
         if marked.contains(id) {
             marked.remove(id)
             remedyChoice[id] = nil
+            retainedMarks[id] = nil
         } else {
+            guard marked.count < 256, let finding = finding(id) else { return }
             marked.insert(id)
+            retainedMarks[id] = RetainedFinding(finding: finding, metadata: auditPages.metadata(for: id))
         }
     }
 
     func chooseRemedy(_ index: Int?, for id: UInt64) {
+        guard marked.contains(id) || marked.count < 256, let finding = finding(id) else { return }
         remedyChoice[id] = index
         marked.insert(id)
+        retainedMarks[id] = RetainedFinding(finding: finding, metadata: retainedMarks[id]?.metadata ?? auditPages.metadata(for: id))
     }
 
     var selection: [Selection] {
@@ -392,16 +647,28 @@ final class AuditStore {
     /// Plan the marked findings and open the confirm sheet — even when
     /// everything was refused, so the user sees why.
     func openConfirm() {
-        let selection = self.selection
+        guard canRefresh else { return }
+        let selection = selection
         guard !selection.isEmpty else { return }
         planError = nil
-        let engine = self.engine
+        isPlanning = true
+        planGeneration &+= 1
+        let generation = planGeneration
+        let engine = engine
         Task {
             do {
-                let plan = try await Task.detached { try engine.plan(selection: selection) }.value
+                let (plan, summary) = try await Task.detached {
+                    let plan = try engine.plan(selection: selection)
+                    return (plan, plan.summary())
+                }.value
+                guard planGeneration == generation else { return }
+                isPlanning = false
                 pendingPlan = plan
-                pendingSummary = plan.summary()
+                pendingSummary = summary
+                sheetRoute = .confirm
             } catch {
+                guard planGeneration == generation else { return }
+                isPlanning = false
                 planError = "\(error)"
             }
         }
@@ -414,6 +681,9 @@ final class AuditStore {
     func dismissConfirm() {
         pendingPlan = nil
         pendingSummary = nil
+        if sheetRoute == .confirm {
+            sheetRoute = nil
+        }
     }
 
     func executePendingPlan() {
@@ -422,20 +692,23 @@ final class AuditStore {
         for a in summary.actions {
             marked.remove(a.findingId)
             remedyChoice[a.findingId] = nil
+            retainedMarks[a.findingId] = nil
         }
         cleanup = CleanupRun(actions: summary.actions, refused: summary.refused)
+        sheetRoute = .cleanup
         let bridge = ExecBridge()
         do {
             try engine.execute(plan: plan, listener: bridge)
         } catch {
             cleanup = nil
+            sheetRoute = nil
             planError = "\(error)"
             return
         }
         Task { [weak self] in
             for await event in bridge.events {
                 guard let self else { return }
-                self.apply(event)
+                apply(event)
             }
         }
     }
@@ -449,7 +722,10 @@ final class AuditStore {
     }
 
     func dismissCleanup() {
-        if case .done = cleanup?.phase { cleanup = nil }
+        if case .done = cleanup?.phase {
+            cleanup = nil
+            sheetRoute = nil
+        }
     }
 
     func apply(_ event: ExecEvent) {
@@ -459,16 +735,16 @@ final class AuditStore {
         // violation and aborts.
         guard var run = cleanup else { return }
         switch event {
-        case .preflightDone(let ok, let refused):
+        case let .preflightDone(ok, refused):
             run.actions = ok
             run.refused.append(contentsOf: refused)
             run.phase = .executing(index: 0, total: ok.count)
             if !refused.isEmpty {
                 push("cleanup: \(refused.count) action(s) refused by the refreshed preflight")
             }
-        case .actionStarted(let index):
+        case let .actionStarted(index):
             run.phase = .executing(index: Int(index), total: run.actions.count)
-        case .actionDone(let index, let ok, let message):
+        case let .actionDone(index, ok, message):
             run.results[Int(index)] = (ok, message)
             if ok {
                 push(message)
@@ -476,21 +752,39 @@ final class AuditStore {
                 let rendered = run.actions[safe: Int(index)]?.rendered ?? ""
                 push("error: \(rendered) — \(message)")
             }
-        case .executed(let cancelled, let rescanning, let rescanGen):
+        case let .executed(cancelled, rescanning, rescanGen):
             run.cancelled = cancelled
             run.phase = .verifying
             // The engine restarted these sections through the scan listener;
             // expect that generation so their events are accepted.
             if let gen = rescanGen {
+                retirementTask?.cancel()
+                retirementTask = nil
+                currentRunId = gen
+                scanMetadata = nil
+                scanCancelRequested = false
+                auditPages.reset()
+                retainedMarks.removeAll()
+                expectedGen.removeAll()
+                selectedFinding = nil
+                marked.removeAll()
+                remedyChoice.removeAll()
+                searchText = ""
+                browser.reset()
+                for owner in owners.values {
+                    owner.reset()
+                }
                 for section in rescanning {
                     expectedGen[section] = gen
-                    findings[section] = [:]
                     status[section] = .scanning(msg: "", done: 0, total: nil)
                 }
+                scanBridge?.activate(runId: gen)
+                auditPages.activate(runId: gen, section: selectedItem?.section
+                    ?? (selectedItem == .storage ? .system : nil))
             }
         case .verifying:
             run.phase = .verifying
-        case .finished(let summary, let reportPath, let reportJSON):
+        case let .finished(summary, reportPath, reportJSON):
             run.phase = .done
             run.summary = summary
             run.reportPath = reportPath
@@ -504,7 +798,9 @@ final class AuditStore {
 
     private func push(_ line: String) {
         activity.append(line)
-        if activity.count > 200 { activity.removeFirst() }
+        if activity.count > 200 {
+            activity.removeFirst()
+        }
     }
 }
 

@@ -73,7 +73,7 @@ private func entry(bytes: UInt64) -> FootprintEntry {
         unattributed: [entry(bytes: 5)],
         diskTotal: 1000,
         attributedTotal: 100,  // includes the 30 baseline + 5 unattributed bytes
-        missingDeps: [.docker])
+        missingDeps: [.docker], queryMemory: nil)
     let coverage = try! #require(LensModel.coverage(buckets))
     #expect(coverage.baseline == 30)
     #expect(coverage.unattributed == 5)
@@ -86,7 +86,7 @@ private func entry(bytes: UInt64) -> FootprintEntry {
     // Racy/stale read: baseline+unattributed alone outweigh attributedTotal.
     let buckets = FootprintBuckets(
         axis: .appStorage, baseline: [entry(bytes: 80)], unattributed: [entry(bytes: 40)],
-        diskTotal: 100, attributedTotal: 50, missingDeps: [])
+        diskTotal: 100, attributedTotal: 50, missingDeps: [], queryMemory: nil)
     let coverage = try! #require(LensModel.coverage(buckets))
     #expect(coverage.attributed == 0)
     #expect(coverage.restOfDisk == 0)  // accounted (120) already exceeds diskTotal (100)
@@ -106,7 +106,7 @@ private func entry(bytes: UInt64) -> FootprintEntry {
     let rows = LensModel.rows(findings)
     let buckets = FootprintBuckets(
         axis: .projects, baseline: [entry(bytes: 15), entry(bytes: 5)], unattributed: [],
-        diskTotal: 1000, attributedTotal: 90, missingDeps: [])
+        diskTotal: 1000, attributedTotal: 90, missingDeps: [], queryMemory: nil)
     let items = LensModel.treemapItems(rows, buckets: buckets)
 
     let byId = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0.value) })
