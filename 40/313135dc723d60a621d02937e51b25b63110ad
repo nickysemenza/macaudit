@@ -1,0 +1,19 @@
+.github/workflows/ci.yml
+  s_74c13e4104a4dc::t_822d94d7b7c082 11-12,30
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "40313135dc723d60a621d02937e51b25b63110ad",
+  "prompts": {},
+  "sessions": {
+    "s_74c13e4104a4dc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0f8ca-ed89-74a0-bbda-02dc46466a75",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "nicky <nicky@cloudflare.com>"
+    }
+  }
+}
