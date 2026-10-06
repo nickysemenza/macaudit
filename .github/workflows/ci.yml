@@ -7,7 +7,7 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.93
+      - uses: dtolnay/rust-toolchain@1.120
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -25,7 +25,7 @@ jobs:
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.93
+      - uses: dtolnay/rust-toolchain@1.120
         with:
           components: rustfmt, clippy
           targets: aarch64-apple-darwin
