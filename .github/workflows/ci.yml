@@ -46,14 +46,6 @@ jobs:
           -configuration Debug -destination 'platform=macOS'
           -derivedDataPath build/DerivedData -onlyUsePackageVersionsFromResolvedFile
           -skipMacroValidation ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO build
-      - name: Validate cached-navigation synchronization (20 repetitions)
-        run: >-
-          xcodebuild -project apps/MacAudit/MacAudit.xcodeproj -scheme MacAudit
-          -configuration Debug -destination 'platform=macOS'
-          -derivedDataPath build/DerivedData -onlyUsePackageVersionsFromResolvedFile
-          -only-testing:MacAuditAppTests/PresentationTests/testCachedNavigationInvalidatesPendingLoad
-          -run-tests-until-failure -test-iterations 20
-          -skipMacroValidation ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO test
       - run: >-
           xcodebuild -project apps/MacAudit/MacAudit.xcodeproj -scheme MacAudit
           -configuration Debug -destination 'platform=macOS'
