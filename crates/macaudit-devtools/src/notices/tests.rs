@@ -68,7 +68,7 @@ impl Fixture {
             "revision": REVISION,
             "license_text_status": status
         });
-        self.sidecar["files"][relative] = json!({"sha256": format!("{:x}", Sha256::digest(bytes))});
+        self.sidecar["files"][relative] = json!({"sha256": sha256_hex(bytes)});
     }
 
     fn pin(&mut self, identity: &str, version: Option<&str>) {
@@ -346,4 +346,24 @@ fn rejects_pinned_swift_checkout_without_license_text() {
     let parent = fixture.root().join("checkouts");
     fixture.checkout(&parent, "swift-alpha", REVISION, None);
     fixture.assert_failure("Missing license texts: swift-alpha", &[parent]);
+}
+
+#[test]
+fn sha256_hex_matches_known_vectors_and_preserves_leading_zeroes() {
+    for (bytes, expected) in [
+        (
+            b"".as_slice(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+        (
+            b"abc".as_slice(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        ),
+        (
+            b"s".as_slice(),
+            "043a718774c572bd8a25adbeb1bfcd5c0256ae11cecf9f9c3f925d0e52beaf89",
+        ),
+    ] {
+        assert_eq!(sha256_hex(bytes), expected);
+    }
 }
