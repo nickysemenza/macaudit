@@ -974,7 +974,10 @@ mod tests {
                 .map(|handle| handle.join().unwrap())
                 .collect::<Vec<_>>()
         });
-        assert_eq!(reservations.iter().filter(|result| result.is_ok()).count(), 4);
+        assert_eq!(
+            reservations.iter().filter(|result| result.is_ok()).count(),
+            4
+        );
         assert_eq!(budget.used(), 64);
         assert_eq!(budget.peak(), 64);
         drop(reservations);
