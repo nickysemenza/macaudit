@@ -360,6 +360,7 @@ final class PresentationTests: XCTestCase {
         browser.navigate(to: "/fixture/A")
         XCTAssertFalse(browser.isLoading)
         XCTAssertEqual(browser.current?.path, "/fixture/A")
+        try await eventually { browser.entries.first?.path == "/fixture/A/child" }
         engine.releaseQueries()
         try await eventually { engine.blockedQueryReturned }
         await Task.yield()
