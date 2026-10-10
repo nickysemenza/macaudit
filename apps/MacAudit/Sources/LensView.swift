@@ -218,6 +218,8 @@ private struct LensSortRequest: Equatable {
     var order: [KeyPathComparator<LensModel.Row>]
 }
 
+private typealias LensColumnBuilder = TableColumnBuilder<LensModel.Row, KeyPathComparator<LensModel.Row>>
+
 /// The five columns every lens table shows (Name/Share/Exclusive/Shared/
 /// Reach), shared by `ProjectsLensTable` and `AppsLensTable` — each of which
 /// appends its own axis-specific columns after this. A `@TableColumnBuilder`
@@ -226,7 +228,7 @@ private struct LensSortRequest: Equatable {
 /// *conditional* `TableColumn` needs 14.4 (`_ConditionalContent`'s
 /// `TableColumnContent` conformance) — a plain, unconditional group of
 /// columns like this one has no such requirement.
-@TableColumnBuilder<LensModel.Row, KeyPathComparator<LensModel.Row>>
+@LensColumnBuilder
 private func lensSharedColumns() -> some TableColumnContent<LensModel.Row, KeyPathComparator<LensModel.Row>> {
     TableColumn("Name", value: \.finding.title) { row in
         Text(row.finding.title).lineLimit(1)

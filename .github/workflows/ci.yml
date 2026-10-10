@@ -35,7 +35,9 @@ jobs:
       - run: cargo clippy -p macaudit-ffi --all-targets -- -D warnings
       - run: cargo test -p macaudit-ffi
       - run: scripts/build-ffi.sh --debug
-      - run: swift test --package-path swift/MacAuditKit --force-resolved-versions
+      - name: Test Swift package
+        timeout-minutes: 15
+        run: swift test --package-path swift/MacAuditKit --force-resolved-versions
       - run: xcodegen generate --spec apps/MacAudit/project.yml
       - run: >-
           xcodebuild -project apps/MacAudit/MacAudit.xcodeproj -scheme MacAudit
