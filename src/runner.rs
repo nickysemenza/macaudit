@@ -438,16 +438,20 @@ async fn capture_output(
         if count == 0 {
             break;
         }
-        total
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |bytes| {
-                bytes
-                    .checked_add(count)
-                    .filter(|bytes| *bytes <= MAX_OUTPUT_BYTES)
-            })
-            .map_err(|_| {
-                anyhow::anyhow!(InventoryError::ResourceLimit)
-                    .context("subprocess output exceeds 32 MiB")
-            })?;
+        let mut current = total.load(Ordering::Acquire);
+        loop {
+            let next = current
+                .checked_add(count)
+                .filter(|bytes| *bytes <= MAX_OUTPUT_BYTES)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(InventoryError::ResourceLimit)
+                        .context("subprocess output exceeds 32 MiB")
+                })?;
+            match total.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
         bytes
             .try_reserve_exact(count)
             .map_err(|_| InventoryError::ResourceLimit)?;

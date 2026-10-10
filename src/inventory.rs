@@ -121,14 +121,23 @@ impl MemoryBudget {
     }
 
     fn try_charge(&self, bytes: usize) -> Result<(), InventoryError> {
-        let previous = self
-            .used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(bytes).filter(|next| *next <= self.limit)
-            })
-            .map_err(|_| InventoryError::ResourceLimit)?;
-        self.peak.fetch_max(previous + bytes, Ordering::Relaxed);
-        Ok(())
+        let mut used = self.used.load(Ordering::Acquire);
+        loop {
+            let next = used
+                .checked_add(bytes)
+                .filter(|next| *next <= self.limit)
+                .ok_or(InventoryError::ResourceLimit)?;
+            match self
+                .used
+                .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    self.peak.fetch_max(next, Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(current) => used = current,
+            }
+        }
     }
 }
 
@@ -946,6 +955,34 @@ impl<T: QueryRow> QueryRegistry<T> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn concurrent_reservations_cannot_exceed_the_budget() {
+        let budget = MemoryBudget::new(64);
+        let barrier = std::sync::Barrier::new(8);
+        let reservations = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        budget.reserve(16)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            reservations.iter().filter(|result| result.is_ok()).count(),
+            4
+        );
+        assert_eq!(budget.used(), 64);
+        assert_eq!(budget.peak(), 64);
+        drop(reservations);
+        assert_eq!(budget.used(), 0);
+    }
 
     #[test]
     fn reservations_include_retiring_owners() {
