@@ -3,6 +3,7 @@ use crate::Result;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -106,6 +107,14 @@ fn append_files(notices: &mut String, files: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    hex
+}
+
 fn preserved_files(
     root: &Path,
     package: &Package,
@@ -142,7 +151,7 @@ fn preserved_files(
             .get(relative)
             .ok_or_else(|| format!("Missing preserved license hash: {relative}"))?;
         let bytes = fs::read(&file).map_err(|error| format!("{}: {error}", file.display()))?;
-        if format!("{:x}", Sha256::digest(&bytes)) != expected.sha256 {
+        if sha256_hex(&bytes) != expected.sha256 {
             return Err(format!("Preserved license hash mismatch: {relative}").into());
         }
         files.push(file);
