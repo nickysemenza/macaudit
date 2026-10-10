@@ -8,8 +8,10 @@ private final class DelayedQueryEngine: MacAuditEngine, @unchecked Sendable {
     private var root = "/synthetic/old"
     private var entered = false
     private var released = false
+    private var timedOut = false
 
     var hasEntered: Bool { condition.withLock { entered } }
+    var didTimeOut: Bool { condition.withLock { timedOut } }
 
     func release() {
         condition.withLock {
@@ -20,9 +22,15 @@ private final class DelayedQueryEngine: MacAuditEngine, @unchecked Sendable {
 
     private func block() {
         condition.lock()
+        defer { condition.unlock() }
         entered = true
-        while !released { condition.wait() }
-        condition.unlock()
+        let deadline = Date(timeIntervalSinceNow: 10)
+        while !released {
+            if !condition.wait(until: deadline), !released {
+                timedOut = true
+                return
+            }
+        }
     }
 
     func selectedRoot() -> String { condition.withLock { root } }
@@ -85,61 +93,75 @@ private func waitForQuery(_ engine: DelayedQueryEngine) async throws {
     #expect(engine.hasEntered)
 }
 
-@Test func blockedLiveFilesDoesNotStarveRunAdmissionAndRejectsRetiredResponse() async throws {
-    let engine = DelayedQueryEngine()
-    let queries = MacAuditQueries(engine: engine)
-    defer { engine.release() }
-    let listing = Task { try await queries.liveFiles(path: "/synthetic/old") }
-    try await waitForQuery(engine)
-    DispatchQueue.global().asyncAfter(deadline: .now() + 3) { engine.release() }
-    let started = ContinuousClock.now
-    let metadata = await queries.metadata()
-    let run = try await queries.startRun(root: "/synthetic/new", listener: QueryTestListener())
-    #expect(started.duration(to: .now) < .seconds(1))
-    #expect(metadata.runId == 1)
-    #expect(run == 2)
-    #expect(await queries.selectedRoot() == "/synthetic/new")
-    engine.release()
-    do {
-        _ = try await listing.value
-        Issue.record("Retired live listing was accepted")
-    } catch MacAuditError.Invalid(let message) {
-        #expect(message.contains("retired"))
+// These tests deliberately block a cooperative worker. Run one at a time so
+// small-core machines retain a worker that can drive and release the query.
+@Suite(.serialized)
+struct QueryActorTests {
+    @Test func blockedLiveFilesDoesNotStarveRunAdmissionAndRejectsRetiredResponse() async throws {
+        let engine = DelayedQueryEngine()
+        let queries = MacAuditQueries(engine: engine)
+        defer {
+            engine.release()
+            #expect(!engine.didTimeOut, "Blocked query exceeded the 10-second safety deadline")
+        }
+        let listing = Task { try await queries.liveFiles(path: "/synthetic/old") }
+        try await waitForQuery(engine)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 3) { engine.release() }
+        let started = ContinuousClock.now
+        let metadata = await queries.metadata()
+        let run = try await queries.startRun(root: "/synthetic/new", listener: QueryTestListener())
+        #expect(started.duration(to: .now) < .seconds(1))
+        #expect(metadata.runId == 1)
+        #expect(run == 2)
+        #expect(await queries.selectedRoot() == "/synthetic/new")
+        engine.release()
+        do {
+            _ = try await listing.value
+            Issue.record("Retired live listing was accepted")
+        } catch MacAuditError.Invalid(let message) {
+            #expect(message.contains("retired"))
+        }
     }
-}
 
-@Test func cancelledLiveFilesDiscardsResponseWithoutBlockingMetadata() async throws {
-    let engine = DelayedQueryEngine()
-    let queries = MacAuditQueries(engine: engine)
-    defer { engine.release() }
-    let listing = Task { try await queries.liveFiles(path: "/synthetic/old") }
-    try await waitForQuery(engine)
-    listing.cancel()
-    DispatchQueue.global().asyncAfter(deadline: .now() + 3) { engine.release() }
-    let started = ContinuousClock.now
-    #expect(await queries.metadata().runId == 1)
-    #expect(started.duration(to: .now) < .seconds(1))
-    engine.release()
-    do {
-        _ = try await listing.value
-        Issue.record("Cancelled listing returned a result")
-    } catch is CancellationError {}
-}
-
-@Test(arguments: [false, true])
-func blockedTopFilesAndPlanLeaveQueryActorRunnable(planning: Bool) async throws {
-    let engine = DelayedQueryEngine()
-    let queries = MacAuditQueries(engine: engine)
-    defer { engine.release() }
-    let query = Task {
-        if planning { _ = try? await queries.plan(selection: []) }
-        else { _ = await queries.topFiles(path: "/synthetic/old", n: 500) }
+    @Test func cancelledLiveFilesDiscardsResponseWithoutBlockingMetadata() async throws {
+        let engine = DelayedQueryEngine()
+        let queries = MacAuditQueries(engine: engine)
+        defer {
+            engine.release()
+            #expect(!engine.didTimeOut, "Blocked query exceeded the 10-second safety deadline")
+        }
+        let listing = Task { try await queries.liveFiles(path: "/synthetic/old") }
+        try await waitForQuery(engine)
+        listing.cancel()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 3) { engine.release() }
+        let started = ContinuousClock.now
+        #expect(await queries.metadata().runId == 1)
+        #expect(started.duration(to: .now) < .seconds(1))
+        engine.release()
+        do {
+            _ = try await listing.value
+            Issue.record("Cancelled listing returned a result")
+        } catch is CancellationError {}
     }
-    try await waitForQuery(engine)
-    DispatchQueue.global().asyncAfter(deadline: .now() + 3) { engine.release() }
-    let started = ContinuousClock.now
-    #expect(await queries.metadata().runId == 1)
-    #expect(started.duration(to: .now) < .seconds(1))
-    engine.release()
-    await query.value
+
+    @Test(arguments: [false, true])
+    func blockedTopFilesAndPlanLeaveQueryActorRunnable(planning: Bool) async throws {
+        let engine = DelayedQueryEngine()
+        let queries = MacAuditQueries(engine: engine)
+        defer {
+            engine.release()
+            #expect(!engine.didTimeOut, "Blocked query exceeded the 10-second safety deadline")
+        }
+        let query = Task {
+            if planning { _ = try? await queries.plan(selection: []) }
+            else { _ = await queries.topFiles(path: "/synthetic/old", n: 500) }
+        }
+        try await waitForQuery(engine)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 3) { engine.release() }
+        let started = ContinuousClock.now
+        #expect(await queries.metadata().runId == 1)
+        #expect(started.duration(to: .now) < .seconds(1))
+        engine.release()
+        await query.value
+    }
 }

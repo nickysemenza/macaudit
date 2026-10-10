@@ -704,48 +704,54 @@ pub async fn pump(mut rx: mpsc::Receiver<ScanEvent>, weak: Weak<Shared>) {
             biased;
             _ = ticks.tick() => {
                 let Some(shared) = weak.upgrade() else { return; };
-                shared.reconcile_retired_run();
-                let _ = shared.publish.try_send(());
+                tokio::task::block_in_place(|| {
+                    shared.reconcile_retired_run();
+                    let _ = shared.publish.try_send(());
+                });
             }
             event = rx.recv() => {
                 let Some(event) = event else { return; };
                 let Some(shared) = weak.upgrade() else { return; };
                 let terminal = matches!(event, ScanEvent::Finished { .. } | ScanEvent::Failed { .. });
-                {
-                    let _gate = shared.run_gate.lock().unwrap();
-                    let mut session = shared.session.lock().unwrap();
-                    let limited = session.resource_limited();
-                    if !session.apply(&event) { continue; }
-                    if !limited && session.resource_limited() {
-                        shared.manager.resource_limited(macaudit::engine::RunId(session.run_id), event.scanner());
-                    }
-                    drop(session);
-                    match event {
-                        ScanEvent::DirTree { tree, .. } => {
-                            let mut trees = shared.dir_trees.write().unwrap();
-                            trees.retain(|current| current.root != tree.root);
-                            trees.push(tree);
+                // FFI callers may hold these synchronous locks while waiting for scanners.
+                // Hand off this worker's queued tasks before blocking on the session.
+                tokio::task::block_in_place(|| {
+                    {
+                        let _gate = shared.run_gate.lock().unwrap();
+                        let mut session = shared.session.lock().unwrap();
+                        let limited = session.resource_limited();
+                        if !session.apply(&event) { return; }
+                        if !limited && session.resource_limited() {
+                            shared.manager.resource_limited(macaudit::engine::RunId(session.run_id), event.scanner());
                         }
-                        ScanEvent::Footprints { scanner, set, .. } => {
-                            match RetainedFootprints::new(set, &shared.query_budget) {
-                                Ok(set) => {
-                                    shared.footprints.write().unwrap().insert(set.axis, set);
-                                }
-                                Err(error) => {
-                                    let mut session = shared.session.lock().unwrap();
-                                    session.resource_limited.insert(scanner);
-                                    session.status.insert(scanner, Status::Failed(error.to_string()));
-                                    let run_id = macaudit::engine::RunId(session.run_id);
-                                    drop(session);
-                                    shared.manager.resource_limited(run_id, scanner);
-                                    let _ = shared.publish.try_send(());
+                        drop(session);
+                        match event {
+                            ScanEvent::DirTree { tree, .. } => {
+                                let mut trees = shared.dir_trees.write().unwrap();
+                                trees.retain(|current| current.root != tree.root);
+                                trees.push(tree);
+                            }
+                            ScanEvent::Footprints { scanner, set, .. } => {
+                                match RetainedFootprints::new(set, &shared.query_budget) {
+                                    Ok(set) => {
+                                        shared.footprints.write().unwrap().insert(set.axis, set);
+                                    }
+                                    Err(error) => {
+                                        let mut session = shared.session.lock().unwrap();
+                                        session.resource_limited.insert(scanner);
+                                        session.status.insert(scanner, Status::Failed(error.to_string()));
+                                        let run_id = macaudit::engine::RunId(session.run_id);
+                                        drop(session);
+                                        shared.manager.resource_limited(run_id, scanner);
+                                        let _ = shared.publish.try_send(());
+                                    }
                                 }
                             }
+                            _ => {},
                         }
-                        _ => {},
                     }
-                }
-                if terminal { after_terminal(&shared); }
+                    if terminal { after_terminal(&shared); }
+                });
             }
         }
     }
