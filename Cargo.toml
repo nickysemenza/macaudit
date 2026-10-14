@@ -61,7 +61,7 @@ semver = "1.0.28"
 [dev-dependencies]
 insta = "1"
 tempfile = "3.27"
-proptest = "=1.11.0"
+proptest = "=1.12.0"
 criterion = "=0.8.2"
 
 [[bench]]
