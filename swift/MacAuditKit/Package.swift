@@ -15,7 +15,7 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-collections", exact: "1.2.1"),
         .package(url: "https://github.com/pointfreeco/swift-navigation", exact: "2.4.2"),
         .package(url: "https://github.com/pointfreeco/swift-snapshot-testing", exact: "1.19.6"),
-        .package(url: "https://github.com/pointfreeco/swift-case-paths", exact: "1.5.6"),
+        .package(url: "https://github.com/pointfreeco/swift-case-paths", exact: "1.10.0"),
         .package(url: "https://github.com/pointfreeco/swift-concurrency-extras", exact: "1.4.3"),
         .package(url: "https://github.com/pointfreeco/swift-custom-dump", exact: "1.3.3"),
         .package(url: "https://github.com/pointfreeco/swift-perception", exact: "1.4.1"),
