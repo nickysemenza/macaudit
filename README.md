@@ -156,8 +156,9 @@ brew install --cask nickysemenza/tap/macaudit
 
 The cask lives in [nickysemenza/homebrew-tap](https://github.com/nickysemenza/homebrew-tap)
 and downloads the zip from [Releases](https://github.com/nickysemenza/macaudit/releases);
-`brew upgrade` picks up new releases because the release workflow bumps the
-cask there. Releases are signed with a Developer ID certificate and
+every merge to `main` publishes a release (versioned like
+`0.1.3-5-gabc1234`, the last release tag plus the commit) and bumps the
+cask, so `brew upgrade` tracks `main`. Releases are signed with a Developer ID certificate and
 notarized by Apple, so the app opens with a plain double-click and the CLI
 runs without a Gatekeeper "killed" — no right-click → Open dance.
 
@@ -499,6 +500,10 @@ arm64, signs both with the Developer ID certificate, notarizes them, staples
 the app, uploads `MacAudit-<version>.zip` (containing `MacAudit.app` and
 `macaudit` side by side) to a GitHub Release, and triggers `bump.yml` in the
 tap, which rewrites the cask's `version`/`sha256` with `brew bump-cask-pr`.
+It runs on a `v*` tag push and, called from `ci.yml` after the tests pass,
+on every push to `main`; a main build is versioned by `git describe` and
+published with `--latest=false`, and its app bundle reports the release core
+(`0.1.3`) since `CFBundleShortVersionString` is dotted integers.
 Running it by hand from the Actions tab (workflow_dispatch) does everything
 except the release and the bump, under the nearest tag's version, and
 uploads the zip as a workflow artifact — use that to prove the secrets work

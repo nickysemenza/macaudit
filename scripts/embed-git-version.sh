@@ -11,6 +11,10 @@
 # still wins whenever it is ahead of the last tag — package.sh 0.2.0 builds an
 # honest 0.2.0 before v0.2.0 exists.
 #
+# Tags containing "-" are the per-merge releases release.yml publishes
+# (v0.1.3-5-gabc1234); the describe excludes them so the version counts from
+# the last real release tag, and their versions aren't dotted-numeric anyway.
+#
 # Best-effort throughout: never fail a build over version metadata. With no
 # git or no tags (a shallow CI checkout), whatever the project set stands.
 #
@@ -28,7 +32,7 @@ fi
 # SRCROOT is apps/MacAudit; the repo root is two levels up.
 cd "${SRCROOT}/../.."
 
-tag=$(git describe --tags --abbrev=0 2>/dev/null || true)
+tag=$(git describe --tags --exclude '*-*' --abbrev=0 2>/dev/null || true)
 version=${tag#v}
 
 # Only a clean dotted-numeric core is a release version; anything else

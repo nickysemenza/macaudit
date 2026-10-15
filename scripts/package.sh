@@ -39,6 +39,11 @@ case "$STAGE" in /*) ;; *) STAGE="$ROOT/$STAGE" ;; esac
 # passes the same value as MARKETING_VERSION. Verified after the build.
 export MACAUDIT_VERSION="$VERSION"
 
+# A per-merge build's version is a describe (0.1.3-5-gabc1234). The CLI
+# reports all of it; CFBundleShortVersionString is meant to be dotted
+# integers, so the app gets the release core in front of the first "-".
+APP_VERSION=${VERSION%%-*}
+
 # Same floor as the app so the CLI runs on the same macOS versions.
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
 
@@ -70,7 +75,7 @@ xcodebuild -quiet -project apps/MacAudit/MacAudit.xcodeproj -scheme MacAudit \
   -onlyUsePackageVersionsFromResolvedFile -skipMacroValidation \
   -derivedDataPath "$DERIVED" ARCHS=arm64 \
   "${XCODE_SIGN_ARGS[@]}" CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO \
-  "MARKETING_VERSION=$VERSION" "CURRENT_PROJECT_VERSION=$BUILD_NUMBER" \
+  "MARKETING_VERSION=$APP_VERSION" "CURRENT_PROJECT_VERSION=$BUILD_NUMBER" \
   build
 APP="$DERIVED/Build/Products/Release/MacAudit.app"
 
@@ -98,8 +103,8 @@ if [ "$GOT" != "macaudit $VERSION" ]; then
   exit 1
 fi
 PLIST_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$STAGE/MacAudit.app/Contents/Info.plist")
-if [ "$PLIST_VERSION" != "$VERSION" ]; then
-  echo "error: app bundle reports version '$PLIST_VERSION', expected '$VERSION'" >&2
+if [ "$PLIST_VERSION" != "$APP_VERSION" ]; then
+  echo "error: app bundle reports version '$PLIST_VERSION', expected '$APP_VERSION'" >&2
   exit 1
 fi
 echo "done: $STAGE/MacAudit.app ($PLIST_VERSION, build $BUILD_NUMBER)"
