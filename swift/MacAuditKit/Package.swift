@@ -18,7 +18,7 @@ let package = Package(
         .package(url: "https://github.com/pointfreeco/swift-case-paths", exact: "1.5.6"),
         .package(url: "https://github.com/pointfreeco/swift-concurrency-extras", exact: "1.4.3"),
         .package(url: "https://github.com/pointfreeco/swift-custom-dump", exact: "1.3.3"),
-        .package(url: "https://github.com/pointfreeco/swift-perception", exact: "1.6.0"),
+        .package(url: "https://github.com/pointfreeco/swift-perception", exact: "2.0.12"),
         .package(url: "https://github.com/pointfreeco/xctest-dynamic-overlay", exact: "1.13.1"),
         .package(url: "https://github.com/swiftlang/swift-syntax", exact: "600.0.1"),
     ],
