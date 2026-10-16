@@ -56,3 +56,13 @@ jobs:
           -configuration Release -destination 'platform=macOS'
           -derivedDataPath build/DerivedData -onlyUsePackageVersionsFromResolvedFile
           -skipMacroValidation ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO build
+
+  # Every merge to main ships: once both test jobs pass, the signed and
+  # notarized release build publishes it and bumps the cask (release.yml).
+  publish:
+    needs: [test, app]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    secrets: inherit

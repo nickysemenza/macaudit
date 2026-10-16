@@ -3,8 +3,10 @@
 //!
 //!   1. `MACAUDIT_VERSION` in the environment — scripts/package.sh sets it to
 //!      the release tag, so a release build reports exactly the tag.
-//!   2. `git describe --tags --always --dirty`, minus the leading "v":
-//!      "0.1.1" at a tag, "0.1.1-3-gabc1234-dirty" past one.
+//!   2. `git describe --tags --exclude '*-*' --always --dirty`, minus the leading "v":
+//!      "0.1.1" at a tag, "0.1.1-3-gabc1234-dirty" past one. Tags containing
+//!      "-" are per-merge releases (release.yml) and are excluded, so the
+//!      count is from the last real release tag.
 //!   3. `CARGO_PKG_VERSION` — the 0.0.0 floor in Cargo.toml, for a checkout
 //!      with no git (a source tarball).
 //!
@@ -16,7 +18,14 @@ use std::process::Command;
 
 fn git_describe() -> Option<String> {
     let out = Command::new("git")
-        .args(["describe", "--tags", "--always", "--dirty"])
+        .args([
+            "describe",
+            "--tags",
+            "--exclude",
+            "*-*",
+            "--always",
+            "--dirty",
+        ])
         .output()
         .ok()?;
     if !out.status.success() {
