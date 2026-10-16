@@ -1,0 +1,19 @@
+build.rs
+  s_07179950d7db18::t_2cac6995876f6e 21-28
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5c1c906a275cfa791be2ef5913275655becb4ee8",
+  "prompts": {},
+  "sessions": {
+    "s_07179950d7db18": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "03c17ddd-b7ce-4c8b-92ab-2ad5a077587e",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "nicky <nicky@cloudflare.com>"
+    }
+  }
+}
