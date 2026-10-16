@@ -18,7 +18,14 @@ use std::process::Command;
 
 fn git_describe() -> Option<String> {
     let out = Command::new("git")
-        .args(["describe", "--tags", "--exclude", "*-*", "--always", "--dirty"])
+        .args([
+            "describe",
+            "--tags",
+            "--exclude",
+            "*-*",
+            "--always",
+            "--dirty",
+        ])
         .output()
         .ok()?;
     if !out.status.success() {
