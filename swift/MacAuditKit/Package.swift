@@ -12,7 +12,7 @@ let package = Package(
         .library(name: "MacAuditCollections", targets: ["MacAuditCollections"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-collections", exact: "1.7.4"),
+        .package(url: "https://github.com/apple/swift-collections", exact: "1.7.5"),
         .package(url: "https://github.com/pointfreeco/swift-navigation", exact: "2.11.2"),
         .package(url: "https://github.com/pointfreeco/swift-snapshot-testing", exact: "1.19.7"),
         .package(url: "https://github.com/pointfreeco/swift-case-paths", exact: "1.10.0"),
