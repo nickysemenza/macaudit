@@ -43,30 +43,24 @@ copyright notices are in that original upstream file, not a `LICENSE` file.
 ## Provenance and scope
 
 All 24 selected `.crate` archive SHA-256 values were checked against `Cargo.lock`.
-For the 21 crates with `.cargo_vcs_info.json`, the upstream `Cargo.toml` at the
+For the 22 crates with `.cargo_vcs_info.json`, the upstream `Cargo.toml` at the
 recorded SHA was compared byte-for-byte with the packaged `Cargo.toml.orig`.
 The legacy `anes` VCS file has no package path; its matching manifest is in
-`anes/Cargo.toml`.
+`anes/Cargo.toml`. `rustls-platform-verifier-android@0.2.0` now publishes
+`.cargo_vcs_info.json`; its packaged manifest matches upstream, and its
+license files are byte-identical to the texts preserved for 0.1.1.
 
-Three archives omit `.cargo_vcs_info.json`:
+Two archives omit `.cargo_vcs_info.json`:
 
 - Both `winapi-*-pc-windows-gnu@0.4.0` archives match upstream commit
   `9497609ef44cc9bcd16cd2411c0ee6ccaf5483aa`: all 1,390 i686 and 1,419 x86_64
   original package files, including import libraries, match Git blob hashes.
   Generated `Cargo.toml` and Cargo cache bookkeeping are excluded; the packaged
   `Cargo.toml.orig` is compared with upstream `Cargo.toml`.
-- `rustls-platform-verifier-android@0.1.1` has byte-identical Rust source and
-  original manifest at `da3d9c36f48fb9f8f97e94f132fdab67ab0fc75b`. Its packaged
-  AAR also matches the upstream backfilled artifact at
-  `a9c4a842e44e41b0ff0ef0ec12486853ce81f34c`; the manifest records the artifact
-  path, Git blob hash, and SHA-256. The archived Maven group directory is
-  `org/rustls`, while the older package directory is `rustls`; identical bytes,
-  not directory naming or a coincidentally named release tag, establish the
-  artifact match.
 
 These are verified source-content matches, not assertions that these commits
 were the actual publishing commits. Publishing SHAs cannot be recovered from
-the three archives themselves.
+the two archives themselves.
 
 The eight `uniffi*` registry crates at 0.32.2 share one upstream revision and
 license. JNI and WezTerm family files are reused only where the originals are
@@ -76,7 +70,7 @@ license templates. Provenance lives in the manifest, not inside those files.
 
 ## Unverifiable full-text cases
 
-`objc2@0.6.4`, `objc2-encode@4.1.0`, and `objc2-foundation@0.3.2` each declare
+`objc2@0.6.5`, `objc2-encode@4.1.0`, and `objc2-foundation@0.3.2` each declare
 MIT. At their exact recorded revisions the repository's `LICENSE.md` explains
 that licensing and discusses Apple SDK-derived code, but supplies neither the
 MIT terms nor a project copyright notice. The original notice is identical at

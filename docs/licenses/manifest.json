@@ -146,11 +146,11 @@
         "The pinned upstream LICENSE.md states MIT licensing and discusses Apple SDK-derived code, but does not contain the MIT terms or a project copyright notice. This entry preserves that notice verbatim; full original MIT text/attribution at this revision could not be verified. Do not treat file presence as proof of complete license terms."
       ]
     },
-    "objc2@0.6.4": {
+    "objc2@0.6.5": {
       "name": "objc2",
-      "version": "0.6.4",
+      "version": "0.6.5",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "crate_sha256": "3a12a8ed07aefc768292f076dc3ac8c48f3781c8f2d5851dd3d98950e8c5a89f",
+      "crate_sha256": "08849bbd4767dfae9457696856ae1c84fe4e0281bbe4a7abff2d0e06fb7981f8",
       "license": "MIT",
       "preserved_license": "MIT",
       "license_files": [
@@ -158,13 +158,13 @@
       ],
       "license_text_status": "notice-only",
       "repository": "https://github.com/madsmtm/objc2",
-      "revision": "8852b424193ca41602281b3d7540d7c8ed51e49a",
+      "revision": "d7d2fa23ceaa5e6096c923b081040e5d81b3b9df",
       "path_in_vcs": "crates/objc2",
       "verification": {
         "method": "cargo-vcs-info",
-        "revision": "8852b424193ca41602281b3d7540d7c8ed51e49a",
+        "revision": "d7d2fa23ceaa5e6096c923b081040e5d81b3b9df",
         "path_in_vcs": "crates/objc2",
-        "manifest_sha256": "edff06609a6f76ba4aa4ead2f6219826f6c4fd82075fa178029085f37f931536",
+        "manifest_sha256": "4a1e1561612efc4a8aea4dd574c781f6215fa5416696425227558fc782353cba",
         "manifest_matches_upstream": true
       },
       "notes": [
@@ -243,11 +243,11 @@
         "manifest_matches_upstream": true
       }
     },
-    "rustls-platform-verifier-android@0.1.1": {
+    "rustls-platform-verifier-android@0.2.0": {
       "name": "rustls-platform-verifier-android",
-      "version": "0.1.1",
+      "version": "0.2.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "crate_sha256": "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f",
+      "crate_sha256": "eec689c0bc40ff2458a5977b6619cb718087084a18e02a131c599b62d05e1a5f",
       "license": "MIT OR Apache-2.0",
       "preserved_license": "MIT OR Apache-2.0",
       "license_files": [
@@ -256,23 +256,17 @@
       ],
       "license_text_status": "complete",
       "repository": "https://github.com/rustls/rustls-platform-verifier",
-      "revision": "da3d9c36f48fb9f8f97e94f132fdab67ab0fc75b",
+      "revision": "252e25161a91af476cbea620e29d277592d27ec7",
       "path_in_vcs": "android-release-support",
       "verification": {
-        "method": "packaged-source-and-archived-artifact-match",
-        "revision": "da3d9c36f48fb9f8f97e94f132fdab67ab0fc75b",
+        "method": "cargo-vcs-info",
+        "revision": "252e25161a91af476cbea620e29d277592d27ec7",
         "path_in_vcs": "android-release-support",
-        "compared_source_files": [
-          "Cargo.toml.orig",
-          "src/lib.rs"
-        ],
-        "artifact_revision": "a9c4a842e44e41b0ff0ef0ec12486853ce81f34c",
-        "artifact_path": "android-release-support/maven/org/rustls/rustls-platform-verifier/0.1.1/rustls-platform-verifier-0.1.1.aar",
-        "artifact_git_blob": "8acc8b5fe0b36db4fb45ad8ac4a8f8c3b24fc0c5",
-        "artifact_sha256": "667292cadd8fa589229dd0f716541236a761f29b774930868d218175633830fd"
+        "manifest_sha256": "e78f460d378e8fbf3cb90e96a249c8d23cd7cfc97e83cd7b95d979472de4adad",
+        "manifest_matches_upstream": true
       },
       "notes": [
-        "The crate omits .cargo_vcs_info.json. The pinned revision is a verified source-content match, not a claimed publishing commit."
+        "The crate archive omits license files. LICENSE-APACHE and LICENSE-MIT at this revision are byte-identical to the texts preserved for 0.1.1."
       ]
     },
     "uniffi_bindgen@0.32.2": {
@@ -669,6 +663,12 @@
           "revision": "8852b424193ca41602281b3d7540d7c8ed51e49a",
           "path": "LICENSE.md",
           "url": "https://raw.githubusercontent.com/madsmtm/objc2/8852b424193ca41602281b3d7540d7c8ed51e49a/LICENSE.md"
+        },
+        {
+          "repository": "https://github.com/madsmtm/objc2",
+          "revision": "d7d2fa23ceaa5e6096c923b081040e5d81b3b9df",
+          "path": "LICENSE.md",
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/d7d2fa23ceaa5e6096c923b081040e5d81b3b9df/LICENSE.md"
         }
       ]
     },
@@ -713,6 +713,12 @@
           "revision": "da3d9c36f48fb9f8f97e94f132fdab67ab0fc75b",
           "path": "LICENSE-APACHE",
           "url": "https://raw.githubusercontent.com/rustls/rustls-platform-verifier/da3d9c36f48fb9f8f97e94f132fdab67ab0fc75b/LICENSE-APACHE"
+        },
+        {
+          "repository": "https://github.com/rustls/rustls-platform-verifier",
+          "revision": "252e25161a91af476cbea620e29d277592d27ec7",
+          "path": "LICENSE-APACHE",
+          "url": "https://raw.githubusercontent.com/rustls/rustls-platform-verifier/252e25161a91af476cbea620e29d277592d27ec7/LICENSE-APACHE"
         }
       ]
     },
@@ -724,6 +730,12 @@
           "revision": "da3d9c36f48fb9f8f97e94f132fdab67ab0fc75b",
           "path": "LICENSE-MIT",
           "url": "https://raw.githubusercontent.com/rustls/rustls-platform-verifier/da3d9c36f48fb9f8f97e94f132fdab67ab0fc75b/LICENSE-MIT"
+        },
+        {
+          "repository": "https://github.com/rustls/rustls-platform-verifier",
+          "revision": "252e25161a91af476cbea620e29d277592d27ec7",
+          "path": "LICENSE-MIT",
+          "url": "https://raw.githubusercontent.com/rustls/rustls-platform-verifier/252e25161a91af476cbea620e29d277592d27ec7/LICENSE-MIT"
         }
       ]
     },
