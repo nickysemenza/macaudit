@@ -10,4 +10,4 @@ name = "uniffi-bindgen-swift"
 path = "src/bin/uniffi-bindgen-swift.rs"
 
 [dependencies]
-uniffi = { version = "0.32", features = ["cli"] }
+uniffi = { version = "0.33", features = ["cli"] }
